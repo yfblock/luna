@@ -6,25 +6,12 @@
  * CSpace, VSpace and TCB.
  */
 #include "luna_isolation_protocol.h"
+#include "luna_lkl_task_host.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
+#include <sel4utils/thread.h>
 #include <lkl_host.h>
-
-/* lkl.o needs these two host-provided symbols.  Full print/panic routing moves
- * with the host operations; for this link-only migration slice they remain
- * deliberately minimal. */
-int lkl_printf(const char *fmt, ...)
-{
-    (void)fmt;
-    return 0;
-}
-
-void lkl_bug(const char *fmt, ...)
-{
-    (void)fmt;
-    for (;;) seL4_Yield();
-}
 
 static seL4_Word parse_word(const char *s)
 {
@@ -44,9 +31,31 @@ static void send_event(seL4_CPtr control_ep, seL4_Word event, seL4_Word detail)
     seL4_Send(control_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
+struct child_worker_descriptor {
+    sel4utils_thread_t thread;
+    seL4_CPtr self_tcb;
+    seL4_CPtr join_ntfn;
+};
+
+static __thread seL4_Word child_worker_tls;
+static volatile seL4_Word child_worker_result;
+
+static void child_worker(void *arg0, void *arg1, void *ipc_buffer)
+{
+    (void)arg1;
+    (void)ipc_buffer;
+    struct child_worker_descriptor *worker = arg0;
+
+    child_worker_tls = LUNA_RESOURCE_TLS_VALUE;
+    child_worker_result = child_worker_tls;
+    seL4_Signal(worker->join_ntfn);
+    seL4_TCB_Suspend(worker->self_tcb);
+    for (;;) seL4_Yield();
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
+    if (argc != 10) {
         for (;;) seL4_Yield();
     }
 
@@ -54,6 +63,19 @@ int main(int argc, char **argv)
     seL4_CPtr command_ntfn = (seL4_CPtr)parse_word(argv[1]);
     seL4_Word mode = parse_word(argv[2]);
     seL4_Word private_addr = parse_word(argv[3]);
+    seL4_Word resource_slots = parse_word(argv[4]);
+    if (resource_slots != LUNA_RESOURCE_SLOTS) {
+        for (;;) seL4_Yield();
+    }
+
+    struct child_worker_descriptor worker = {0};
+    worker.self_tcb = (seL4_CPtr)parse_word(argv[5]);
+    worker.thread.tcb.cptr = worker.self_tcb;
+    worker.thread.stack_top = (void *)(uintptr_t)parse_word(argv[6]);
+    worker.thread.initial_stack_pointer = worker.thread.stack_top;
+    worker.thread.stack_size = (size_t)parse_word(argv[7]);
+    worker.thread.ipc_buffer_addr = parse_word(argv[8]);
+    worker.join_ntfn = (seL4_CPtr)parse_word(argv[9]);
 
     send_event(control_ep, LUNA_ISOLATION_EVENT_READY, mode);
 
@@ -66,6 +88,24 @@ int main(int argc, char **argv)
     seL4_Word command_badge = 0;
     seL4_Wait(command_ntfn, &command_badge);
     (void)command_badge;
+
+    child_worker_result = 0;
+    if (sel4utils_start_thread(&worker.thread, child_worker, &worker, NULL, 1)) {
+        for (;;) seL4_Yield();
+    }
+    seL4_Word join_badge = 0;
+    seL4_Wait(worker.join_ntfn, &join_badge);
+    (void)join_badge;
+    if (child_worker_result != LUNA_RESOURCE_TLS_VALUE) {
+        for (;;) seL4_Yield();
+    }
+    send_event(control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK, mode);
+
+    if (luna_lkl_task_init()) {
+        for (;;) seL4_Yield();
+    }
+    send_event(control_ep, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode);
+    luna_lkl_task_cleanup();
 
     if (mode == LUNA_ISOLATION_MODE_FAULT) {
         /* The manager maps this address only in its own VSpace.  Reaching the

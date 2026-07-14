@@ -41,6 +41,8 @@ QEMU 实测输出：
 ```text
 luna: isolation child created with private CSpace/VSpace
 LUNA_LKL_CHILD_LINKED
+LUNA_RESOURCE_POOL_OK
+LUNA_LKL_CHILD_INIT_OK
 Pagefault from [luna-lkl-task]: read fault ... vaddr: <manager-private-address>
 LUNA_ISOLATION_FAULT_OK addr=<manager-private-address>
 LUNA_ISOLATION_CHANNEL_OK
@@ -64,14 +66,44 @@ CSpace、VSpace、Untyped、I/O port 或 LKL host 全局状态 capability。
 不长期占用共享页。Phase 2.1b 必须先建立可计量的固定资源池，再增加共享控制页，避免靠扩大权限或
 隐式消耗资源绕过问题。
 
+## Phase 2.1b：固定资源契约（进行中）
+
+manager 现在为每个 `luna-lkl-task` 预配置一个真实 host-thread slot：
+
+- 独立 TCB，配置到 child CSpace/VSpace 和 child fault endpoint；
+- 64 页（256KiB）栈，与当前 root-hosted LKL boot thread 相同；
+- 独立 IPC buffer；
+- join Notification；
+- child 只得到该 TCB 和 Notification 的派生 cap，不得到 VKA 或 Untyped。
+
+child 使用这些描述构造本地 `sel4utils_thread_t`，调用 `sel4utils_start_thread()` 写入自己的 TLS
+image 并启动 worker。worker 设置 `__thread` 值、通过 join Notification 通知主线程并自行挂起；成功后
+child 报告 `LUNA_RESOURCE_POOL_OK`。
+
+资源销毁时必须先删除 child CSpace 中的 TCB/Notification 派生 cap，再将原对象交还 Untyped
+allocator。旧顺序会使 allocator 认为范围已经释放，但 seL4 内核仍看到派生 cap，下一次 retype 会报
+`Untyped Retype: Insufficient memory`。当前流程已经在 fault child 和 replacement child 两次完整
+装载中验证回收。
+
+最小 host operations 也已迁入 `luna-lkl-task`。child 在固定 worker 测试后调用：
+
+```text
+lkl_init(child_host_ops)
+  → LUNA_LKL_CHILD_INIT_OK
+  → lkl_cleanup()
+```
+
+当前 child host-ops 先提供 `memcpy/memset/memmove`，满足此 LKL 配置下 `lkl_init()` 的实际要求。
+这证明 child 中执行的是自己的 LKL 全局状态，而不是 manager 的 LKL 副本。
+
 ## 下一迁移切片
 
-Phase 2.1b 将建立固定资源契约，为最终 LKL task 预置有限数量的线程槽、Notification 和栈，再在
-资源预算允许后加入共享控制页。随后按以下顺序迁移：
+Phase 2.1b 已建立首个固定线程 slot。下一步将命令 Notification 升级为单向 command Endpoint，
+通过 IPC message 逐项下发资源描述，然后扩展线程和同步 Notification 池。随后按以下顺序迁移：
 
-1. `lkl.o` 已链接进 child，下一步迁移纯内存 host operations。
-2. 让 `thread_create/join` 使用 manager 预置的固定资源池。
-3. 在 child 内完成 `lkl_init()` / `lkl_start_kernel()`，通过事件 endpoint 报告状态。
+1. `lkl.o`、最小内存 host operations 和 `lkl_init()` 已迁入 child。
+2. 让正式的 `thread_create/join`、sem/mutex 和 TLS host operations 使用固定资源池。
+3. 在 child 内执行 `lkl_start_kernel()`，通过事件 endpoint 报告状态。
 4. 最后迁移 timer、tty 和 shutdown；root manager 只保留资源分配、fault 诊断和生命周期管理。
 
 在 child 能完整启动 LKL 之前，现有 root-hosted LKL 路径保留为可比较的稳定基线。

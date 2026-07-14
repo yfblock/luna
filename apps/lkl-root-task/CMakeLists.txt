@@ -30,6 +30,7 @@ endif()
 
 add_executable(luna-lkl-task
     src/isolation_child.c
+    src/lkl_task_host.c
 )
 target_include_directories(luna-lkl-task PRIVATE include)
 target_include_directories(luna-lkl-task PRIVATE
@@ -40,7 +41,7 @@ target_compile_options(luna-lkl-task PRIVATE
 )
 target_link_libraries(luna-lkl-task
     ${LKL_KERNEL_OBJ}
-    sel4runtime sel4 muslc utils sel4muslcsys
+    sel4runtime sel4 muslc utils sel4muslcsys sel4utils
 )
 
 include(cpio)

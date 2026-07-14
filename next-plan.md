@@ -23,11 +23,13 @@
 当前进度：Phase 2.1a 已完成。manager 已能装载具有独立 CSpace/VSpace/TCB/fault endpoint 的
 child；child 访问 manager 私有页会产生可诊断 VMFault，manager 随后能销毁并重建 child，且原有
 LKL smoke 继续通过。manager→child 命令 Notification 和 child→manager 事件 Endpoint 已通过，
-`lkl.o` 也已链接进 child 并报告 `LKL_LINKED`。实现与证据见 `PHASE2.1-RESULTS.md`。
+`lkl.o` 也已链接进 child 并报告 `LKL_LINKED`。manager 还会预建一个带 64 页栈、IPC buffer 和 join
+Notification 的 worker slot；child 已用它验证 TLS worker，并独立完成 `lkl_init()`/`lkl_cleanup()`。
+实现与证据见 `PHASE2.1-RESULTS.md`。
 
-下一切片 Phase 2.1b：建立固定资源契约，预置有限 TCB、Notification 和栈；然后将内存与线程 host
-operations 迁入 child，并在资源预算稳定后加入共享控制页，再迁 timer、tty 和 shutdown。迁移完成前
-保留 root-hosted LKL 路径作为回归基线。
+Phase 2.1b 下一切片：将命令 Notification 升级为可携带资源描述的单向 Endpoint，扩展固定 TCB 和
+同步 Notification 池，把正式 thread/sem/mutex/TLS host operations 迁入 child；随后执行 child 内
+`lkl_start_kernel()`，再迁 timer、tty 和 shutdown。迁移完成前保留 root-hosted LKL 路径作为回归基线。
 
 ## Phase 2.2：可回收 host 资源与同步语义
 
