@@ -1,0 +1,173 @@
+diff --git a/arch/lkl/include/uapi/asm/host_ops.h b/arch/lkl/include/uapi/asm/host_ops.h
+index c6fb872e3..859444dc7 100644
+--- a/arch/lkl/include/uapi/asm/host_ops.h
++++ b/arch/lkl/include/uapi/asm/host_ops.h
+@@ -136,6 +136,19 @@ struct lkl_host_operations {
+ 	void (*print)(const char *str, int len);
+ 	void (*panic)(void);
+ 
++	/**
++	 * console_start - 启动 host 侧的虚拟串口输入轮询。host 应开一个独立线程
++	 * 轮询输入源（seL4 上为 COM1），把字符放进一个 SPSC 环，并在环从空变非空时
++	 * 调用 lkl_trigger_irq(@irq) 注入 IRQ。可在任意 host 线程调用 lkl_trigger_irq。
++	 * @irq 由 LKL 分配并通过此参数告知 host。
++	 */
++	void (*console_start)(int irq);
++	/**
++	 * console_take - 在 LKL IRQ 上下文中从环里取一个字符（非阻塞）。
++	 * @return 0..255 的字符，或 -1 表示环空。
++	 */
++	int (*console_take)(void);
++
+ 	struct lkl_sem* (*sem_alloc)(int count);
+ 	void (*sem_free)(struct lkl_sem *sem);
+ 	void (*sem_up)(struct lkl_sem *sem);
+diff --git a/arch/lkl/kernel/Makefile b/arch/lkl/kernel/Makefile
+index 80a557a92..e083c665c 100644
+--- a/arch/lkl/kernel/Makefile
++++ b/arch/lkl/kernel/Makefile
+@@ -5,4 +5,4 @@ KASAN_SANITIZE_init.o := n
+ KASAN_SANITIZE_stacktrace.o := n
+ 
+ obj-y = setup.o threads.o irq.o time.o syscalls.o misc.o console.o \
+-	syscalls_32.o cpu.o init.o stacktrace.o
++	syscalls_32.o cpu.o init.o stacktrace.o lkl_tty.o
+diff --git a/arch/lkl/kernel/lkl_tty.c b/arch/lkl/kernel/lkl_tty.c
+new file mode 100644
+index 000000000..8f5119f9f
+--- /dev/null
++++ b/arch/lkl/kernel/lkl_tty.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * arch/lkl/kernel/lkl_tty.c — LKL 虚拟串口（tty），对接 host 的输入输出。
++ *
++ * 输出：tty write → lkl_ops->print（seL4 上为 seL4_DebugPutChar）。
++ * 输入：host 侧独立线程轮询输入源 → 填 SPSC 环 → lkl_trigger_irq(irq)；
++ *       LKL 在 IRQ 上下文调 lkl_ops->console_take 取字符，push 进 tty flip 缓冲。
++ * ldisc（n_tty）负责回显与行编辑，故用户程序 read() 直接拿到整行。
++ *
++ * 设备节点：major 240, minor 0 → /dev/ttyLKL0（需 mknod）。
++ */
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/tty.h>
++#include <linux/tty_driver.h>
++#include <linux/tty_flip.h>
++#include <linux/interrupt.h>
++#include <linux/serial.h>
++#include <asm/host_ops.h>
++#include <asm/irq.h>
++
++static struct tty_driver *lkl_tty_driver;
++static struct tty_port lkl_tty_port;
++static int lkl_tty_irq;
++
++/* IRQ handler：把 host 环里的字符排空，push 进 tty（ldisc 随后回显+排队） */
++static irqreturn_t lkl_tty_irq_handler(int irq, void *dev_id)
++{
++	int c = 0;
++
++	if (!lkl_ops || !lkl_ops->console_take)
++		return IRQ_NONE;
++
++	while ((c = lkl_ops->console_take()) >= 0)
++		tty_insert_flip_char(&lkl_tty_port, (unsigned char)c, TTY_NORMAL);
++	tty_flip_buffer_push(&lkl_tty_port);
++	return IRQ_HANDLED;
++}
++
++static ssize_t lkl_tty_write(struct tty_struct *tty, const u8 *buf, size_t count)
++{
++	if (lkl_ops && lkl_ops->print)
++		lkl_ops->print((const char *)buf, count);
++	return count;
++}
++
++static unsigned int lkl_tty_write_room(struct tty_struct *tty)
++{
++	return 4096;
++}
++
++static int lkl_tty_open(struct tty_struct *tty, struct file *filp)
++{
++	return tty_port_open(&lkl_tty_port, tty, filp);
++}
++
++static void lkl_tty_close(struct tty_struct *tty, struct file *filp)
++{
++	tty_port_close(&lkl_tty_port, tty, filp);
++}
++
++static void lkl_tty_hangup(struct tty_struct *tty)
++{
++	tty_port_hangup(&lkl_tty_port);
++}
++
++static const struct tty_operations lkl_tty_ops = {
++	.open = lkl_tty_open,
++	.close = lkl_tty_close,
++	.write = lkl_tty_write,
++	.write_room = lkl_tty_write_room,
++	.hangup = lkl_tty_hangup,
++};
++
++static const struct tty_port_operations lkl_tty_port_ops = {
++};
++
++static int __init lkl_tty_init(void)
++{
++	int ret;
++
++	if (!lkl_ops || !lkl_ops->console_start || !lkl_ops->console_take)
++		return 0; /* host 未提供虚拟串口，跳过 */
++
++	lkl_tty_driver = tty_alloc_driver(1, TTY_DRIVER_REAL_RAW);
++	if (IS_ERR(lkl_tty_driver))
++		return PTR_ERR(lkl_tty_driver);
++
++	tty_port_init(&lkl_tty_port);
++	lkl_tty_port.ops = &lkl_tty_port_ops;
++
++	lkl_tty_driver->driver_name = "lkltty";
++	lkl_tty_driver->name = "ttyLKL";
++	lkl_tty_driver->major = 240;
++	lkl_tty_driver->minor_start = 0;
++	lkl_tty_driver->type = TTY_DRIVER_TYPE_SERIAL;
++	lkl_tty_driver->subtype = SERIAL_TYPE_NORMAL;
++	lkl_tty_driver->init_termios = tty_std_termios;
++	/* n_tty 默认 ICANON|ECHO|ISIG：行编辑与回显由 ldisc 完成 */
++	tty_set_operations(lkl_tty_driver, &lkl_tty_ops);
++	tty_port_link_device(&lkl_tty_port, lkl_tty_driver, 0);
++
++	ret = tty_register_driver(lkl_tty_driver);
++	if (ret < 0)
++		goto err_port;
++
++	lkl_tty_irq = lkl_get_free_irq("lkltty");
++	if (lkl_tty_irq < 0) {
++		ret = lkl_tty_irq;
++		goto err_unreg;
++	}
++	ret = request_irq(lkl_tty_irq, lkl_tty_irq_handler, 0, "lkltty", NULL);
++	if (ret)
++		goto err_putirq;
++
++	/* 通知 host 开始轮询输入，并把 IRQ 号给它（host 收到字符后 lkl_trigger_irq） */
++	lkl_ops->console_start(lkl_tty_irq);
++	pr_info("lkl_tty: /dev/ttyLKL0 ready (irq %d)\n", lkl_tty_irq);
++	return 0;
++
++err_putirq:
++	lkl_put_irq(lkl_tty_irq, "lkltty");
++err_unreg:
++	tty_unregister_driver(lkl_tty_driver);
++err_port:
++	tty_port_destroy(&lkl_tty_port);
++	tty_driver_kref_put(lkl_tty_driver);
++	return ret;
++}
++device_initcall(lkl_tty_init);
++
++MODULE_DESCRIPTION("LKL virtual serial tty backed by host ops");
++MODULE_LICENSE("GPL");

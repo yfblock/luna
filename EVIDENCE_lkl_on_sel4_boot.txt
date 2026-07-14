@@ -1,0 +1,146 @@
+./simulate: QEMU command: /home/yfblock/.local/bin/qemu-system-x86_64  -cpu Nehalem,-vme,+pdpe1gb,-xsave,-xsaveopt,-xsavec,-fsgsbase,-invpcid,+syscall,+lm,enforce -nographic -serial mon:stdio -m size=512M  -kernel images/kernel-x86_64-pc99 -initrd images/luna-lkl-image-x86_64-pc99 c[?7lSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+1EFD1D60+1EF31D60 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from ROM..Boot config: debug_port = 0x3f8
+Boot config: disable_iommu = false
+Detected 1 boot module(s):
+  module #0: start=0xa14000 end=0x95c9a80 size=0x8bb5a80 name='images/luna-lkl-image-x86_64-pc99'
+Parsing GRUB physical memory map
+	Physical Memory Region from 0 size 9fc00 type 1
+	Physical Memory Region from 9fc00 size 400 type 2
+	Physical Memory Region from f0000 size 10000 type 2
+	Physical Memory Region from 100000 size 1fee0000 type 1
+Adding physical memory region 0x100000-0x1ffe0000
+	Physical Memory Region from 1ffe0000 size 20000 type 2
+	Physical Memory Region from fffc0000 size 40000 type 2
+Multiboot gave us no video information
+ACPI: RSDP paddr=0xf52e0
+ACPI: RSDP vaddr=0xf52e0
+ACPI: RSDT paddr=0x1ffe2328
+ACPI: RSDT vaddr=0x1ffe2328
+Kernel loaded to: start=0x100000 end=0xa13000 size=0x913000 entry=0x1002f7
+ACPI: RSDT paddr=0x1ffe2328
+ACPI: RSDT vaddr=0x1ffe2328
+ACPI: FADT paddr=0x1ffe21dc
+ACPI: FADT vaddr=0x1ffe21dc
+ACPI: FADT flags=0x80a5
+ACPI: MADT paddr=0x1ffe2250
+ACPI: MADT vaddr=0x1ffe2250
+ACPI: MADT apic_addr=0xfee00000
+ACPI: MADT flags=0x1
+ACPI: MADT_APIC apic_id=0x0
+ACPI: MADT_IOAPIC ioapic_id=0 ioapic_addr=0xfec00000 gsib=0
+ACPI: MADT_ISO bus=0 source=0 gsi=0x002 flags=0x0
+ACPI: MADT_ISO bus=0 source=5 gsi=0x005 flags=0xd
+ACPI: MADT_ISO bus=0 source=9 gsi=0x009 flags=0xd
+ACPI: MADT_ISO bus=0 source=10 gsi=0x00a flags=0xd
+ACPI: MADT_ISO bus=0 source=11 gsi=0x00b flags=0xd
+ACPI: 1 CPU(s) detected
+ELF-loading userland images from boot modules:
+size=0x2e3a000 v_entry=0xabf841 v_start=0x400000 v_end=0x323a000 p_start=0x95ca000 p_end=0xc404000
+Moving loaded userland images to final location: from=0x95ca000 to=0xa13000 size=0x2e3a000
+Starting node #0 with APIC ID 0
+Mapping kernel window is done
+available phys memory regions: 1
+  [100000..1ffe0000)
+reserved virt address space regions: 1
+  [ffffff8000100000..ffffff800384d000)
+Booting all finished, dropped to user space
+
+Warning: using printf before serial is set up. This only works as your
+printf is backed by seL4_Debug_PutChar()
+luna: start
+luna: vspace ok
+luna: host backend ok
+luna: lkl_init ok
+luna: calling lkl_start_kernel...
+[    0.000000] Linux version 6.12.0+ (yfblock@9950x) (gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #1 Mon Jul 13 12:22:09 CST 2026
+[    0.000000] memblock address range: 0x10d2000 - 0x20d2000
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x00000000010d2000-0x00000000020d1fff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x00000000010d2000-0x00000000020d1fff]
+[    0.000000] Initmem setup node 0 [mem 0x00000000010d2000-0x00000000020d1fff]
+[    0.000000] pcpu-alloc: s0 r0 d32768 u32768 alloc=1*32768
+[    0.000000] pcpu-alloc: [0] 0 
+[    0.000000] Kernel command line:  mem=16M loglevel=8
+[    0.000000] Dentry cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 4096
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=32, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 4096
+[    0.000000] lkl: irqs initialized
+[    0.000000] clocksource: lkl: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.000000] lkl: time and timers initialized (irq1)
+[    0.000000] pid_max: default: 32768 minimum: 301
+[    0.000000] Mount-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000000] Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000000] Memory: 13920K/16384K available (6786K kernel code, 911K rwdata, 2534K rodata, 332K init, 353K bss, 344K reserved, 0K cma-reserved)
+[    0.000000] printk: legacy console [lkl_console0] enabled
+[    0.000000] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+[    0.000000] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.000000] lkl_pci lkl_pci: probe with driver lkl_pci failed with error -1
+[    0.000000] raid6: skipped pq benchmark and selected int64x8
+[    0.000000] raid6: using intx1 recovery algorithm
+[    0.000000] vgaarb: loaded
+[    0.000000] clocksource: Switched to clocksource lkl
+[    0.000000] NET: Registered PF_INET protocol family
+[    0.000000] IP idents hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.000000] tcp_listen_portaddr_hash hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000000] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.000000] TCP established hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.000000] TCP bind hash table entries: 512 (order: 1, 8192 bytes, linear)
+[    0.000000] TCP: Hash tables configured (established 512 bind 512)
+[    0.000000] UDP hash table entries: 256 (order: 1, 8192 bytes, linear)
+[    0.000000] UDP-Lite hash table entries: 256 (order: 1, 8192 bytes, linear)
+[    0.000000] PCI: CLS 0 bytes, default 32
+[    0.000000] workingset: timestamp_bits=62 max_order=12 bucket_order=0
+[    0.000000] SGI XFS with ACLs, security attributes, no debug enabled
+[    0.000000] xor: automatically using best checksumming function   8regs     
+[    0.000000] io scheduler mq-deadline registered
+[    0.000000] io scheduler kyber registered
+[    0.000000] NET: Registered PF_INET6 protocol family
+[    0.000000] Segment Routing with IPv6
+[    0.000000] In-situ OAM (IOAM) with IPv6
+[    0.000000] sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+[    0.000000] Btrfs loaded, zoned=no, fsverity=no
+[    0.000000] Warning: unable to open an initial console.
+[    0.000000] This architecture does not have kernel memory protection.
+[    0.000000] Run /init as init process
+[    0.000000]   with arguments:
+[    0.000000]     /init
+[    0.000000]   with environment:
+[    0.000000]     HOME=/
+[    0.000000]     TERM=linux
+luna: lkl_start_kernel returned 0
+hello from LKL on seL4
+luna: hello emitted via LKL console
+[    0.000000] reboot: Restarting system
+Caught cap fault in send phase at address 0
+while trying to handle:
+vm fault on data at address 0 with status 0x4
+in thread 0xffffff801fe1f400 "luna-lkl-root" at address 0
+With stack:
+0x3133248: 0xabfed8
+0x3133250: 0x31332a0
+0x3133258: 0x0
+0x3133260: 0x31332a0
+0x3133268: 0xabf961
+0x3133270: 0x0
+0x3133278: 0x31332e0
+0x3133280: 0x31332d0
+0x3133288: 0x31332c0
+0x3133290: 0x1
+0x3133298: 0x401060
+0x31332a0: 0x31333c0
+0x31332a8: 0xabfaf5
+0x31332b0: 0x0
+0x31332b8: 0x323b000
+0x31332c0: 0xd155d4
+qemu-system-x86_64: terminating on signal 15 from pid 1273715 (timeout)

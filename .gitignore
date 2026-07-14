@@ -1,0 +1,24 @@
+# Local dependency checkouts and their build trees.
+/deps/*
+!/deps/lkl_settings.cmake
+
+# Extracted and generated build artifacts.
+/build-artifacts/
+/build/
+/cmake-build-*/
+
+# Generic native build output.
+*.a
+*.o
+*.so
+*.d
+*.tmp
+
+# Editor and OS metadata.
+.cache/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+

@@ -1,0 +1,76 @@
+./simulate: QEMU command: /home/yfblock/.local/bin/qemu-system-x86_64  -cpu Nehalem,-vme,+pdpe1gb,-xsave,-xsaveopt,-xsavec,-fsgsbase,-invpcid,+syscall,+lm,enforce -nographic -serial mon:stdio -m size=512M  -kernel images/kernel-x86_64-pc99 -initrd images/hello-world-image-x86_64-pc99 c[?7lSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+1EFD1D60+1EF31D60 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from ROM..Boot config: debug_port = 0x3f8
+Boot config: disable_iommu = false
+Detected 1 boot module(s):
+  module #0: start=0xa14000 end=0xa5a168 size=0x46168 name='images/hello-world-image-x86_64-pc99'
+Parsing GRUB physical memory map
+	Physical Memory Region from 0 size 9fc00 type 1
+	Physical Memory Region from 9fc00 size 400 type 2
+	Physical Memory Region from f0000 size 10000 type 2
+	Physical Memory Region from 100000 size 1fee0000 type 1
+Adding physical memory region 0x100000-0x1ffe0000
+	Physical Memory Region from 1ffe0000 size 20000 type 2
+	Physical Memory Region from fffc0000 size 40000 type 2
+Multiboot gave us no video information
+ACPI: RSDP paddr=0xf52e0
+ACPI: RSDP vaddr=0xf52e0
+ACPI: RSDT paddr=0x1ffe2328
+ACPI: RSDT vaddr=0x1ffe2328
+Kernel loaded to: start=0x100000 end=0xa13000 size=0x913000 entry=0x1002f7
+ACPI: RSDT paddr=0x1ffe2328
+ACPI: RSDT vaddr=0x1ffe2328
+ACPI: FADT paddr=0x1ffe21dc
+ACPI: FADT vaddr=0x1ffe21dc
+ACPI: FADT flags=0x80a5
+ACPI: MADT paddr=0x1ffe2250
+ACPI: MADT vaddr=0x1ffe2250
+ACPI: MADT apic_addr=0xfee00000
+ACPI: MADT flags=0x1
+ACPI: MADT_APIC apic_id=0x0
+ACPI: MADT_IOAPIC ioapic_id=0 ioapic_addr=0xfec00000 gsib=0
+ACPI: MADT_ISO bus=0 source=0 gsi=0x002 flags=0x0
+ACPI: MADT_ISO bus=0 source=5 gsi=0x005 flags=0xd
+ACPI: MADT_ISO bus=0 source=9 gsi=0x009 flags=0xd
+ACPI: MADT_ISO bus=0 source=10 gsi=0x00a flags=0xd
+ACPI: MADT_ISO bus=0 source=11 gsi=0x00b flags=0xd
+ACPI: 1 CPU(s) detected
+ELF-loading userland images from boot modules:
+size=0x126000 v_entry=0x401124 v_start=0x400000 v_end=0x526000 p_start=0xa5b000 p_end=0xb81000
+Moving loaded userland images to final location: from=0xa5b000 to=0xa13000 size=0x126000
+Starting node #0 with APIC ID 0
+Mapping kernel window is done
+available phys memory regions: 1
+  [100000..1ffe0000)
+reserved virt address space regions: 1
+  [ffffff8000100000..ffffff8000b39000)
+Booting all finished, dropped to user space
+Hello, World!
+Second hello
+Caught cap fault in send phase at address 0
+while trying to handle:
+vm fault on data at address 0 with status 0x4
+in thread 0xffffff801fe08400 "rootserver" at address 0
+With stack:
+0x41ee78: 0x4017bb
+0x41ee80: 0x41eef0
+0x41ee88: 0x0
+0x41ee90: 0x41eed0
+0x41ee98: 0x401244
+0x41eea0: 0x0
+0x41eea8: 0x41ef10
+0x41eeb0: 0x41ef00
+0x41eeb8: 0x41eef0
+0x41eec0: 0x1
+0x41eec8: 0x4010f6
+0x41eed0: 0x41eff0
+0x41eed8: 0x4013d8
+0x41eee0: 0x0
+0x41eee8: 0x527000
+0x41eef0: 0x414028
+qemu-system-x86_64: terminating on signal 15 from pid 1240895 (timeout)
