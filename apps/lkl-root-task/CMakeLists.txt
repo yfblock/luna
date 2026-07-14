@@ -28,8 +28,40 @@ if(NOT LKL_KERNEL_OBJ OR NOT EXISTS "${LKL_KERNEL_OBJ}")
     message(FATAL_ERROR "LKL_KERNEL_OBJ 未设置或不存在：${LKL_KERNEL_OBJ}")
 endif()
 
+add_executable(luna-lkl-task
+    src/isolation_child.c
+)
+target_include_directories(luna-lkl-task PRIVATE include)
+target_include_directories(luna-lkl-task PRIVATE
+    ${LKL_LINUX_DIR}/tools/lkl/include
+)
+target_compile_options(luna-lkl-task PRIVATE
+    -O2 -g -Wall -Wextra -Wno-unused-parameter
+)
+target_link_libraries(luna-lkl-task
+    ${LKL_KERNEL_OBJ}
+    sel4runtime sel4 muslc utils sel4muslcsys
+)
+
+include(cpio)
+set(LUNA_CHILD_CPIO_DIR "${CMAKE_CURRENT_BINARY_DIR}/child-cpio")
+set(LUNA_CHILD_CPIO_ELF "${LUNA_CHILD_CPIO_DIR}/luna-lkl-task")
+add_custom_command(
+    OUTPUT "${LUNA_CHILD_CPIO_ELF}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${LUNA_CHILD_CPIO_DIR}"
+    COMMAND ${CMAKE_OBJCOPY} --strip-debug
+            "$<TARGET_FILE:luna-lkl-task>" "${LUNA_CHILD_CPIO_ELF}"
+    DEPENDS luna-lkl-task
+    COMMENT "Strip debug sections from embedded isolation child"
+    VERBATIM
+)
+MakeCPIO(isolation-child-archive.o "${LUNA_CHILD_CPIO_ELF}"
+         DEPENDS luna-lkl-task)
+
 add_executable(luna-lkl
+    isolation-child-archive.o
     src/main.c
+    src/isolation_manager.c
     src/lkl_host_ops.c
     src/shell.c
 )

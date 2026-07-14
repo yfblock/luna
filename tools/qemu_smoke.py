@@ -25,6 +25,11 @@ COMMANDS = [
 ]
 
 REQUIRED = [
+    b"LUNA_ISOLATION_FAULT_OK",
+    b"LUNA_ISOLATION_CHANNEL_OK",
+    b"LUNA_LKL_CHILD_LINKED",
+    b"LUNA_ISOLATION_RESTART_OK",
+    b"LUNA_ISOLATION_OK",
     b"luna: host thread reuse test ok",
     b"unknown: " + b"x" * 200,
     b"lkl: time and timers initialized",

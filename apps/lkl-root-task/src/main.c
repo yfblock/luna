@@ -14,6 +14,7 @@
  *   6. lkl_sys_halt。
  */
 #include "sel4_lkl_host.h"
+#include "luna_isolation.h"
 #include <sel4/sel4.h>
 #include <sel4runtime.h>
 #include <simple-default/simple-default.h>
@@ -64,6 +65,13 @@ int main(int argc, char **argv)
     int err = sel4utils_bootstrap_vspace_with_bootinfo(&vspace, &vspace_data, pd, &vka, info, NULL, NULL);
     ZF_LOGF_IF(err, "vspace bootstrap failed: %d", err);
     printf("luna: vspace ok\n");
+
+    /* Establish the child-task boundary before LKL is gradually migrated into
+       it. A faulting child must be diagnosable and replaceable without harming
+       the manager or the existing LKL baseline. */
+    err = luna_isolation_smoke(&simple, &vka, &vspace);
+    ZF_LOGF_IF(err, "isolation smoke failed");
+    printf("LUNA_ISOLATION_OK\n");
 
     /* 2. 初始化 host 后端并验证线程槽可累计复用。 */
     err = sel4_lkl_host_init(&simple, &vka, &vspace, cnode, root_tcb);

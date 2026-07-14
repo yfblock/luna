@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef LUNA_ISOLATION_PROTOCOL_H
+#define LUNA_ISOLATION_PROTOCOL_H
+
+#include <sel4/sel4.h>
+
+#define LUNA_ISOLATION_CHILD_IMAGE "luna-lkl-task"
+#define LUNA_ISOLATION_SECRET        ((seL4_Word)0x4c554e4153454352ULL)
+
+enum luna_isolation_mode {
+    LUNA_ISOLATION_MODE_FAULT = 1,
+    LUNA_ISOLATION_MODE_CLEAN = 2,
+};
+
+enum luna_isolation_event {
+    LUNA_ISOLATION_EVENT_READY = 0x100,
+    LUNA_ISOLATION_EVENT_DONE = 0x101,
+    LUNA_ISOLATION_EVENT_LKL_LINKED = 0x102,
+    LUNA_ISOLATION_EVENT_PRIVATE_PAGE_VISIBLE = 0x1ff,
+};
+
+#endif /* LUNA_ISOLATION_PROTOCOL_H */
