@@ -104,7 +104,7 @@ export LKL_LINUX_DIR=$PWD/deps/lkl-linux
 export LKL_KERNEL_OBJ=$PWD/build-artifacts/lkl-kernel.o   # ar x liblkl.a lkl.o
 
 # 1) 建 liblkl.a 并抽取干净内核对象 lkl.o
-make -C deps/lkl-linux/tools/lkl -j
+make -C deps/lkl-linux/tools/lkl -j liblkl.a
 ar x deps/lkl-linux/tools/lkl/liblkl.a lkl.o && mv lkl.o build-artifacts/lkl-kernel.o
 
 # 2) 配置 + 构建 seL4 root task（含 LKL）

@@ -51,8 +51,10 @@ if [[ $DO_BUILD == 1 ]]; then
         exit 1
     }
 
-    step "build liblkl.a"
-    make -C "$LKL_LINUX/tools/lkl" -j"$(nproc)" >/dev/null
+    step "build LKL kernel archive"
+    # luna only extracts lkl.o. Building the default tools/lkl target also links
+    # optional tests and hijack libraries, adding unrelated CI dependencies.
+    make -C "$LKL_LINUX/tools/lkl" -j"$(nproc)" liblkl.a
 
     step "extract clean kernel object lkl.o"
     mkdir -p "$ROOT/build-artifacts"
