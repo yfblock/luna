@@ -14,7 +14,17 @@ patch in `patches/lkl-tty.patch`.
 - Manifest commit: `cf8e88fbd953fedbf65ddee6eac6ccabb4a36df3`
 - Manifest file: `default.xml`
 
-From the luna repository root:
+The supported path from the luna repository root is:
+
+```sh
+./setup-deps.sh
+```
+
+It verifies the host tools and Python modules, synchronizes the pinned seL4
+manifest, checks out the exact LKL base revision, and applies the tty patch
+idempotently. Use `./setup-deps.sh --check-only` to audit an existing checkout.
+
+The equivalent manual seL4 commands are:
 
 ```sh
 mkdir -p deps
@@ -42,4 +52,3 @@ After checkout, follow the build instructions in `README.md` or run
 
 The current build also expects the Python packages and `xmllint` setup noted
 in `README.md`.
-

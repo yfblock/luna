@@ -19,7 +19,6 @@
 #include <vspace/vspace.h>
 #include <simple/simple.h>
 #include <sel4utils/thread.h>
-#include <sel4platsupport/timer.h>
 #include <platsupport/io.h>
 #include <lkl_host.h>
 
@@ -32,16 +31,20 @@ struct sel4_lkl_ctx {
     vspace_t        *vspace;
     seL4_CPtr        cspace;
     seL4_CPtr        root_tcb;
-    seL4_CPtr        fault_ntfn;
-    vka_object_t     fault_ntfn_obj;
+    seL4_CPtr        fault_ep;
+    vka_object_t     fault_ep_obj;
     ps_io_port_ops_t io_port_ops;   /* COM1 轮询输入用 */
+    int              io_port_inited;
 
-    /* timer */
-    seL4_timer_t     timer;
-    seL4_CPtr        timer_ntfn;
-    vka_object_t     timer_ntfn_obj;
+    /* PIT 校准后的 TSC 单调时钟 + polling oneshot timer。 */
     sel4utils_thread_t timer_thread;
     int              timer_inited;
+    int              timer_thread_started;
+    volatile int     timer_stop;
+    volatile int     timer_armed;
+    unsigned long long timer_deadline_ns;
+    unsigned long long tsc_freq;
+    unsigned long long tsc_epoch_ns;
     void           (*timer_fn)(void);   /* LKL 注册的回调 → lkl_trigger_irq(TIMER_IRQ) */
 };
 
@@ -50,5 +53,10 @@ extern struct lkl_host_operations seL4_lkl_host_ops;
 
 int sel4_lkl_host_init(simple_t *simple, vka_t *vka, vspace_t *vspace,
                        seL4_CPtr cspace, seL4_CPtr root_tcb);
+int sel4_lkl_host_thread_reuse_test(void);
+unsigned long long sel4_lkl_host_time(void);
+int sel4_lkl_host_console_ready(void);
+void sel4_lkl_host_stop_console(void);
+void sel4_lkl_host_shutdown(void);
 
 #endif /* SEL4_LKL_HOST_H */

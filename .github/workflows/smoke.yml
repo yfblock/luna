@@ -1,0 +1,30 @@
+name: QEMU smoke
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  qemu-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libssl-dev libelf-dev cmake ninja-build qemu-system-x86 gcc-multilib g++-multilib cpio libxml2-utils repo python3-pip nasm
+          python3 -m pip install --break-system-packages sh aenum pyelftools sortedcontainers future jinja2
+          git config --global user.name github-actions
+          git config --global user.email github-actions@users.noreply.github.com
+
+      - name: Fetch pinned source dependencies
+        run: ./setup-deps.sh
+
+      - name: Build
+        run: ./run.sh --build-only
+
+      - name: Boot and exercise the LKL shell
+        run: ./tools/smoke-test.sh --timeout 120

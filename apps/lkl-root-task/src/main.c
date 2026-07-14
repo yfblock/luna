@@ -4,9 +4,9 @@
  *
  * 流程（见 DESIGN.md）：
  *   1. 从 bootinfo 引导 simple/vka/vspace（root task 自用 + 供 LKL host_ops 分配 TCB/栈）。
- *   2. sel4_lkl_host_init：建 fault ntfn、ltimer + 定时器服务线程。
+ *   2. sel4_lkl_host_init：建 fault endpoint、TSC 时钟 + oneshot 服务线程。
  *   3. lkl_init(&seL4_lkl_host_ops) 注入 host ops。
- *   4. lkl_start_kernel("mem=64M ...") —— LKL 内核在派生 TCB 上跑起来，
+ *   4. lkl_start_kernel("mem=16M ...") —— LKL 内核在派生 TCB 上跑起来，
  *      完成 start_kernel → run_init_process("/init")（lkl_run_init binfmt 空操作）→
  *      sem_up(init_sem) + thread_exit，随后本函数（宿主线程）成为 init/PID1 返回。
  *   5. lkl_sys_write(1, "hello from LKL on seL4\n") —— 经 lkl_syscall → LKL sys_write →
@@ -30,10 +30,7 @@
 #include <platsupport/io.h>
 #include <utils/util.h>
 #include <lkl.h>
-#include <stdio.h>
-
 void luna_shell_run(void);
-#include <stdio.h>
 
 #define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 256)
 static char allocator_mem_pool[ALLOCATOR_STATIC_POOL_SIZE];
@@ -68,10 +65,14 @@ int main(int argc, char **argv)
     ZF_LOGF_IF(err, "vspace bootstrap failed: %d", err);
     printf("luna: vspace ok\n");
 
-    /* 2. 初始化 host 后端（fault ntfn + ltimer + 定时器服务线程） */
+    /* 2. 初始化 host 后端并验证线程槽可累计复用。 */
     err = sel4_lkl_host_init(&simple, &vka, &vspace, cnode, root_tcb);
     ZF_LOGF_IF(err, "lkl host init failed");
     printf("luna: host backend ok\n");
+    err = sel4_lkl_host_thread_reuse_test();
+    ZF_LOGF_IF(err, "host thread reuse test failed");
+    printf("luna: host thread reuse test ok\n");
+    printf("luna: timer monotonic start=%llu ns\n", sel4_lkl_host_time());
 
     /* 3. 注入 host ops */
     err = lkl_init(&seL4_lkl_host_ops);
@@ -84,9 +85,7 @@ int main(int argc, char **argv)
     printf("luna: lkl_start_kernel returned %d\n", err);
     ZF_LOGF_IF(err, "lkl_start_kernel failed: %d", err);
 
-    /* 5. 宿主即 init：打印 hello。
-       LKL 控制台为 printk-console（无 tty 设备节点，/dev/console 返回 -ENODEV），
-       故用 LKL 控制台 API lkl_printf（→ lkl_ops->print → seL4_DebugPutChar）输出。 */
+    /* 5. 宿主即 init：先经 printk console 打印 hello；随后创建 ttyLKL 设备节点。 */
     lkl_printf("hello from LKL on seL4\n");
     printf("luna: hello emitted via LKL console\n");
 
@@ -98,17 +97,27 @@ int main(int argc, char **argv)
     lkl_sys_close(0); lkl_sys_close(1); lkl_sys_close(2);   /* 确保空出 */
     long tfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 0 */
     printf("luna: /dev/ttyLKL0 first open fd=%ld\n", tfd);
-    if (tfd >= 0) {
-        lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 1 */
-        lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 2 */
+    if (tfd == 0 && sel4_lkl_host_console_ready()) {
+        long outfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 1 */
+        long errfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 2 */
+        ZF_LOGF_IF(outfd != 1 || errfd != 2, "tty fd setup failed: %ld/%ld", outfd, errfd);
         lkl_sys_mkdir("/proc", 0555);
         lkl_sys_mkdir("/tmp", 0755);
         lkl_sys_mount("proc", "/proc", "proc", 0, NULL);
         luna_shell_run();
+    } else {
+        printf("luna: interactive console unavailable\n");
     }
 
-    /* 6. 关停（halt 路径在 LKL 协作模型下会触发 reboot，Phase 1 接受其后的次生 fault） */
-    lkl_sys_halt();
+    /* 6. 停止外部输入，再让 LKL 完成线程/时钟清理。根 host task 的 join 是 no-op。 */
+    sel4_lkl_host_stop_console();
+    long halt_ret = lkl_sys_halt();
+    printf("luna: lkl_sys_halt returned %ld\n", halt_ret);
     lkl_cleanup();
-    return 0;
+    sel4_lkl_host_shutdown();
+    printf("LUNA_SHUTDOWN_OK\n");
+
+    /* root task 没有父进程可返回；进入明确的 quiescent 状态，由测试端结束 QEMU。 */
+    seL4_TCB_Suspend(root_tcb);
+    for (;;) seL4_Yield();
 }

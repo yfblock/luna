@@ -30,7 +30,9 @@ while [[ $# -gt 0 ]]; do
         --build-only) DO_RUN=0;;
         --run-only)   DO_BUILD=0;;
         --no-timeout) TIMEOUT=0;;
-        --timeout) TIMEOUT="$2"; shift;;
+        --timeout)
+            [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--timeout 需要非负整数秒数" >&2; exit 2; }
+            TIMEOUT="$2"; shift;;
         *) echo "unknown arg: $1" >&2; exit 2;;
     esac
     shift
@@ -43,8 +45,11 @@ step() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 if [[ $DO_BUILD == 1 ]]; then
     step "sanity checks"
     [[ -d "$LKL_LINUX/tools/lkl" ]] || { echo "缺 lkl-linux：$LKL_LINUX" >&2; exit 1; }
-    [[ -x "$QEMU" ]] || { echo "缺 qemu-system-x86_64" >&2; exit 1; }
     command -v xmllint >/dev/null || { echo "缺 xmllint stub（见 README）" >&2; exit 1; }
+    git -C "$LKL_LINUX" apply --check --reverse "$ROOT/patches/lkl-tty.patch" >/dev/null 2>&1 || {
+        echo "LKL tty 补丁未应用；请运行 ./setup-deps.sh" >&2
+        exit 1
+    }
 
     step "build liblkl.a"
     make -C "$LKL_LINUX/tools/lkl" -j"$(nproc)" >/dev/null
@@ -65,12 +70,13 @@ fi
 
 if [[ $DO_RUN == 1 ]]; then
     step "boot on QEMU  (qemu: $QEMU)"
+    [[ -x "$QEMU" ]] || { echo "缺 qemu-system-x86_64" >&2; exit 1; }
     [[ -x "$BUILD/simulate" ]] || { echo "未构建：先 ./run.sh --build-only" >&2; exit 1; }
     cd "$BUILD"
     # 直接透传，不过 sed：sed 按行处理会吞掉逐字符回显（交互 shell 必须）。
     # 启动时 seL4 的 ANSI（ESC[?7l ESC[2J）会清一次屏，可接受。
     if [[ $TIMEOUT -gt 0 ]]; then
-        timeout "$TIMEOUT" ./simulate -b "$QEMU" || true
+        timeout "$TIMEOUT" ./simulate -b "$QEMU"
     else
         ./simulate -b "$QEMU"
     fi

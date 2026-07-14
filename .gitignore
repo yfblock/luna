@@ -13,6 +13,8 @@
 *.so
 *.d
 *.tmp
+__pycache__/
+*.pyc
 
 # Editor and OS metadata.
 .cache/
@@ -21,4 +23,3 @@
 *.swp
 *~
 .DS_Store
-

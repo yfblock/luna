@@ -6,10 +6,11 @@
  * 输出：lkl_sys_write(1, ...) —— 经 LKL tty write → lkl_ops->print → seL4_DebugPutChar。
  * 命令：经 lkl_sys_* 在 LKL 内核上执行。
  *
- * fd 0/1/2 由 main.c 打开 /dev/ttyLKL0 并 dup2 设置。
+ * fd 0/1/2 由 main.c 依次打开 /dev/ttyLKL0 设置。
  */
 #include "sel4_lkl_host.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <lkl.h>
@@ -23,7 +24,10 @@ static void sh_printf(const char *fmt, ...)
     va_list ap; va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) sh_write(buf, n);
+    if (n > 0) {
+        long len = n < (int)sizeof(buf) ? n : (long)sizeof(buf) - 1;
+        sh_write(buf, len);
+    }
 }
 
 /* 读一行（ldisc 已行编辑并回显，read 返回含 \n 的整行） */
@@ -56,7 +60,7 @@ static void cmd_ls(const char *path)
     long fd = lkl_sys_open(path, LKL_O_RDONLY | LKL_O_DIRECTORY, 0);
     if (fd < 0) { sh_printf("ls: %s: %ld\n", path, fd); return; }
     char buf[512]; long n;
-    while ((n = lkl_sys_getdents64((int)fd, buf, sizeof(buf))) > 0) {
+    while ((n = lkl_sys_getdents64((int)fd, (struct lkl_linux_dirent64 *)buf, sizeof(buf))) > 0) {
         long off = 0;
         while (off < n) {
             struct lkl_linux_dirent64 *d = (struct lkl_linux_dirent64 *)(buf + off);
@@ -98,6 +102,25 @@ static void cmd_write(const char *path, const char *text)
     sh_printf("wrote %ld bytes to %s\n", n, path);
 }
 
+static void cmd_sleep(const char *value)
+{
+    char *end = NULL;
+    unsigned long ms = strtoul(value, &end, 10);
+    if (!value[0] || (end && *end) || ms > 60000) {
+        sh_puts("sleep: milliseconds must be 0..60000\n");
+        return;
+    }
+    struct __lkl__kernel_timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (ms % 1000) * 1000000UL,
+    };
+    unsigned long long before = sel4_lkl_host_time();
+    long r = lkl_sys_nanosleep(&ts, NULL);
+    unsigned long long elapsed = sel4_lkl_host_time() - before;
+    if (r < 0) sh_printf("sleep: %ld\n", r);
+    else sh_printf("slept %lu ms (elapsed %llu ns)\n", ms, elapsed);
+}
+
 static void prompt(void)
 {
     char cwd[256];
@@ -120,15 +143,15 @@ void luna_shell_run(void)
         else if (!strcmp(cmd, "help"))
             sh_puts("ls [path] cat <f> cd [path] pwd mkdir <d> rmdir <d> rm <f>\n"
                     "touch <f> write <f> <text...> stat <f> echo <text...>\n"
-                    "mount <src> <dir> <fstype>  free  exit\n");
+                    "mount <src> <dir> <fstype> free sleep <ms> time exit\n");
         else if (!strcmp(cmd, "ls")) cmd_ls(argc > 1 ? argv[1] : ".");
         else if (!strcmp(cmd, "cat")) { if (argc > 1) cmd_cat(argv[1]); else sh_puts("cat: need file\n"); }
         else if (!strcmp(cmd, "cd")) { long r = lkl_sys_chdir(argc > 1 ? argv[1] : "/"); if (r<0) sh_printf("cd: %ld\n", r); }
-        else if (!strcmp(cmd, "pwd")) { char c[256]; lkl_sys_getcwd(c, sizeof(c)); sh_printf("%s\n", c); }
+        else if (!strcmp(cmd, "pwd")) { char c[256]; if (lkl_sys_getcwd(c, sizeof(c)) > 0) sh_printf("%s\n", c); else sh_puts("pwd: getcwd failed\n"); }
         else if (!strcmp(cmd, "mkdir")) { if (argc>1){long r=lkl_sys_mkdir(argv[1],0755); if(r<0) sh_printf("mkdir: %ld\n",r);} }
         else if (!strcmp(cmd, "rmdir")) { if (argc>1){long r=lkl_sys_rmdir(argv[1]); if(r<0) sh_printf("rmdir: %ld\n",r);} }
         else if (!strcmp(cmd, "rm"))    { if (argc>1){long r=lkl_sys_unlink(argv[1]); if(r<0) sh_printf("rm: %ld\n",r);} }
-        else if (!strcmp(cmd, "touch")) { if (argc>1) lkl_sys_close((int)lkl_sys_open(argv[1], LKL_O_CREAT, 0644)); }
+        else if (!strcmp(cmd, "touch")) { if (argc>1) { long fd=lkl_sys_open(argv[1], LKL_O_CREAT,0644); if(fd<0) sh_printf("touch: %ld\n",fd); else lkl_sys_close((int)fd); } }
         else if (!strcmp(cmd, "write")) {
             if (argc > 2) {
                 char text[200]; text[0]=0;
@@ -143,6 +166,8 @@ void luna_shell_run(void)
             else sh_puts("mount <src> <dir> <fstype>\n");
         }
         else if (!strcmp(cmd, "free")) cmd_cat("/proc/meminfo");
+        else if (!strcmp(cmd, "sleep")) { if (argc > 1) cmd_sleep(argv[1]); else sh_puts("sleep: need milliseconds\n"); }
+        else if (!strcmp(cmd, "time")) sh_printf("monotonic_ns=%llu\n", sel4_lkl_host_time());
         else sh_printf("unknown: %s (try help)\n", cmd);
     }
 }

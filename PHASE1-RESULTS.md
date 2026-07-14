@@ -1,5 +1,9 @@
 # Phase 1.1 — 实际实现与验证结果（已跑通）
 
+> 本文保留 Phase 1.1 的历史实现和踩坑记录。timer、线程复用、fault endpoint、关机路径与
+> 自动化测试已经在 Phase 1.2 中更新，当前状态以 [`PHASE1.2-RESULTS.md`](PHASE1.2-RESULTS.md)
+> 为准。
+
 本文件记录 Phase 1.1 **实际**落地并经 QEMU 验证的结果，与早期 `DESIGN.md` 中基于假设的方案
 （initramfs + execve 静态 ELF + virtio）不同——核对真实 `lkl/linux` 源码后，那些假设不成立。
 以下为已验证事实。
