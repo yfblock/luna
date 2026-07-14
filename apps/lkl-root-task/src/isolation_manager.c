@@ -145,8 +145,29 @@ static int receive_event(seL4_CPtr control_ep, seL4_Word expected_badge,
     return 0;
 }
 
+static void send_resource_slot(seL4_CPtr command_ep,
+                               const struct luna_resource_slot *slot,
+                               seL4_Word index)
+{
+    seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_SLOT);
+    seL4_SetMR(1, index);
+    seL4_SetMR(2, LUNA_RESOURCE_SLOTS);
+    seL4_SetMR(3, slot->child_tcb);
+    seL4_SetMR(4, (seL4_Word)(uintptr_t)slot->thread.stack_top);
+    seL4_SetMR(5, slot->thread.stack_size);
+    seL4_SetMR(6, slot->thread.ipc_buffer_addr);
+    seL4_SetMR(7, slot->child_join_ntfn);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 8));
+}
+
+static void send_start(seL4_CPtr command_ep)
+{
+    seL4_SetMR(0, LUNA_COMMAND_START);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+}
+
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
-                       seL4_CPtr control_ep, seL4_CPtr command_ntfn,
+                       seL4_CPtr control_ep, seL4_CPtr command_ep,
                        seL4_Word badge,
                        enum luna_isolation_mode mode, seL4_Word private_addr,
                        sel4utils_process_t *process,
@@ -187,7 +208,7 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
     }
 
     cspacepath_t command_path;
-    vka_cspace_make_path(vka, command_ntfn, &command_path);
+    vka_cspace_make_path(vka, command_ep, &command_path);
     seL4_CPtr child_command = sel4utils_mint_cap_to_process(
         process, command_path, seL4_CapRights_new(false, false, true, false), 0);
     if (!child_command) {
@@ -196,21 +217,14 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         return -1;
     }
 
-    struct luna_resource_slot *slot = &resources->slots[0];
-    char arg_strings[10][WORD_STRING_SIZE];
-    char *argv[10];
-    sel4utils_create_word_args(arg_strings, argv, 10,
+    char arg_strings[4][WORD_STRING_SIZE];
+    char *argv[4];
+    sel4utils_create_word_args(arg_strings, argv, 4,
                                (seL4_Word)child_control,
                                (seL4_Word)child_command,
                                (seL4_Word)mode,
-                               private_addr,
-                               (seL4_Word)LUNA_RESOURCE_SLOTS,
-                               (seL4_Word)slot->child_tcb,
-                               (seL4_Word)(uintptr_t)slot->thread.stack_top,
-                               (seL4_Word)slot->thread.stack_size,
-                               slot->thread.ipc_buffer_addr,
-                               (seL4_Word)slot->child_join_ntfn);
-    if (sel4utils_spawn_process_v(process, vka, manager_vspace, 10, argv, 1)) {
+                               private_addr);
+    if (sel4utils_spawn_process_v(process, vka, manager_vspace, 4, argv, 1)) {
         printf("luna: isolation child spawn failed\n");
         destroy_child(process, resources, vka);
         return -1;
@@ -222,7 +236,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
 {
     const seL4_Word private_addr = (seL4_Word)(uintptr_t)manager_private_page;
     vka_object_t control_ep = {0};
-    vka_object_t command_ntfn = {0};
+    vka_object_t command_ep = {0};
     sel4utils_process_t child = {0};
     struct luna_child_resources resources = {0};
     int control_allocated = 0;
@@ -238,13 +252,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
     }
     control_allocated = 1;
 
-    if (vka_alloc_notification(vka, &command_ntfn)) {
-        printf("luna: isolation command notification allocation failed\n");
+    if (vka_alloc_endpoint(vka, &command_ep)) {
+        printf("luna: isolation command endpoint allocation failed\n");
         goto out;
     }
     command_allocated = 1;
 
-    if (start_child(simple, vka, manager_vspace, control_ep.cptr, command_ntfn.cptr,
+    if (start_child(simple, vka, manager_vspace, control_ep.cptr, command_ep.cptr,
                     CHILD_BADGE_FAULT, LUNA_ISOLATION_MODE_FAULT,
                     private_addr, &child, &resources))
         goto out;
@@ -258,7 +272,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
                       LUNA_ISOLATION_EVENT_LKL_LINKED, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_LINKED\n");
-    seL4_Signal(command_ntfn.cptr);
+    for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++)
+        send_resource_slot(command_ep.cptr, &resources.slots[i], i);
+    if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
+                      LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
+                      LUNA_ISOLATION_MODE_FAULT))
+        goto out;
+    send_start(command_ep.cptr);
 
     if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
                       LUNA_ISOLATION_EVENT_RESOURCE_OK, LUNA_ISOLATION_MODE_FAULT))
@@ -289,7 +309,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
     destroy_child(&child, &resources, vka);
     child_live = 0;
 
-    if (start_child(simple, vka, manager_vspace, control_ep.cptr, command_ntfn.cptr,
+    if (start_child(simple, vka, manager_vspace, control_ep.cptr, command_ep.cptr,
                     CHILD_BADGE_CLEAN, LUNA_ISOLATION_MODE_CLEAN,
                     private_addr, &child, &resources))
         goto out;
@@ -301,7 +321,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_LKL_LINKED, LUNA_ISOLATION_MODE_CLEAN))
         goto out;
-    seL4_Signal(command_ntfn.cptr);
+    for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++)
+        send_resource_slot(command_ep.cptr, &resources.slots[i], i);
+    if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
+                      LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
+                      LUNA_ISOLATION_MODE_CLEAN))
+        goto out;
+    send_start(command_ep.cptr);
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_RESOURCE_OK, LUNA_ISOLATION_MODE_CLEAN))
         goto out;
@@ -319,7 +345,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
 
 out:
     if (child_live) destroy_child(&child, &resources, vka);
-    if (command_allocated) vka_free_object(vka, &command_ntfn);
+    if (command_allocated) vka_free_object(vka, &command_ep);
     if (control_allocated) vka_free_object(vka, &control_ep);
     return result;
 }

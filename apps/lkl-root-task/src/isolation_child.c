@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Minimal payload used to establish the process boundary that LKL will move
- * into. It receives a send-only event endpoint, a wait-only command
- * Notification, plus the capabilities installed by sel4utils for its own
+ * into. It receives a send-only event endpoint, a receive-only command
+ * endpoint, plus the capabilities installed by sel4utils for its own
  * CSpace, VSpace and TCB.
  */
 #include "luna_isolation_protocol.h"
@@ -10,8 +10,8 @@
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
-#include <sel4utils/thread.h>
 #include <lkl_host.h>
+#include <string.h>
 
 static seL4_Word parse_word(const char *s)
 {
@@ -31,51 +31,28 @@ static void send_event(seL4_CPtr control_ep, seL4_Word event, seL4_Word detail)
     seL4_Send(control_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
-struct child_worker_descriptor {
-    sel4utils_thread_t thread;
-    seL4_CPtr self_tcb;
-    seL4_CPtr join_ntfn;
-};
-
-static __thread seL4_Word child_worker_tls;
-static volatile seL4_Word child_worker_result;
-
-static void child_worker(void *arg0, void *arg1, void *ipc_buffer)
+static seL4_MessageInfo_t receive_command(seL4_CPtr command_ep,
+                                          enum luna_manager_command expected)
 {
-    (void)arg1;
-    (void)ipc_buffer;
-    struct child_worker_descriptor *worker = arg0;
-
-    child_worker_tls = LUNA_RESOURCE_TLS_VALUE;
-    child_worker_result = child_worker_tls;
-    seL4_Signal(worker->join_ntfn);
-    seL4_TCB_Suspend(worker->self_tcb);
-    for (;;) seL4_Yield();
+    seL4_Word badge = 0;
+    seL4_MessageInfo_t tag = seL4_Recv(command_ep, &badge);
+    if (badge || seL4_MessageInfo_get_label(tag) != 0 ||
+        seL4_MessageInfo_get_length(tag) < 1 || seL4_GetMR(0) != expected) {
+        for (;;) seL4_Yield();
+    }
+    return tag;
 }
 
 int main(int argc, char **argv)
 {
-    if (argc != 10) {
+    if (argc != 4) {
         for (;;) seL4_Yield();
     }
 
     seL4_CPtr control_ep = (seL4_CPtr)parse_word(argv[0]);
-    seL4_CPtr command_ntfn = (seL4_CPtr)parse_word(argv[1]);
+    seL4_CPtr command_ep = (seL4_CPtr)parse_word(argv[1]);
     seL4_Word mode = parse_word(argv[2]);
     seL4_Word private_addr = parse_word(argv[3]);
-    seL4_Word resource_slots = parse_word(argv[4]);
-    if (resource_slots != LUNA_RESOURCE_SLOTS) {
-        for (;;) seL4_Yield();
-    }
-
-    struct child_worker_descriptor worker = {0};
-    worker.self_tcb = (seL4_CPtr)parse_word(argv[5]);
-    worker.thread.tcb.cptr = worker.self_tcb;
-    worker.thread.stack_top = (void *)(uintptr_t)parse_word(argv[6]);
-    worker.thread.initial_stack_pointer = worker.thread.stack_top;
-    worker.thread.stack_size = (size_t)parse_word(argv[7]);
-    worker.thread.ipc_buffer_addr = parse_word(argv[8]);
-    worker.join_ntfn = (seL4_CPtr)parse_word(argv[9]);
 
     send_event(control_ep, LUNA_ISOLATION_EVENT_READY, mode);
 
@@ -85,20 +62,28 @@ int main(int argc, char **argv)
     if (!lkl_link_anchor) for (;;) seL4_Yield();
     send_event(control_ep, LUNA_ISOLATION_EVENT_LKL_LINKED, mode);
 
-    seL4_Word command_badge = 0;
-    seL4_Wait(command_ntfn, &command_badge);
-    (void)command_badge;
+    struct luna_task_thread_resource resources[LUNA_RESOURCE_SLOTS];
+    for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
+        seL4_MessageInfo_t config_tag =
+            receive_command(command_ep, LUNA_COMMAND_CONFIGURE_SLOT);
+        if (seL4_MessageInfo_get_length(config_tag) != 8 ||
+            seL4_GetMR(1) != i || seL4_GetMR(2) != LUNA_RESOURCE_SLOTS) {
+            for (;;) seL4_Yield();
+        }
+        resources[i].tcb = (seL4_CPtr)seL4_GetMR(3);
+        resources[i].stack_top = seL4_GetMR(4);
+        resources[i].stack_pages = seL4_GetMR(5);
+        resources[i].ipc_buffer_addr = seL4_GetMR(6);
+        resources[i].join_ntfn = (seL4_CPtr)seL4_GetMR(7);
+    }
+    if (luna_lkl_task_configure_resources(resources))
+        for (;;) seL4_Yield();
+    send_event(control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode);
 
-    child_worker_result = 0;
-    if (sel4utils_start_thread(&worker.thread, child_worker, &worker, NULL, 1)) {
+    receive_command(command_ep, LUNA_COMMAND_START);
+
+    if (luna_lkl_task_thread_test())
         for (;;) seL4_Yield();
-    }
-    seL4_Word join_badge = 0;
-    seL4_Wait(worker.join_ntfn, &join_badge);
-    (void)join_badge;
-    if (child_worker_result != LUNA_RESOURCE_TLS_VALUE) {
-        for (;;) seL4_Yield();
-    }
     send_event(control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK, mode);
 
     if (luna_lkl_task_init()) {

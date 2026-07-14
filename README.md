@@ -103,9 +103,10 @@ Phase 1.2 稳定基线继续自动验证：LKL 启动、tty shell、单调时间
 
 Phase 2.1a 已验证 manager 私有页不映射到 child、child VM fault 可诊断、fault child 可销毁且新
 child 可重建。`lkl.o` 已同时链接进隔离 child 并完成 `LKL_LINKED` 握手，但 LKL 仍暂时由 root task
-实际启动。manager 已预建一个 64 页栈的 TCB/IPC/join slot，child 用它启动并回收 TLS worker；child
-也已独立完成 `lkl_init()`/`lkl_cleanup()`。后续继续扩展固定资源池并迁移正式 thread/sem/mutex host
-operations，再执行 child 内 `lkl_start_kernel()`。
+实际启动。manager 已预建两个 64 页栈的 TCB/IPC/join slot，并通过 receive-only command Endpoint
+下发描述；child 的正式 thread host operations 已用它们并发启动、TLS 运行并 join。child 也已独立
+完成 `lkl_init()`/`lkl_cleanup()`。后续迁移 sem/mutex/TLS 和内存 host ops，再执行 child 内
+`lkl_start_kernel()`。
 
 当前限制仍包括：bump heap 不回收、mutex/sem 为二值、无 virtio 块设备/网络、LKL 与 root task
 仍在迁移完成前与 root task 同址。后续工作见 [`next-plan.md`](next-plan.md)。
