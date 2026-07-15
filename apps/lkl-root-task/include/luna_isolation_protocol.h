@@ -34,7 +34,37 @@
 #define LUNA_NET_MAC_WORD1              ((seL4_Word)0x00005634UL)
 #define LUNA_NET_STRESS_BURST            64UL
 #define LUNA_NET_STRESS_PAYLOAD          1200UL
+#define LUNA_NET_STATS_FIELD_MASK         ((seL4_Word)0xffffUL)
+#define LUNA_NET_STATS_HIGH_WATER_SHIFT   0U
+#define LUNA_NET_STATS_BACKPRESSURE_SHIFT 16U
+#define LUNA_NET_STATS_DROPS_SHIFT        32U
+#define LUNA_NET_STATS_EMPTY_FETCHES_SHIFT 48U
 #define LUNA_PERSISTENT_MARKER         "luna-phase-2.3-persistent\n"
+
+static inline seL4_Word luna_net_stats_pack(seL4_Word high_water,
+                                             seL4_Word backpressure,
+                                             seL4_Word drops,
+                                             seL4_Word empty_fetches)
+{
+    if (high_water > LUNA_NET_STATS_FIELD_MASK)
+        high_water = LUNA_NET_STATS_FIELD_MASK;
+    if (backpressure > LUNA_NET_STATS_FIELD_MASK)
+        backpressure = LUNA_NET_STATS_FIELD_MASK;
+    if (drops > LUNA_NET_STATS_FIELD_MASK)
+        drops = LUNA_NET_STATS_FIELD_MASK;
+    if (empty_fetches > LUNA_NET_STATS_FIELD_MASK)
+        empty_fetches = LUNA_NET_STATS_FIELD_MASK;
+    return (high_water << LUNA_NET_STATS_HIGH_WATER_SHIFT) |
+           (backpressure << LUNA_NET_STATS_BACKPRESSURE_SHIFT) |
+           (drops << LUNA_NET_STATS_DROPS_SHIFT) |
+           (empty_fetches << LUNA_NET_STATS_EMPTY_FETCHES_SHIFT);
+}
+
+static inline unsigned luna_net_stats_unpack(seL4_Word stats,
+                                              unsigned shift)
+{
+    return (unsigned)((stats >> shift) & LUNA_NET_STATS_FIELD_MASK);
+}
 
 enum luna_isolation_mode {
     LUNA_ISOLATION_MODE_FAULT = 1,

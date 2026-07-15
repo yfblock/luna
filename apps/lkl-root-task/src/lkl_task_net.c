@@ -57,6 +57,11 @@ static uint16_t task_htons(uint16_t value)
     return (uint16_t)((value << 8) | (value >> 8));
 }
 
+static uint16_t task_ntohs(uint16_t value)
+{
+    return task_htons(value);
+}
+
 static uint16_t task_checksum(const void *data, size_t length)
 {
     const unsigned char *bytes = data;
@@ -389,9 +394,10 @@ int luna_lkl_task_net_pressure_smoke(void)
 
     seL4_Word paused_stats = 0;
     if (task_net_stats(&paused_stats)) goto out;
-    unsigned paused_high_water = (unsigned)(paused_stats & 0xffffU);
-    unsigned paused_backpressure =
-        (unsigned)((paused_stats >> 16) & 0xffffU);
+    unsigned paused_high_water = luna_net_stats_unpack(
+        paused_stats, LUNA_NET_STATS_HIGH_WATER_SHIFT);
+    unsigned paused_backpressure = luna_net_stats_unpack(
+        paused_stats, LUNA_NET_STATS_BACKPRESSURE_SHIFT);
     if (paused_high_water < TASK_NET_PRESSURE_MIN_RX ||
         !paused_backpressure)
         goto out;
@@ -413,8 +419,8 @@ int luna_lkl_task_net_pressure_smoke(void)
         uint16_t sequence_word = 0, count_word = 0;
         memcpy(&sequence_word, packet, sizeof(sequence_word));
         memcpy(&count_word, packet + 2, sizeof(count_word));
-        unsigned sequence = task_htons(sequence_word);
-        unsigned count = task_htons(count_word);
+        unsigned sequence = task_ntohs(sequence_word);
+        unsigned count = task_ntohs(count_word);
         if (count != LUNA_NET_STRESS_BURST ||
             sequence >= LUNA_NET_STRESS_BURST)
             goto out;
@@ -430,10 +436,14 @@ int luna_lkl_task_net_pressure_smoke(void)
 
     seL4_Word stats = 0;
     if (task_net_stats(&stats)) goto out;
-    unsigned high_water = (unsigned)(stats & 0xffffU);
-    unsigned backpressure = (unsigned)((stats >> 16) & 0xffffU);
-    unsigned drops = (unsigned)((stats >> 32) & 0xffffU);
-    unsigned empty_fetches = (unsigned)((stats >> 48) & 0xffffU);
+    unsigned high_water = luna_net_stats_unpack(
+        stats, LUNA_NET_STATS_HIGH_WATER_SHIFT);
+    unsigned backpressure = luna_net_stats_unpack(
+        stats, LUNA_NET_STATS_BACKPRESSURE_SHIFT);
+    unsigned drops = luna_net_stats_unpack(
+        stats, LUNA_NET_STATS_DROPS_SHIFT);
+    unsigned empty_fetches = luna_net_stats_unpack(
+        stats, LUNA_NET_STATS_EMPTY_FETCHES_SHIFT);
     if (received < TASK_NET_PRESSURE_MIN_RX ||
         high_water < TASK_NET_PRESSURE_MIN_RX || !backpressure ||
         empty_fetches)

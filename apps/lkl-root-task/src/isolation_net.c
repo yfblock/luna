@@ -65,27 +65,18 @@ struct luna_network_state {
     volatile int poll_in_driver;
     volatile int notification_masked;
     volatile int backpressure_active;
-    volatile uint64_t rx_enqueued;
-    volatile uint64_t rx_delivered;
     volatile uint64_t rx_drops;
     volatile uint64_t rx_high_water;
     volatile uint64_t rx_backpressure;
     volatile uint64_t rx_empty_fetches;
-    volatile uint64_t rx_signals;
     vka_object_t rx_ntfn;
     vka_object_t poll_kick_ntfn;
     vka_object_t tx_done_ntfn;
     vka_object_t poll_quiesce_ntfn;
     sel4utils_thread_t poll_thread;
-    int rx_ntfn_allocated;
-    int poll_kick_allocated;
-    int tx_done_allocated;
-    int poll_quiesce_allocated;
-    int poll_thread_configured;
     unsigned char mac[6];
     void *io_mapping;
     reservation_t io_reservation;
-    int io_reserved;
     int io_allocated;
     int ready;
 };
@@ -106,7 +97,6 @@ static void signal_rx(struct luna_network_state *state)
 {
     if (!__atomic_load_n(&state->notification_masked, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE)) {
-        __atomic_fetch_add(&state->rx_signals, 1, __ATOMIC_RELAXED);
         seL4_Signal(state->rx_ntfn.cptr);
     }
 }
@@ -186,7 +176,6 @@ static void receive_complete(void *cookie, unsigned int num_buffers,
         }
         packet->length = total;
         __atomic_store_n(&state->rx_head, next, __ATOMIC_RELEASE);
-        __atomic_fetch_add(&state->rx_enqueued, 1, __ATOMIC_RELAXED);
         unsigned used = (next + LUNA_NET_RX_QUEUE_COUNT - tail) %
                         LUNA_NET_RX_QUEUE_COUNT;
         uint64_t high_water = __atomic_load_n(&state->rx_high_water,
@@ -288,18 +277,16 @@ static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
     }
 }
 
-static int init_shared_window(vka_t *vka, vspace_t *manager_vspace)
+static int init_shared_window(vspace_t *manager_vspace)
 {
     network.io_reservation = vspace_reserve_range_at(
         manager_vspace, MANAGER_NET_IO_ADDR, LUNA_NET_IO_SIZE,
         seL4_AllRights, 1);
     if (!network.io_reservation.res) return -1;
-    network.io_reserved = 1;
     if (vspace_new_pages_at_vaddr(manager_vspace, MANAGER_NET_IO_ADDR,
                                   LUNA_NET_IO_PAGES, seL4_PageBits,
                                   network.io_reservation))
         return -1;
-    (void)vka;
     network.io_mapping = MANAGER_NET_IO_ADDR;
     network.io_allocated = 1;
     memset(network.io_mapping, 0, LUNA_NET_IO_SIZE);
@@ -339,7 +326,7 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
     }
     dma_addr_t tx = dma_alloc_pin(&network.io_ops.dma_manager,
                                   LUNA_NET_PACKET_SIZE, 1, 16);
-    if (!tx.virt || !tx.phys || init_shared_window(vka, manager_vspace)) {
+    if (!tx.virt || !tx.phys || init_shared_window(manager_vspace)) {
         printf("luna: manager network DMA/window allocation failed\n");
         return -1;
     }
@@ -377,10 +364,6 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
         printf("luna: manager network notification allocation failed\n");
         return -1;
     }
-    network.rx_ntfn_allocated = 1;
-    network.poll_kick_allocated = 1;
-    network.tx_done_allocated = 1;
-    network.poll_quiesce_allocated = 1;
     sel4utils_thread_config_t thread_config = thread_config_new(simple);
     thread_config = thread_config_priority(thread_config,
                                            LUNA_NET_POLL_PRIORITY);
@@ -395,7 +378,6 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
         printf("luna: manager network poll thread setup failed\n");
         return -1;
     }
-    network.poll_thread_configured = 1;
     NAME_THREAD(network.poll_thread.tcb.cptr, "luna-net-rx");
     network.ready = 1;
     printf("luna: manager virtio-net ready PCI=00:05.0 io=%04x "
@@ -455,13 +437,10 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.rx_tail, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.notification_masked, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&network.rx_enqueued, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&network.rx_delivered, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.rx_drops, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.rx_high_water, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.rx_backpressure, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.rx_empty_fetches, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&network.rx_signals, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_request_length, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.child_active, activate != 0,
@@ -525,7 +504,6 @@ static int service_rx(seL4_Word *response)
     packet->length = 0;
     tail = (tail + 1U) % LUNA_NET_RX_QUEUE_COUNT;
     __atomic_store_n(&network.rx_tail, tail, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&network.rx_delivered, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
     if (tail != __atomic_load_n(&network.rx_head, __ATOMIC_ACQUIRE))
         signal_rx(&network);
@@ -542,15 +520,8 @@ static seL4_Word service_stats(void)
                                             __ATOMIC_ACQUIRE);
     uint64_t empty_value = __atomic_load_n(&network.rx_empty_fetches,
                                             __ATOMIC_ACQUIRE);
-    uint64_t high_water = high_water_value > 0xffffU ?
-                          0xffffU : high_water_value;
-    uint64_t backpressure = backpressure_value > 0xffffU ?
-                            0xffffU : backpressure_value;
-    uint64_t drops = drops_value > 0xffffU ? 0xffffU : drops_value;
-    uint64_t empty = empty_value > 0xffffU ? 0xffffU : empty_value;
-    seL4_Word value = (seL4_Word)(high_water |
-        (backpressure << 16) | (drops << 32) | (empty << 48));
-    return value;
+    return luna_net_stats_pack(high_water_value, backpressure_value,
+                               drops_value, empty_value);
 }
 
 static int service_control(seL4_Word control)
