@@ -5,10 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS="$ROOT/deps"
 PATCH="$ROOT/patches/lkl-tty.patch"
+BUSYBOX_PATCH="$ROOT/patches/busybox-nofork-cat.patch"
 SEL4_MANIFEST_URL="https://github.com/seL4/seL4-tutorials-manifest.git"
 SEL4_MANIFEST_REV="cf8e88fbd953fedbf65ddee6eac6ccabb4a36df3"
 LKL_URL="https://github.com/lkl/linux.git"
 LKL_REV="6bce81422a8a420389c1b100d7e0473e066638b6"
+BUSYBOX_URL="https://github.com/mirror/busybox.git"
+BUSYBOX_REV="1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4"
 CHECK_ONLY=0
 
 usage() {
@@ -44,12 +47,26 @@ PY
 
 check_tools() {
     local failed=0
-    for cmd in git repo cmake ninja make ar python3 xmllint qemu-system-x86_64 \
+    for cmd in git repo cmake ninja make ar ld objcopy nm python3 xmllint qemu-system-x86_64 \
                mke2fs e2fsck; do
         require_cmd "$cmd" || failed=1
     done
     check_python_modules || failed=1
     [[ $failed == 0 ]]
+}
+
+check_busybox() {
+    [[ -d "$DEPS/busybox/.git" ]] || { echo "BusyBox checkout missing" >&2; return 1; }
+    local actual
+    actual="$(git -C "$DEPS/busybox" rev-parse HEAD)"
+    [[ "$actual" == "$BUSYBOX_REV" ]] || {
+        echo "BusyBox revision mismatch: expected $BUSYBOX_REV, got $actual" >&2
+        return 1
+    }
+    git -C "$DEPS/busybox" apply --unidiff-zero --check --reverse "$BUSYBOX_PATCH" >/dev/null 2>&1 || {
+        echo "BusyBox Luna patch is not applied cleanly" >&2
+        return 1
+    }
 }
 
 check_sel4() {
@@ -81,6 +98,7 @@ if [[ $CHECK_ONLY == 1 ]]; then
     check_tools
     check_sel4
     check_lkl
+    check_busybox
     echo "dependency check passed"
     exit 0
 fi
@@ -115,6 +133,31 @@ else
     exit 1
 fi
 
+if [[ ! -d "$DEPS/busybox/.git" ]]; then
+    git clone "$BUSYBOX_URL" "$DEPS/busybox"
+fi
+
+actual="$(git -C "$DEPS/busybox" rev-parse HEAD)"
+if [[ "$actual" != "$BUSYBOX_REV" ]]; then
+    [[ -z "$(git -C "$DEPS/busybox" status --porcelain)" ]] || {
+        echo "refusing to change a dirty BusyBox checkout" >&2
+        exit 1
+    }
+    git -C "$DEPS/busybox" fetch origin "$BUSYBOX_REV"
+    git -C "$DEPS/busybox" checkout --detach "$BUSYBOX_REV"
+fi
+
+if git -C "$DEPS/busybox" apply --unidiff-zero --check --reverse "$BUSYBOX_PATCH" >/dev/null 2>&1; then
+    echo "BusyBox Luna patch already applied"
+elif git -C "$DEPS/busybox" apply --unidiff-zero --check "$BUSYBOX_PATCH" >/dev/null 2>&1; then
+    git -C "$DEPS/busybox" apply --unidiff-zero "$BUSYBOX_PATCH"
+    echo "applied BusyBox Luna patch"
+else
+    echo "BusyBox Luna patch cannot be applied to $BUSYBOX_REV" >&2
+    exit 1
+fi
+
 check_sel4
 check_lkl
+check_busybox
 echo "dependencies ready"

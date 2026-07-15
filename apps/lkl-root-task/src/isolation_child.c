@@ -198,6 +198,10 @@ int main(int argc, char **argv)
     if (child_boot.mode == LUNA_ISOLATION_MODE_CLEAN) {
         if (luna_shell_prepare(luna_lkl_task_console_ready()))
             for (;;) seL4_Yield();
+        if (luna_lkl_task_user_smoke())
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_USER_PROGRAM_OK, child_boot.mode);
         send_event(child_boot.control_ep,
                    LUNA_ISOLATION_EVENT_LKL_SHELL_READY, child_boot.mode);
         luna_shell_run(luna_lkl_task_time);

@@ -38,6 +38,10 @@ REQUIRED = [
     b"LUNA_THREAD_TIMER_OK",
     b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
     b"LUNA_PERSISTENCE_OK rounds=100",
+    b"LUNA_STATIC_USER_OK path=/bin/busybox abi=1",
+    b"LUNA_SPAWN_WAIT_OK pid=",
+    b"LUNA_BUSYBOX_OK command=echo ok > /tmp/x; cat /tmp/x",
+    b"LUNA_PHASE2_4_USER_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
     b"LUNA_LKL_CHILD_HALT_OK",
@@ -81,6 +85,9 @@ FORBIDDEN = [
     b"post-halt disk cleanup failed",
     b"child disk request failed",
     b"persistent rootfs pack metadata invalid",
+    b"static BusyBox manifest invalid",
+    b"BusyBox spawn/wait failed",
+    b"Error attempting syscall",
 ]
 PROMPT = re.compile(rb"lkl:[^\r\n]*# ")
 

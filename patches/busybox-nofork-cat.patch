@@ -1,0 +1,7 @@
+diff --git a/coreutils/cat.c b/coreutils/cat.c
+index 4b3414941..e7d2ac2a9 100644
+--- a/coreutils/cat.c
++++ b/coreutils/cat.c
+@@ -30 +30 @@
+-//applet:IF_CAT(APPLET(cat, BB_DIR_BIN, BB_SUID_DROP))
++//applet:IF_CAT(APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat))

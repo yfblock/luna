@@ -7,6 +7,8 @@ contain generated files larger than GitHub's 100 MiB per-file limit.
 The luna-owned seL4 build settings remain tracked as
 `deps/lkl_settings.cmake`. The LKL changes required by luna are tracked as a
 patch in `patches/lkl-tty.patch`.
+BusyBox is also pinned and its Luna-specific nofork metadata change is tracked
+in `patches/busybox-nofork-cat.patch`.
 
 ## seL4 dependencies
 
@@ -46,6 +48,21 @@ git clone https://github.com/lkl/linux.git deps/lkl-linux
 git -C deps/lkl-linux checkout 6bce81422a8a420389c1b100d7e0473e066638b6
 git -C deps/lkl-linux apply ../../patches/lkl-tty.patch
 ```
+
+## BusyBox
+
+- Repository: `https://github.com/mirror/busybox.git`
+- Base commit/tag 1.36.1: `1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4`
+- Local feature patch: `patches/busybox-nofork-cat.patch`
+
+```sh
+git clone https://github.com/mirror/busybox.git deps/busybox
+git -C deps/busybox checkout 1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4
+git -C deps/busybox apply ../../patches/busybox-nofork-cat.patch
+```
+
+Phase 2.4 additionally uses `ld`, `objcopy`, and `nm` to produce and audit the
+minimal relocatable BusyBox host-program object.
 
 After checkout, follow the build instructions in `README.md` or run
 `./run.sh --build-only`.

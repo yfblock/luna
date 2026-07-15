@@ -24,15 +24,38 @@ sel4_libs_import_libraries()
 # LKL 内核对象 + 头文件（已构建于 lkl-linux 树）
 set(LKL_LINUX_DIR   "$ENV{LKL_LINUX_DIR}" CACHE PATH "lkl/linux 源树")
 set(LKL_KERNEL_OBJ  "$ENV{LKL_KERNEL_OBJ}" CACHE FILEPATH "lkl.o 内核对象")
+set(BUSYBOX_DIR     "$ENV{BUSYBOX_DIR}" CACHE PATH "BusyBox 源树")
 if(NOT LKL_KERNEL_OBJ OR NOT EXISTS "${LKL_KERNEL_OBJ}")
     message(FATAL_ERROR "LKL_KERNEL_OBJ 未设置或不存在：${LKL_KERNEL_OBJ}")
 endif()
+if(NOT BUSYBOX_DIR OR NOT EXISTS "${BUSYBOX_DIR}/Makefile")
+    message(FATAL_ERROR "BUSYBOX_DIR 未设置或不存在：${BUSYBOX_DIR}")
+endif()
+
+set(LUNA_BUSYBOX_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/luna-busybox.o")
+set(LUNA_BUSYBOX_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/build-busybox-object.sh")
+set(LUNA_BUSYBOX_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/../../configs/busybox_phase2_4.config")
+add_custom_command(
+    OUTPUT "${LUNA_BUSYBOX_OBJECT}"
+    COMMAND "${LUNA_BUSYBOX_TOOL}" "${BUSYBOX_DIR}"
+            "${LUNA_BUSYBOX_CONFIG}" "${LUNA_BUSYBOX_OBJECT}"
+    DEPENDS "${LUNA_BUSYBOX_TOOL}" "${LUNA_BUSYBOX_CONFIG}"
+            "${BUSYBOX_DIR}/coreutils/cat.c"
+            "${BUSYBOX_DIR}/coreutils/echo.c"
+            "${BUSYBOX_DIR}/shell/ash.c"
+    COMMENT "Build minimal BusyBox ash/cat static host-program object"
+    VERBATIM
+)
+set_source_files_properties("${LUNA_BUSYBOX_OBJECT}"
+    PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
 add_executable(luna-lkl-task
     src/isolation_child.c
     src/lkl_task_host.c
     src/lkl_task_disk.c
+    src/lkl_task_user.c
     src/shell.c
+    "${LUNA_BUSYBOX_OBJECT}"
     ${LKL_LINUX_DIR}/tools/lkl/lib/fs.c
     ${LKL_LINUX_DIR}/tools/lkl/lib/iomem.c
     ${LKL_LINUX_DIR}/tools/lkl/lib/virtio.c
@@ -68,6 +91,7 @@ add_custom_command(
     OUTPUT "${LUNA_ROOTFS_IMAGE}"
     COMMAND "${LUNA_ROOTFS_TOOL}" "${LUNA_ROOTFS_IMAGE}" "${LUNA_ROOTFS_SEED}"
     DEPENDS "${LUNA_ROOTFS_TOOL}" "${LUNA_ROOTFS_SEED}/etc/luna-release"
+            "${LUNA_ROOTFS_SEED}/bin/busybox"
     COMMENT "Create checked 16MiB ext4 persistent rootfs image"
     VERBATIM
 )

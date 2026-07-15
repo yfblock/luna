@@ -873,9 +873,12 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
                    LUNA_ISOLATION_MODE_CLEAN, private_addr, tsc_frequency,
                    &child, &resources, &disk, &child_live, &event_context))
         goto out;
-    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
+    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
+                      LUNA_ISOLATION_MODE_CLEAN) ||
+        receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
                       LUNA_ISOLATION_MODE_CLEAN))
         goto out;
+    printf("LUNA_PHASE2_4_USER_OK\n");
     printf("LUNA_LKL_CHILD_SHELL_READY\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_CLEAN))
         goto out;

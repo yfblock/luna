@@ -19,6 +19,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS="$ROOT/deps"
 BUILD="$DEPS/build_lkl"
 LKL_LINUX="$DEPS/lkl-linux"
+BUSYBOX="$DEPS/busybox"
 LKL_LIBA="$LKL_LINUX/tools/lkl/liblkl.a"
 KERNEL_OBJ="$ROOT/build-artifacts/lkl-kernel.o"
 QEMU="$(command -v qemu-system-x86_64 || true)"
@@ -47,9 +48,14 @@ step() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 if [[ $DO_BUILD == 1 ]]; then
     step "sanity checks"
     [[ -d "$LKL_LINUX/tools/lkl" ]] || { echo "缺 lkl-linux：$LKL_LINUX" >&2; exit 1; }
+    [[ -d "$BUSYBOX/.git" ]] || { echo "缺 BusyBox：$BUSYBOX" >&2; exit 1; }
     command -v xmllint >/dev/null || { echo "缺 xmllint stub（见 README）" >&2; exit 1; }
     git -C "$LKL_LINUX" apply --check --reverse "$ROOT/patches/lkl-tty.patch" >/dev/null 2>&1 || {
         echo "LKL tty 补丁未应用；请运行 ./setup-deps.sh" >&2
+        exit 1
+    }
+    git -C "$BUSYBOX" apply --unidiff-zero --check --reverse "$ROOT/patches/busybox-nofork-cat.patch" >/dev/null 2>&1 || {
+        echo "BusyBox Luna 补丁未应用；请运行 ./setup-deps.sh" >&2
         exit 1
     }
 
@@ -71,6 +77,7 @@ if [[ $DO_BUILD == 1 ]]; then
     export LUNA_SETTINGS="$DEPS/lkl_settings.cmake"
     export LKL_LINUX_DIR="$LKL_LINUX"
     export LKL_KERNEL_OBJ="$KERNEL_OBJ"
+    export BUSYBOX_DIR="$BUSYBOX"
     cmake -G Ninja -B "$BUILD" -S "$ROOT/apps/lkl-root-task" >/dev/null
 
     step "ninja build"
