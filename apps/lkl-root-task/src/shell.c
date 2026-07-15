@@ -20,6 +20,8 @@ int luna_shell_prepare(int console_ready)
     if (outfd != 1 || errfd != 2) return -1;
     lkl_sys_mkdir("/proc", 0555);
     lkl_sys_mkdir("/tmp", 0755);
+    lkl_sys_mkdir("/run", 0755);
     if (lkl_sys_mount("proc", "/proc", "proc", 0, NULL) < 0) return -1;
+    if (lkl_sys_mount("ramfs", "/run", "ramfs", 0, NULL) < 0) return -1;
     return 0;
 }

@@ -43,7 +43,7 @@ add_custom_command(
             "${BUSYBOX_DIR}/coreutils/cat.c"
             "${BUSYBOX_DIR}/coreutils/echo.c"
             "${BUSYBOX_DIR}/shell/ash.c"
-    COMMENT "Build minimal BusyBox ash/cat static host-program object"
+    COMMENT "Build BusyBox ash and nofork applet static host-program object"
     VERBATIM
 )
 set_source_files_properties("${LUNA_BUSYBOX_OBJECT}"

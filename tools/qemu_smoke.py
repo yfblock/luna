@@ -24,6 +24,39 @@ BASE_COMMANDS = [
     "fsync /tmp/ash-msg; echo busybox-fsync-ok",
     "sync; echo busybox-sync-ok",
     "sleep 1; echo busybox-sleep-ok",
+    "mkdir -m 700 -p /tmp/bb-dir/nested && echo busybox-mkdir-ok",
+    "echo payload > /tmp/bb-dir/nested/file",
+    "truncate -s 3 /tmp/bb-dir/nested/file",
+    "cat /tmp/bb-dir/nested/file; echo",
+    "truncate -s 0 /tmp/bb-dir/nested/file; "
+    "test ! -s /tmp/bb-dir/nested/file && echo busybox-truncate-ok",
+    "basename /tmp/bb-dir/nested/file",
+    "dirname /tmp/bb-dir/nested/file",
+    "export LUNA_APPLET_ENV=env-value",
+    "printenv LUNA_APPLET_ENV",
+    "uname -s",
+    "touch /tmp/bb-touch && test -f /tmp/bb-touch && echo busybox-touch-ok",
+    "echo runtime-target > /run/runtime-target",
+    "ln -s runtime-target /run/runtime-link && echo busybox-ln-ok",
+    "readlink /run/runtime-link",
+    "realpath /run/runtime-link",
+    "printf 'pipeline-ok\\n' | cat",
+    "echo pipeline-three-ok | cat | cat",
+    "true | false || echo pipeline-status-ok",
+    "printf 'alpha\\nbeta\\n' > /tmp/stream-data",
+    "head -n 1 /tmp/stream-data",
+    "wc -l < /tmp/stream-data",
+    "printf 'left:right\\n' > /tmp/cut-data",
+    "cut -d: -f2 /tmp/cut-data",
+    "printf 'same\\nsame\\nnext\\n' > /tmp/uniq-data",
+    "uniq /tmp/uniq-data",
+    "echo background-ok & wait; echo background-wait-ok",
+    "unlink /run/runtime-link && unlink /run/runtime-target",
+    "mkdir -p /run/bb-remove/nested && "
+    "echo remove-me > /run/bb-remove/nested/file && "
+    "unlink /run/bb-remove/nested/file && "
+    "rmdir /run/bb-remove/nested /run/bb-remove && "
+    "test ! -e /run/bb-remove && echo busybox-applets-ok",
     "cat /etc/luna-release",
     "cat /luna-persist",
     "cat /proc/meminfo",
@@ -62,6 +95,7 @@ REQUIRED = [
     b"LUNA_BUSYBOX_OK command=cat /tmp/x",
     b"LUNA_BUSYBOX_INTERACTIVE_READY prompt=luna-ash#",
     b"LUNA_BUSYBOX_INTERACTIVE_OK status=0 forbidden=0",
+    b"LUNA_STATIC_RUNTIME_OK workers=13 pipelines=3 background=1",
     b"LUNA_PHASE2_4_USER_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
@@ -82,6 +116,31 @@ REQUIRED = [
     b"luna-phase-2.3-persistent",
     b"MemTotal:",
     b"LUNA_SHUTDOWN_OK",
+]
+
+REQUIRED_LINES = [
+    b"busybox-mkdir-ok",
+    b"pay",
+    b"busybox-truncate-ok",
+    b"file",
+    b"/tmp/bb-dir/nested",
+    b"env-value",
+    b"Linux",
+    b"busybox-touch-ok",
+    b"busybox-ln-ok",
+    b"runtime-target",
+    b"/run/runtime-target",
+    b"pipeline-ok",
+    b"pipeline-three-ok",
+    b"pipeline-status-ok",
+    b"alpha",
+    b"2",
+    b"right",
+    b"same",
+    b"next",
+    b"background-ok",
+    b"background-wait-ok",
+    b"busybox-applets-ok",
 ]
 
 FORBIDDEN = [
@@ -244,6 +303,10 @@ def main() -> int:
     for marker in required:
         if marker not in data:
             errors.append(f"missing output: {marker.decode(errors='replace')}")
+    output_lines = {line.strip() for line in data.splitlines()}
+    for marker in REQUIRED_LINES:
+        if marker not in output_lines:
+            errors.append(f"missing output line: {marker.decode(errors='replace')}")
     for marker in FORBIDDEN:
         if marker in data:
             errors.append(f"forbidden output: {marker.decode(errors='replace')}")

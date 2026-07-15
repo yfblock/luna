@@ -8,7 +8,8 @@ The luna-owned seL4 build settings remain tracked as
 `deps/lkl_settings.cmake`. The LKL changes required by luna are tracked as a
 patch in `patches/lkl-tty.patch`.
 BusyBox is also pinned and its Luna-specific nofork metadata change is tracked
-in `patches/busybox-nofork-cat.patch`.
+in `patches/busybox-nofork-cat.patch`. The controlled static worker hooks in
+ash are tracked separately in `patches/busybox-static-runtime.patch`.
 
 ## seL4 dependencies
 
@@ -53,16 +54,19 @@ git -C deps/lkl-linux apply ../../patches/lkl-tty.patch
 
 - Repository: `https://github.com/mirror/busybox.git`
 - Base commit/tag 1.36.1: `1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4`
-- Local feature patch: `patches/busybox-nofork-cat.patch`
+- Local feature patches: `patches/busybox-nofork-cat.patch`,
+  `patches/busybox-static-runtime.patch`
 
 ```sh
 git clone https://github.com/mirror/busybox.git deps/busybox
 git -C deps/busybox checkout 1a64f6a20aaf6ea4dbba68bbfa8cc1ab7e5c57c4
 git -C deps/busybox apply ../../patches/busybox-nofork-cat.patch
+git -C deps/busybox apply ../../patches/busybox-static-runtime.patch
 ```
 
 Phase 2.4 additionally uses `ld`, `objcopy`, and `nm` to produce and audit the
-minimal relocatable BusyBox host-program object.
+relocatable BusyBox host-program object. Phase 2.4.4 links four symbol-prefixed
+worker copies so concurrent applets do not share mutable libbb global state.
 
 Phase 2.5 requires a QEMU build with the `socket` netdev backend, legacy
 `virtio-net-pci` support, and `ivshmem-plain` for the host-file ext4 backing.

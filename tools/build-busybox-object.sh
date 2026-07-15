@@ -35,6 +35,9 @@ while IFS= read -r setting; do
     esac
 done < "$config"
 
+sed -i 's|^CONFIG_EXTRA_LDFLAGS=.*$|CONFIG_EXTRA_LDFLAGS="-Wl,--unresolved-symbols=ignore-all"|' \
+    "$build_dir/.config"
+
 make -C "$source_dir" O="$build_dir" oldconfig </dev/null >/dev/null
 make -C "$source_dir" O="$build_dir" -j"$(nproc)" busybox_unstripped >/dev/null
 
@@ -50,7 +53,7 @@ raw_object="$build_dir/luna-busybox.raw.o"
 ld -r -u ash_main -o "$raw_object" \
     --start-group "${library_paths[@]}" --end-group
 
-objcopy \
+abi_objcopy_args=(
     --redefine-sym __isoc23_sscanf=sscanf \
     --redefine-sym __isoc23_strtol=strtol \
     --redefine-sym __isoc23_strtoll=strtoll \
@@ -79,6 +82,24 @@ objcopy \
     --redefine-sym ferror=luna_bb_ferror \
     --redefine-sym ferror_unlocked=luna_bb_ferror_unlocked \
     --redefine-sym clearerr=luna_bb_clearerr \
+    --redefine-sym getopt=luna_bb_getopt \
+    --redefine-sym getopt_long=luna_bb_getopt_long \
+    --redefine-sym fopen=luna_bb_fopen \
+    --redefine-sym fdopen=luna_bb_fdopen \
+    --redefine-sym fclose=luna_bb_fclose \
+    --redefine-sym fileno=luna_bb_fileno \
+    --redefine-sym fileno_unlocked=luna_bb_fileno_unlocked \
+    --redefine-sym getc=luna_bb_getc \
+    --redefine-sym getc_unlocked=luna_bb_getc_unlocked \
+    --redefine-sym fgetc=luna_bb_fgetc \
+    --redefine-sym fread=luna_bb_fread \
+    --redefine-sym fwrite=luna_bb_fwrite \
+    --redefine-sym fgets=luna_bb_fgets \
+    --redefine-sym feof=luna_bb_feof \
+    --redefine-sym ungetc=luna_bb_ungetc \
+    --redefine-sym rewind=luna_bb_rewind \
+    --redefine-sym fseek=luna_bb_fseek \
+    --redefine-sym ftell=luna_bb_ftell \
     --redefine-sym lseek=luna_bb_lseek \
     --redefine-sym dup=luna_bb_dup \
     --redefine-sym dup2=luna_bb_dup2 \
@@ -90,6 +111,17 @@ objcopy \
     --redefine-sym fchdir=luna_bb_fchdir \
     --redefine-sym chroot=luna_bb_chroot \
     --redefine-sym getcwd=luna_bb_getcwd \
+    --redefine-sym mkdir=luna_bb_mkdir \
+    --redefine-sym rmdir=luna_bb_rmdir \
+    --redefine-sym chmod=luna_bb_chmod \
+    --redefine-sym ftruncate=luna_bb_ftruncate \
+    --redefine-sym uname=luna_bb_uname \
+    --redefine-sym utimensat=luna_bb_utimensat \
+    --redefine-sym futimens=luna_bb_futimens \
+    --redefine-sym readlink=luna_bb_readlink \
+    --redefine-sym realpath=luna_bb_realpath \
+    --redefine-sym symlink=luna_bb_symlink \
+    --redefine-sym link=luna_bb_link \
     --redefine-sym isatty=luna_bb_isatty \
     --redefine-sym ioctl=luna_bb_ioctl \
     --redefine-sym tcgetattr=luna_bb_tcgetattr \
@@ -125,8 +157,44 @@ objcopy \
     --redefine-sym execve=luna_bb_execve \
     --redefine-sym execvp=luna_bb_execvp \
     --redefine-sym waitpid=luna_bb_waitpid \
-    --redefine-sym pipe=luna_bb_pipe \
-    "$raw_object" "$output"
+    --redefine-sym pipe=luna_bb_pipe
+)
+
+shell_object="$build_dir/luna-busybox.shell.o"
+objcopy "${abi_objcopy_args[@]}" "$raw_object" "$shell_object"
+
+worker_entries=(
+    basename cat cut dirname echo false head ln mkdir printenv printf readlink
+    realpath rmdir touch true truncate uname uniq unlink wc
+)
+worker_undefined=()
+for entry in "${worker_entries[@]}"; do
+    worker_undefined+=(-u "${entry}_main")
+done
+worker_raw="$build_dir/luna-busybox.worker.raw.o"
+ld -r "${worker_undefined[@]}" -o "$worker_raw" \
+    --start-group "$build_dir/coreutils/lib.a" "$build_dir/libbb/lib.a" \
+    "$build_dir/libpwdgrp/lib.a" --end-group
+worker_mapped="$build_dir/luna-busybox.worker.mapped.o"
+objcopy "${abi_objcopy_args[@]}" "$worker_raw" "$worker_mapped"
+
+worker_objects=()
+for slot in 0 1 2 3; do
+    prefix="luna_bb_slot${slot}_"
+    restore=()
+    while read -r symbol; do
+        [[ -n "$symbol" ]] || continue
+        [[ "$symbol" == optind || "$symbol" == optarg ]] && continue
+        restore+=(--redefine-sym "${prefix}${symbol}=${symbol}")
+    done < <(nm -u "$worker_mapped" | awk '{print $2}')
+    prefixed_object="$build_dir/luna-busybox.worker${slot}.prefixed.o"
+    worker_object="$build_dir/luna-busybox.worker${slot}.o"
+    objcopy --prefix-symbols="$prefix" "$worker_mapped" "$prefixed_object"
+    objcopy "${restore[@]}" "$prefixed_object" "$worker_object"
+    worker_objects+=("$worker_object")
+done
+
+ld -r -o "$output" "$shell_object" "${worker_objects[@]}"
 
 if nm "$output" | grep -Eq ' [Tt] main$'; then
     echo "BusyBox object unexpectedly defines main" >&2

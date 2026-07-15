@@ -1,0 +1,115 @@
+diff --git a/shell/ash.c b/shell/ash.c
+index 9344e4de1..5b26c6f71 100644
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -189,6 +189,10 @@
+ #include <sys/times.h>
+ #include <sys/utsname.h> /* for setting $HOSTNAME */
+ #include "busybox.h" /* for applet_names */
++
++extern int luna_bb_run_static(char **argv);
++extern int luna_bb_run_pipeline(int count, char ***commands);
++extern long luna_bb_spawn_static(char **argv);
+ #if ENABLE_FEATURE_SH_EMBEDDED_SCRIPTS
+ # include "embedded_scripts.h"
+ #else
+@@ -8841,6 +8845,54 @@ fill_arglist(struct arglist *arglist, union node **argpp)
+ 	return *lastp;
+ }
+ 
++static int
++luna_static_argv(union node *cmd, char ***argv_out)
++{
++	struct arglist arglist;
++	struct strlist *sp;
++	union node *argp;
++	char **argv;
++	int argc = 0;
++	int index = 0;
++
++	if (!cmd || cmd->type != NCMD || cmd->ncmd.assign || cmd->ncmd.redirect)
++		return -1;
++	arglist.list = NULL;
++	arglist.lastp = &arglist.list;
++	for (argp = cmd->ncmd.args; argp; argp = argp->narg.next)
++		expandarg(argp, &arglist, EXP_FULL | EXP_TILDE);
++	for (sp = arglist.list; sp; sp = sp->next)
++		argc++;
++	if (!argc)
++		return -1;
++	argv = stalloc(sizeof(char *) * (argc + 1));
++	for (sp = arglist.list; sp; sp = sp->next)
++		argv[index++] = sp->text;
++	argv[index] = NULL;
++	*argv_out = argv;
++	return 0;
++}
++
++static int
++luna_static_pipeline(union node *pipeline)
++{
++	struct nodelist *stage;
++	char ***commands;
++	int count = 0;
++	int index = 0;
++	for (stage = pipeline->npipe.cmdlist; stage; stage = stage->next)
++		count++;
++	if (pipeline->npipe.pipe_backgnd || count < 2 || count > 4)
++		return -1;
++	commands = stalloc(sizeof(char **) * count);
++	for (stage = pipeline->npipe.cmdlist; stage; stage = stage->next) {
++		if (luna_static_argv(stage->n, &commands[index]))
++			return -1;
++		index++;
++	}
++	return luna_bb_run_pipeline(count, commands);
++}
++
+ #if ENABLE_ASH_CMDCMD
+ /* Is it "command [-p] PROG ARGS" bltin, no other opts? Return ptr to "PROG" if yes */
+ static int
+@@ -9576,6 +9628,19 @@ evalsubshell(union node *n, int flags)
+ 	int status;
+ 
+ 	errlinno = lineno = n->nredir.linno;
++	if (backgnd && !n->nredir.redirect) {
++		char **argv;
++		if (luna_static_argv(n->nredir.n, &argv) == 0) {
++			long pid = luna_bb_spawn_static(argv);
++			if (pid > 0) {
++				INT_OFF;
++				jp = makejob(/*n,*/ 1);
++				forkparent(jp, n, FORK_BG, (pid_t)pid);
++				INT_ON;
++				return 0;
++			}
++		}
++	}
+ 
+ 	expredir(n->nredir.redirect);
+ 	if (!backgnd && (flags & EV_EXIT) && !may_have_traps)
+@@ -9683,6 +9748,12 @@ evalpipe(union node *n, int flags)
+ 	int status = 0;
+ 
+ 	TRACE(("evalpipe(0x%lx) called\n", (long)n));
++	status = luna_static_pipeline(n);
++	if (status >= 0)
++		return status;
++	ash_msg("pipeline requires 2-4 supported static applets");
++	return 127;
++
+ 	pipelen = 0;
+ 	for (lp = n->npipe.cmdlist; lp; lp = lp->next)
+ 		pipelen++;
+@@ -10563,6 +10634,11 @@ evalcommand(union node *cmd, int flags)
+ 			break;
+ 		}
+ #endif
++		status = luna_bb_run_static(argv);
++		if (status >= 0) {
++			exitstatus = status;
++			break;
++		}
+ 		/* Can we avoid forking? For example, very last command
+ 		 * in a script or a subshell does not need forking,
+ 		 * we can just exec it.

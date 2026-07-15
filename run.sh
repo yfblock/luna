@@ -63,6 +63,10 @@ if [[ $DO_BUILD == 1 ]]; then
         echo "BusyBox Luna 补丁未应用；请运行 ./setup-deps.sh" >&2
         exit 1
     }
+    git -C "$BUSYBOX" apply --check --reverse "$ROOT/patches/busybox-static-runtime.patch" >/dev/null 2>&1 || {
+        echo "BusyBox static runtime 补丁未应用；请运行 ./setup-deps.sh" >&2
+        exit 1
+    }
 
     step "build LKL kernel archive"
     # luna only extracts lkl.o. Building the default tools/lkl target also links
