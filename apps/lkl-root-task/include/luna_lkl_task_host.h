@@ -26,6 +26,8 @@ int luna_lkl_task_configure_resources(
 int luna_lkl_task_thread_test(void);
 int luna_lkl_task_sync_tls_test(void);
 int luna_lkl_task_sync_tls_runtime_ok(void);
+int luna_lkl_task_prepare_time(unsigned long long tsc_frequency);
+int luna_lkl_task_thread_timer_test(void);
 int luna_lkl_task_allocator_test(void);
 int luna_lkl_task_allocator_idle(void);
 int luna_lkl_task_init(void);

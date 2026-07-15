@@ -24,23 +24,71 @@ struct task_thread_slot {
     void (*fn)(void *);
     void *arg;
     lkl_thread_t tid;
-    int used;
+    unsigned tls_index;
+    volatile int used;
+    volatile int exited;
+    volatile int join_claimed;
 };
 
 static struct task_thread_slot task_threads[LUNA_RESOURCE_SLOTS];
 static __thread lkl_thread_t current_tid = 1;
-static void task_tls_cleanup(lkl_thread_t tid);
+static __thread unsigned current_tls_index = 1;
+static volatile lkl_thread_t task_next_tid = 2;
+static volatile int task_thread_table_lock_word;
+static void task_tls_cleanup(unsigned tls_index);
 
 static void task_debug(const char *str)
 {
     while (*str) seL4_DebugPutChar(*str++);
 }
 
+static void task_thread_table_lock(void)
+{
+    while (__atomic_test_and_set(&task_thread_table_lock_word,
+                                 __ATOMIC_ACQUIRE))
+        seL4_Yield();
+}
+
+static void task_thread_table_unlock(void)
+{
+    __atomic_clear(&task_thread_table_lock_word, __ATOMIC_RELEASE);
+}
+
+static struct task_thread_slot *thread_by_tid_unlocked(lkl_thread_t tid)
+{
+    if (tid < 2) return NULL;
+    for (int i = 0; i < LUNA_LKL_THREAD_SLOTS; i++) {
+        struct task_thread_slot *slot = &task_threads[i];
+        if (__atomic_load_n(&slot->used, __ATOMIC_ACQUIRE) &&
+            slot->tid == tid)
+            return slot;
+    }
+    return NULL;
+}
+
 static struct task_thread_slot *thread_by_tid(lkl_thread_t tid)
 {
-    if (tid < 2 || tid >= 2 + LUNA_LKL_THREAD_SLOTS) return NULL;
-    struct task_thread_slot *slot = &task_threads[tid - 2];
-    return slot->used && slot->tid == tid ? slot : NULL;
+    struct task_thread_slot *slot;
+    task_thread_table_lock();
+    slot = thread_by_tid_unlocked(tid);
+    task_thread_table_unlock();
+    return slot;
+}
+
+static void task_thread_drain_join(struct task_thread_slot *slot)
+{
+    seL4_Word badge = 0;
+    seL4_Poll(slot->join_ntfn, &badge);
+}
+
+static __attribute__((noreturn)) void task_thread_complete(
+    struct task_thread_slot *slot)
+{
+    task_tls_cleanup(slot->tls_index);
+    __atomic_store_n(&slot->exited, 1, __ATOMIC_RELEASE);
+    seL4_Signal(slot->join_ntfn);
+    seL4_TCB_Suspend(slot->self_tcb);
+    for (;;) seL4_Yield();
 }
 
 static void task_thread_trampoline(void *arg0, void *arg1, void *ipc_buffer)
@@ -49,32 +97,48 @@ static void task_thread_trampoline(void *arg0, void *arg1, void *ipc_buffer)
     (void)ipc_buffer;
     struct task_thread_slot *slot = arg0;
     current_tid = slot->tid;
+    current_tls_index = slot->tls_index;
     slot->fn(slot->arg);
-    task_tls_cleanup(current_tid);
-    seL4_Signal(slot->join_ntfn);
-    seL4_TCB_Suspend(slot->self_tcb);
-    for (;;) seL4_Yield();
+    task_thread_complete(slot);
 }
 
 static lkl_thread_t task_thread_create(void (*fn)(void *), void *arg)
 {
+    struct task_thread_slot *selected = NULL;
+    task_thread_table_lock();
     for (int i = 0; i < LUNA_LKL_THREAD_SLOTS; i++) {
         struct task_thread_slot *slot = &task_threads[i];
         if (slot->used) continue;
         slot->used = 1;
-        slot->tid = (lkl_thread_t)(i + 2);
+        task_thread_drain_join(slot);
+        slot->tid = __atomic_fetch_add(&task_next_tid, 1,
+                                       __ATOMIC_RELAXED);
+        if (slot->tid < 2) slot->tid = 2;
+        slot->tls_index = (unsigned)i + 2;
         slot->fn = fn;
         slot->arg = arg;
-        if (sel4utils_start_thread(&slot->thread, task_thread_trampoline,
-                                   slot, NULL, 1)) {
-            slot->used = 0;
-            task_debug("luna-lkl-task: host thread start failed\n");
-            return 0;
-        }
-        return slot->tid;
+        slot->exited = 0;
+        slot->join_claimed = 0;
+        selected = slot;
+        break;
     }
-    task_debug("luna-lkl-task: host thread pool exhausted\n");
-    return 0;
+    task_thread_table_unlock();
+    if (!selected) {
+        task_debug("luna-lkl-task: host thread pool exhausted\n");
+        return 0;
+    }
+    if (sel4utils_start_thread(&selected->thread, task_thread_trampoline,
+                               selected, NULL, 1)) {
+        task_thread_table_lock();
+        selected->tid = 0;
+        selected->fn = NULL;
+        selected->arg = NULL;
+        selected->used = 0;
+        task_thread_table_unlock();
+        task_debug("luna-lkl-task: host thread start failed\n");
+        return 0;
+    }
+    return selected->tid;
 }
 
 static void task_thread_detach(void) { }
@@ -82,24 +146,37 @@ static void task_thread_detach(void) { }
 static void task_thread_exit(void)
 {
     struct task_thread_slot *slot = thread_by_tid(current_tid);
-    if (slot) {
-        task_tls_cleanup(current_tid);
-        seL4_Signal(slot->join_ntfn);
-        seL4_TCB_Suspend(slot->self_tcb);
-    }
+    if (slot) task_thread_complete(slot);
     for (;;) seL4_Yield();
 }
 
 static int task_thread_join(lkl_thread_t tid)
 {
     if (tid == 1) return 0;
-    struct task_thread_slot *slot = thread_by_tid(tid);
-    if (!slot) return -1;
+    task_thread_table_lock();
+    struct task_thread_slot *slot = thread_by_tid_unlocked(tid);
+    if (!slot || slot->join_claimed) {
+        task_thread_table_unlock();
+        return -1;
+    }
+    slot->join_claimed = 1;
+    task_thread_table_unlock();
     seL4_Word badge = 0;
-    seL4_Wait(slot->join_ntfn, &badge);
+    if (!__atomic_load_n(&slot->exited, __ATOMIC_ACQUIRE))
+        seL4_Wait(slot->join_ntfn, &badge);
+    else
+        seL4_Poll(slot->join_ntfn, &badge);
+    task_thread_table_lock();
+    if (!slot->used || slot->tid != tid) {
+        task_thread_table_unlock();
+        return -1;
+    }
     slot->fn = NULL;
     slot->arg = NULL;
+    slot->tid = 0;
+    slot->exited = 0;
     slot->used = 0;
+    task_thread_table_unlock();
     return 0;
 }
 
@@ -298,15 +375,15 @@ struct lkl_tls_key {
 };
 static struct lkl_tls_key task_tls[TASK_TLS_KEYS];
 
-static void task_tls_cleanup(lkl_thread_t tid)
+static void task_tls_cleanup(unsigned tls_index)
 {
-    if (tid >= LUNA_RESOURCE_SLOTS + 2) return;
+    if (tls_index >= LUNA_RESOURCE_SLOTS + 2) return;
     for (int pass = 0; pass < TASK_TLS_DESTRUCTOR_ITERATIONS; pass++) {
         int called = 0;
         for (int i = 0; i < TASK_TLS_KEYS; i++) {
             struct lkl_tls_key *key = &task_tls[i];
-            void *data = key->data[tid];
-            key->data[tid] = NULL;
+            void *data = key->data[tls_index];
+            key->data[tls_index] = NULL;
             void (*destructor)(void *) = key->destructor;
             if (data && __atomic_load_n(&key->used, __ATOMIC_ACQUIRE) &&
                 destructor) {
@@ -317,7 +394,7 @@ static void task_tls_cleanup(lkl_thread_t tid)
         if (!called) break;
     }
     for (int i = 0; i < TASK_TLS_KEYS; i++)
-        task_tls[i].data[tid] = NULL;
+        task_tls[i].data[tls_index] = NULL;
 }
 
 static struct lkl_tls_key *task_tls_alloc(void (*destructor)(void *))
@@ -346,18 +423,18 @@ static void task_tls_free(struct lkl_tls_key *key)
 static int task_tls_set(struct lkl_tls_key *key, void *data)
 {
     if (!key || !__atomic_load_n(&key->used, __ATOMIC_ACQUIRE) ||
-        current_tid >= LUNA_RESOURCE_SLOTS + 2)
+        current_tls_index >= LUNA_RESOURCE_SLOTS + 2)
         return -1;
-    key->data[current_tid] = data;
+    key->data[current_tls_index] = data;
     return 0;
 }
 
 static void *task_tls_get(struct lkl_tls_key *key)
 {
     if (!key || !__atomic_load_n(&key->used, __ATOMIC_ACQUIRE) ||
-        current_tid >= LUNA_RESOURCE_SLOTS + 2)
+        current_tls_index >= LUNA_RESOURCE_SLOTS + 2)
         return NULL;
-    return key->data[current_tid];
+    return key->data[current_tls_index];
 }
 
 #define TASK_HEAP_ALIGNMENT       16UL
@@ -608,21 +685,50 @@ static unsigned long long task_time(void)
 static void (*task_timer_fn)(void);
 static volatile int task_timer_started;
 static char task_timer_handle;
-static volatile int task_timer_armed;
+static volatile int task_timer_allocated;
+static volatile int task_timer_callback_running;
+static volatile int task_timer_lock_word;
+static volatile unsigned long long task_timer_generation;
+static volatile unsigned long long task_timer_armed_generation;
 static unsigned long long task_timer_deadline_ns;
+
+static void task_timer_lock(void)
+{
+    while (__atomic_test_and_set(&task_timer_lock_word, __ATOMIC_ACQUIRE))
+        seL4_Yield();
+}
+
+static void task_timer_unlock(void)
+{
+    __atomic_clear(&task_timer_lock_word, __ATOMIC_RELEASE);
+}
 
 static void task_timer_service(void *arg)
 {
     (void)arg;
     for (;;) {
-        if (__atomic_load_n(&task_timer_armed, __ATOMIC_ACQUIRE)) {
+        unsigned long long generation = __atomic_load_n(
+            &task_timer_armed_generation, __ATOMIC_ACQUIRE);
+        if (generation) {
             unsigned long long deadline =
                 __atomic_load_n(&task_timer_deadline_ns, __ATOMIC_RELAXED);
-            if (task_time() >= deadline &&
-                __atomic_exchange_n(&task_timer_armed, 0,
-                                    __ATOMIC_ACQ_REL)) {
-                void (*fn)(void) = task_timer_fn;
-                if (fn) fn();
+            if (task_time() >= deadline) {
+                unsigned long long expected = generation;
+                if (__atomic_compare_exchange_n(
+                        &task_timer_armed_generation, &expected, 0, false,
+                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    __atomic_store_n(&task_timer_callback_running, 1,
+                                     __ATOMIC_RELEASE);
+                    if (__atomic_load_n(&task_timer_generation,
+                                        __ATOMIC_ACQUIRE) == generation &&
+                        __atomic_load_n(&task_timer_allocated,
+                                        __ATOMIC_ACQUIRE)) {
+                        void (*fn)(void) = task_timer_fn;
+                        if (fn) fn();
+                    }
+                    __atomic_store_n(&task_timer_callback_running, 0,
+                                     __ATOMIC_RELEASE);
+                }
             }
         }
         seL4_Yield();
@@ -632,41 +738,79 @@ static void task_timer_service(void *arg)
 static void *task_timer_alloc(void (*fn)(void))
 {
     if (!fn || !task_tsc_frequency) return NULL;
+    task_timer_lock();
+    if (task_timer_allocated) {
+        task_timer_unlock();
+        return NULL;
+    }
     task_timer_fn = fn;
-    __atomic_store_n(&task_timer_armed, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&task_timer_generation, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&task_timer_armed_generation, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&task_timer_allocated, 1, __ATOMIC_RELEASE);
     if (!task_timer_started) {
         struct task_thread_slot *slot = &task_threads[LUNA_TIMER_SLOT];
-        if (slot->used) return NULL;
-        slot->used = 1;
+        if (__atomic_load_n(&slot->used, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&task_timer_allocated, 0, __ATOMIC_RELEASE);
+            task_timer_fn = NULL;
+            task_timer_unlock();
+            return NULL;
+        }
+        __atomic_store_n(&slot->used, 1, __ATOMIC_RELEASE);
         slot->tid = TASK_TIMER_TID;
+        slot->exited = 0;
+        slot->join_claimed = 0;
         slot->fn = task_timer_service;
         slot->arg = NULL;
         if (sel4utils_start_thread(&slot->thread, task_thread_trampoline,
                                    slot, NULL, 1)) {
-            slot->used = 0;
+            __atomic_store_n(&slot->used, 0, __ATOMIC_RELEASE);
             slot->tid = 0;
             slot->fn = NULL;
             slot->arg = NULL;
+            __atomic_store_n(&task_timer_allocated, 0, __ATOMIC_RELEASE);
+            task_timer_fn = NULL;
+            task_timer_unlock();
             return NULL;
         }
         task_timer_started = 1;
     }
+    task_timer_unlock();
     return &task_timer_handle;
 }
 
 static int task_timer_set_oneshot(void *timer, unsigned long ns)
 {
-    if (timer != &task_timer_handle || !task_timer_started) return -1;
+    task_timer_lock();
+    if (timer != &task_timer_handle || !task_timer_started ||
+        !task_timer_allocated) {
+        task_timer_unlock();
+        return -1;
+    }
+    unsigned long long generation = __atomic_add_fetch(
+        &task_timer_generation, 1, __ATOMIC_ACQ_REL);
     __atomic_store_n(&task_timer_deadline_ns,
                      task_time() + (ns ? ns : 1), __ATOMIC_RELAXED);
-    __atomic_store_n(&task_timer_armed, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&task_timer_armed_generation, generation,
+                     __ATOMIC_RELEASE);
+    task_timer_unlock();
     return 0;
 }
 
 static void task_timer_free(void *timer)
 {
-    if (timer == &task_timer_handle)
-        __atomic_store_n(&task_timer_armed, 0, __ATOMIC_RELEASE);
+    task_timer_lock();
+    if (timer != &task_timer_handle || !task_timer_allocated) {
+        task_timer_unlock();
+        return;
+    }
+    __atomic_store_n(&task_timer_allocated, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&task_timer_generation, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&task_timer_armed_generation, 0, __ATOMIC_RELEASE);
+    task_timer_fn = NULL;
+    task_timer_unlock();
+    while (__atomic_load_n(&task_timer_callback_running,
+                           __ATOMIC_ACQUIRE))
+        seL4_Yield();
 }
 
 #define TASK_CONSOLE_TID 0x7ffffffeUL
@@ -708,18 +852,20 @@ static void task_console_start(int irq)
 {
     if (!task_console_io_port || task_console_started || irq <= 0) return;
     struct task_thread_slot *slot = &task_threads[LUNA_CONSOLE_SLOT];
-    if (slot->used) return;
+    if (__atomic_load_n(&slot->used, __ATOMIC_ACQUIRE)) return;
     task_console_irq = irq;
     task_console_head = 0;
     task_console_tail = 0;
     __atomic_store_n(&task_console_stop_requested, 0, __ATOMIC_RELEASE);
-    slot->used = 1;
+    __atomic_store_n(&slot->used, 1, __ATOMIC_RELEASE);
     slot->tid = TASK_CONSOLE_TID;
+    slot->exited = 0;
+    slot->join_claimed = 0;
     slot->fn = task_console_service;
     slot->arg = NULL;
     if (sel4utils_start_thread(&slot->thread, task_thread_trampoline,
                                slot, NULL, 1)) {
-        slot->used = 0;
+        __atomic_store_n(&slot->used, 0, __ATOMIC_RELEASE);
         slot->tid = 0;
         slot->fn = NULL;
         task_console_irq = 0;
@@ -743,9 +889,15 @@ void luna_lkl_task_console_stop(void)
     if (!task_console_started) return;
     __atomic_store_n(&task_console_stop_requested, 1, __ATOMIC_RELEASE);
     struct task_thread_slot *slot = &task_threads[LUNA_CONSOLE_SLOT];
-    seL4_TCB_Suspend(slot->self_tcb);
-    slot->used = 0;
+    seL4_Word badge = 0;
+    if (!__atomic_load_n(&slot->exited, __ATOMIC_ACQUIRE))
+        seL4_Wait(slot->join_ntfn, &badge);
+    else
+        seL4_Poll(slot->join_ntfn, &badge);
+    __atomic_store_n(&slot->used, 0, __ATOMIC_RELEASE);
     slot->tid = 0;
+    slot->exited = 0;
+    slot->join_claimed = 0;
     slot->fn = NULL;
     slot->arg = NULL;
     task_console_started = 0;
@@ -828,6 +980,9 @@ int luna_lkl_task_configure_resources(
 {
     memset(task_threads, 0, sizeof(task_threads));
     current_tid = 1;
+    current_tls_index = 1;
+    task_next_tid = 2;
+    task_thread_table_lock_word = 0;
     for (int i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
         struct task_thread_slot *slot = &task_threads[i];
         slot->self_tcb = resources[i].tcb;
@@ -837,6 +992,7 @@ int luna_lkl_task_configure_resources(
         slot->thread.initial_stack_pointer = slot->thread.stack_top;
         slot->thread.stack_size = resources[i].stack_pages;
         slot->thread.ipc_buffer_addr = resources[i].ipc_buffer_addr;
+        slot->tls_index = (unsigned)i + 2;
         if (!slot->self_tcb || !slot->join_ntfn || !slot->thread.stack_top ||
             !slot->thread.stack_size || !slot->thread.ipc_buffer_addr)
             return -1;
@@ -858,6 +1014,14 @@ int luna_lkl_task_configure_resources(
     task_console_started = 0;
     task_console_stop_requested = 0;
     task_console_irq = 0;
+    task_timer_fn = NULL;
+    task_timer_started = 0;
+    task_timer_allocated = 0;
+    task_timer_callback_running = 0;
+    task_timer_lock_word = 0;
+    task_timer_generation = 0;
+    task_timer_armed_generation = 0;
+    task_timer_deadline_ns = 0;
     return 0;
 }
 
@@ -958,9 +1122,12 @@ static int task_tls_reentry_test(int rearm_limit, int expected_calls)
 
     lkl_thread_t tid = task_thread_create(task_tls_test_worker,
                                           (void *)(uintptr_t)1);
-    if (!tid || task_thread_join(tid) ||
+    struct task_thread_slot *slot = tid ? thread_by_tid(tid) : NULL;
+    unsigned tls_index = slot ? slot->tls_index : 0;
+    if (!tid || !slot || task_thread_join(tid) ||
         task_test_tls_destructor_calls != expected_calls ||
-        task_test_tls_set_errors != 0 || task_test_tls_key->data[tid] != NULL) {
+        task_test_tls_set_errors != 0 ||
+        task_test_tls_key->data[tls_index] != NULL) {
         task_tls_free(task_test_tls_key);
         task_test_tls_key = NULL;
         return -1;
@@ -1053,6 +1220,143 @@ int luna_lkl_task_sync_tls_test(void)
     if (task_tls_reentry_test(3, 3) ||
         task_tls_reentry_test(TASK_TLS_DESTRUCTOR_ITERATIONS + 2,
                               TASK_TLS_DESTRUCTOR_ITERATIONS))
+        return -1;
+    return 0;
+}
+
+#define TASK_THREAD_REUSE_ROUNDS 64
+#define TASK_TIMER_REARM_NS      8000000UL
+
+static struct lkl_sem *task_join_test_gate;
+static lkl_thread_t task_join_test_target;
+static volatile int task_join_test_ready;
+static volatile int task_join_test_results[2];
+
+static void task_join_target_worker(void *arg)
+{
+    (void)arg;
+    task_sem_down(task_join_test_gate);
+}
+
+static void task_joiner_worker(void *arg)
+{
+    int index = (int)(uintptr_t)arg;
+    __atomic_fetch_add(&task_join_test_ready, 1, __ATOMIC_RELEASE);
+    task_join_test_results[index] = task_thread_join(task_join_test_target);
+}
+
+static void task_noop_worker(void *arg)
+{
+    (void)arg;
+}
+
+static void task_explicit_exit_worker(void *arg)
+{
+    (void)arg;
+    task_thread_exit();
+}
+
+static int task_thread_lifecycle_test(void)
+{
+    task_join_test_gate = task_sem_alloc(0);
+    if (!task_join_test_gate) return -1;
+    task_join_test_ready = 0;
+    task_join_test_results[0] = 99;
+    task_join_test_results[1] = 99;
+    task_join_test_target = task_thread_create(task_join_target_worker, NULL);
+    if (!task_join_test_target) return -1;
+
+    lkl_thread_t joiners[2];
+    for (int i = 0; i < 2; i++) {
+        joiners[i] = task_thread_create(task_joiner_worker,
+                                        (void *)(uintptr_t)i);
+        if (!joiners[i]) return -1;
+    }
+    while (__atomic_load_n(&task_join_test_ready, __ATOMIC_ACQUIRE) != 2)
+        seL4_Yield();
+    task_sem_up(task_join_test_gate);
+    if (task_thread_join(joiners[0]) || task_thread_join(joiners[1]))
+        return -1;
+    int successes = (task_join_test_results[0] == 0) +
+                    (task_join_test_results[1] == 0);
+    int rejected = (task_join_test_results[0] == -1) +
+                   (task_join_test_results[1] == -1);
+    if (successes != 1 || rejected != 1 ||
+        task_thread_join(task_join_test_target) != -1)
+        return -1;
+    task_sem_free(task_join_test_gate);
+    task_join_test_gate = NULL;
+
+    lkl_thread_t replacement = task_thread_create(task_noop_worker, NULL);
+    if (!replacement || replacement == task_join_test_target ||
+        task_thread_join(task_join_test_target) != -1 ||
+        task_thread_join(replacement) || task_thread_join(replacement) != -1)
+        return -1;
+
+    lkl_thread_t exiting = task_thread_create(task_explicit_exit_worker, NULL);
+    if (!exiting || task_thread_join(exiting)) return -1;
+
+    lkl_thread_t previous = 0;
+    for (int i = 0; i < TASK_THREAD_REUSE_ROUNDS; i++) {
+        lkl_thread_t tid = task_thread_create(task_noop_worker, NULL);
+        if (!tid || tid == previous || task_thread_equal(tid, previous) ||
+            task_thread_join(tid))
+            return -1;
+        previous = tid;
+    }
+    return task_thread_join((lkl_thread_t)-1) == -1 ? 0 : -1;
+}
+
+static volatile int task_timer_test_callbacks;
+
+static void task_timer_test_callback(void)
+{
+    __atomic_fetch_add(&task_timer_test_callbacks, 1, __ATOMIC_ACQ_REL);
+}
+
+static void task_timer_test_wait(unsigned long long ns)
+{
+    unsigned long long deadline = task_time() + ns;
+    while (task_time() < deadline) seL4_Yield();
+}
+
+static int task_timer_lifecycle_test(void)
+{
+    task_timer_test_callbacks = 0;
+    void *timer = task_timer_alloc(task_timer_test_callback);
+    if (!timer || task_timer_set_oneshot(timer, 2000000UL)) return -1;
+    task_timer_free(timer);
+    task_timer_test_wait(4000000ULL);
+    if (task_timer_test_callbacks != 0) return -1;
+
+    timer = task_timer_alloc(task_timer_test_callback);
+    if (!timer || task_timer_set_oneshot(timer, 1000000UL)) return -1;
+    for (int i = 0; i < 32; i++)
+        if (task_timer_set_oneshot(timer, TASK_TIMER_REARM_NS)) return -1;
+    task_timer_test_wait(3000000ULL);
+    if (task_timer_test_callbacks != 0) return -1;
+    task_timer_test_wait(10000000ULL);
+    if (task_timer_test_callbacks != 1) return -1;
+    task_timer_free(timer);
+
+    for (int i = 0; i < 16; i++) {
+        timer = task_timer_alloc(task_timer_test_callback);
+        if (!timer || task_timer_set_oneshot(timer, 100000UL)) return -1;
+        seL4_Yield();
+        task_timer_free(timer);
+        int callbacks = __atomic_load_n(&task_timer_test_callbacks,
+                                        __ATOMIC_ACQUIRE);
+        task_timer_test_wait(300000ULL);
+        if (__atomic_load_n(&task_timer_test_callbacks,
+                            __ATOMIC_ACQUIRE) != callbacks)
+            return -1;
+    }
+    return 0;
+}
+
+int luna_lkl_task_thread_timer_test(void)
+{
+    if (task_thread_lifecycle_test() || task_timer_lifecycle_test())
         return -1;
     return 0;
 }
@@ -1159,11 +1463,17 @@ int luna_lkl_task_init(void)
     return lkl_init(&task_host_ops);
 }
 
-int luna_lkl_task_start_kernel(unsigned long long tsc_frequency)
+int luna_lkl_task_prepare_time(unsigned long long tsc_frequency)
 {
     if (!tsc_frequency) return -1;
     task_tsc_frequency = tsc_frequency;
     task_time_epoch = __builtin_ia32_rdtsc();
+    return 0;
+}
+
+int luna_lkl_task_start_kernel(unsigned long long tsc_frequency)
+{
+    if (luna_lkl_task_prepare_time(tsc_frequency)) return -1;
     return lkl_start_kernel("mem=16M loglevel=4");
 }
 

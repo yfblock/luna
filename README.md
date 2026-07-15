@@ -7,8 +7,9 @@
 `luna-lkl-task` → child 独立引导 LKL（Linux 6.12.0+）→ 进入交互 shell。`ls / cat / cd / mkdir /
 write / stat / free` 等命令经 `lkl_sys_*` 跑在 child 内的 LKL 内核上，`free` 读到真实
 `/proc/meminfo`。child 同时通过了真实单调时钟、oneshot timer、100ms `nanosleep`、固定资源池、
-故障诊断、销毁重建和无 fault 关机验证。Phase 2.2 又加入 manager 受控的可回收页映射和连续
-100 次完整 child boot/halt/destroy 压力测试。root manager 不再链接或运行 LKL。详见
+故障诊断、销毁重建和无 fault 关机验证。Phase 2.2 又加入 manager 受控的可回收页映射、完整的
+同步/TLS/thread/timer 生命周期语义和连续 100 次 child boot/halt/destroy 压力测试。root manager
+不再链接或运行 LKL。详见
 [`PHASE2.1-RESULTS.md`](PHASE2.1-RESULTS.md) 和
 [`PHASE2.2-RESULTS.md`](PHASE2.2-RESULTS.md)。
 
@@ -55,11 +56,11 @@ luna/
 | LKL host op | seL4 后端 |
 |---|---|
 | 内存（mem/page/mmap/shmem） | child 位图分配器 + manager 按需 map/unmap；child 不持有 VKA/Untyped |
-| 线程 | manager 预建的固定 TCB 池（全部配置到 child VSpace/CSpace） |
+| 线程 | manager 预建的固定 TCB 池；唯一递增 tid、单 join claim、显式 exit 与安全 slot reuse |
 | mutex/sem | 原子计数 semaphore + Notification 唤醒；mutex 记录 owner/递归深度并拒绝非 owner 解锁 |
-| TLS | `[tid][key]` 表 + 最多 4 轮可重入 destructor（根线程 tid=1） |
+| TLS | `[slot][key]` 表 + 最多 4 轮可重入 destructor（与可复用 slot 绑定，不复用公开 tid） |
 | jmp_buf | musl setjmp/longjmp |
-| timer/time | PIT 校准 TSC 单调时钟 + seL4 polling TCB oneshot（不占用冲突 IRQ） |
+| timer/time | PIT 校准 TSC 单调时钟 + generation oneshot；cancel barrier 与 rearm 失效旧 deadline |
 | console | 输出走 `seL4_DebugPutChar`；输入只使用 `0x3f8–0x3ff` COM1 capability |
 
 ## 复现
@@ -118,9 +119,11 @@ host operation 请求时由 manager 映射，释放时立即 unmap 并归还 VKA
 BSS heap；allocator 自测覆盖全 arena、释放复用和清零，manager 在每次 halt 后断言映射页计数为 0，
 并连续完成 100 轮 LKL 启动/关闭/销毁。
 
-Phase 2.2 的同步与 TLS 语义也已完成：semaphore 保存真实 token 计数并支持多个阻塞 waiter，mutex
-拒绝非 owner 解锁并验证 recursive depth；TLS destructor 在重新设置 key 时最多重试 4 轮。以上自测
-在每个 stress child 中执行，LKL 运行期出现任何 owner/sync 错误都会使 smoke 失败。
+Phase 2.2 已完整完成。semaphore 保存真实 token 计数并支持多个阻塞 waiter，mutex 拒绝非 owner
+解锁并验证 recursive depth；TLS destructor 在重新设置 key 时最多重试 4 轮。thread 使用唯一 tid、
+单 join claim 和 table lock 防止 slot reuse ABA；timer 使用 generation、cancel barrier 和 callback/free
+排序保证 rearm 后旧 deadline 不触发、free 返回后旧 callback 不再执行。以上自测在每个 stress child
+中执行，最终 100 轮 QEMU smoke 全部通过。
 
 当前限制包括：小于一页的 host allocation 仍按页计费，以及尚无 virtio 块设备/网络。
 后续工作见 [`next-plan.md`](next-plan.md)。

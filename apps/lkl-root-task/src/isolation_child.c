@@ -145,6 +145,8 @@ int main(int argc, char **argv)
     if (seL4_MessageInfo_get_length(start_tag) != 2 || !seL4_GetMR(1))
         for (;;) seL4_Yield();
     unsigned long long tsc_frequency = seL4_GetMR(1);
+    if (luna_lkl_task_prepare_time(tsc_frequency))
+        for (;;) seL4_Yield();
 
     if (luna_lkl_task_thread_test())
         for (;;) seL4_Yield();
@@ -157,6 +159,10 @@ int main(int argc, char **argv)
     if (luna_lkl_task_sync_tls_test())
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_SYNC_TLS_OK,
+               child_boot.mode);
+    if (luna_lkl_task_thread_timer_test())
+        for (;;) seL4_Yield();
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_THREAD_TIMER_OK,
                child_boot.mode);
 
     if (luna_lkl_task_init()) {

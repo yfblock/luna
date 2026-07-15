@@ -486,6 +486,8 @@ static int boot_child(simple_t *simple, vka_t *vka,
     if (receive_event(event_context, LUNA_ISOLATION_EVENT_RESOURCE_OK, mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_ALLOCATOR_OK, mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_SYNC_TLS_OK, mode) ||
+        receive_event(event_context, LUNA_ISOLATION_EVENT_THREAD_TIMER_OK,
+                      mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode))
         return -1;
@@ -566,6 +568,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_CHILD_ALLOCATOR_OK pages=%lu\n",
            (unsigned long)LUNA_CHILD_HEAP_PAGES);
     printf("LUNA_SYNC_TLS_OK\n");
+    printf("LUNA_THREAD_TIMER_OK\n");
     printf("LUNA_LKL_CHILD_INIT_OK\n");
     printf("LUNA_LKL_CHILD_BOOT_OK\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
