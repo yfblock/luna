@@ -111,6 +111,15 @@ LKL 内部路径；shim 会显式拒绝这些调用。实现与证据见 `PHASE2
 
 完成状态：Phase 2.4.1 已完成。实现与证据见 `PHASE2.4.1-RESULTS.md`。
 
+### Phase 2.4.2：LKL-aware 标准流 stdio
+
+- [x] 将 printf/vprintf/dprintf 的 stdout 输出写入 LKL fd。
+- [x] 将 stdout/stderr 的 fprintf、puts、putchar、fputs、putc 写入 LKL fd。
+- [x] 支持标准流 fflush/ferror/clearerr，并拒绝未支持的任意 FILE stream。
+- [x] 自动验证 `printf > file` 后由 `cat` 读回格式化内容。
+
+完成状态：Phase 2.4.2 已完成。实现与证据见 `PHASE2.4.2-RESULTS.md`。
+
 ## Phase 2.5：网络数据通路
 
 目标：接通 LKL 内核网络栈与 seL4/QEMU 外部网络。

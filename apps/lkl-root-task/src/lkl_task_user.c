@@ -32,6 +32,8 @@
 #define LUNA_USER_MIN_SPLIT 16UL
 
 extern int lbb_main(char **argv);
+void *luna_bb_malloc(size_t size);
+void luna_bb_free(void *pointer);
 
 static jmp_buf task_user_exit;
 static volatile int task_user_exit_armed;
@@ -114,6 +116,159 @@ ssize_t luna_bb_write(int fd, const void *buffer, size_t count)
 {
     return (ssize_t)bb_result(lkl_sys_write((unsigned int)fd,
                                             (void *)buffer, count));
+}
+
+static int bb_write_all(int fd, const void *buffer, size_t count)
+{
+    const unsigned char *cursor = buffer;
+    size_t written = 0;
+    while (written < count) {
+        ssize_t result = luna_bb_write(fd, cursor + written,
+                                       count - written);
+        if (result <= 0) return -1;
+        written += (size_t)result;
+    }
+    return 0;
+}
+
+static int bb_vformat_fd(int fd, const char *format, va_list arguments)
+{
+    char stack_buffer[512];
+    va_list copy;
+    va_copy(copy, arguments);
+    int length = vsnprintf(stack_buffer, sizeof(stack_buffer), format, copy);
+    va_end(copy);
+    if (length < 0) return -1;
+
+    char *buffer = stack_buffer;
+    if ((size_t)length >= sizeof(stack_buffer)) {
+        buffer = luna_bb_malloc((size_t)length + 1U);
+        if (!buffer) return -1;
+        va_copy(copy, arguments);
+        int formatted = vsnprintf(buffer, (size_t)length + 1U,
+                                  format, copy);
+        va_end(copy);
+        if (formatted != length) {
+            luna_bb_free(buffer);
+            task_user_errno = EIO;
+            return -1;
+        }
+    }
+    int result = bb_write_all(fd, buffer, (size_t)length) ? -1 : length;
+    if (buffer != stack_buffer) luna_bb_free(buffer);
+    return result;
+}
+
+int luna_bb_vprintf(const char *format, va_list arguments)
+{
+    return bb_vformat_fd(1, format, arguments);
+}
+
+int luna_bb_printf(const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = bb_vformat_fd(1, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+int luna_bb_dprintf(int fd, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = bb_vformat_fd(fd, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int bb_file_fd(FILE *stream)
+{
+    if (stream == stdout) return 1;
+    if (stream == stderr) return 2;
+    task_user_errno = ENOSYS;
+    return -1;
+}
+
+int luna_bb_vfprintf(FILE *stream, const char *format, va_list arguments)
+{
+    int fd = bb_file_fd(stream);
+    return fd < 0 ? -1 : bb_vformat_fd(fd, format, arguments);
+}
+
+int luna_bb_fprintf(FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = luna_bb_vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+int luna_bb_putchar(int character)
+{
+    unsigned char value = (unsigned char)character;
+    return bb_write_all(1, &value, 1) ? EOF : value;
+}
+
+int luna_bb_putchar_unlocked(int character)
+{
+    return luna_bb_putchar(character);
+}
+
+int luna_bb_puts(const char *string)
+{
+    size_t length = strlen(string);
+    if (bb_write_all(1, string, length) || bb_write_all(1, "\n", 1))
+        return EOF;
+    return 0;
+}
+
+int luna_bb_fputs(const char *string, FILE *stream)
+{
+    int fd = bb_file_fd(stream);
+    if (fd < 0 || bb_write_all(fd, string, strlen(string))) return EOF;
+    return 0;
+}
+
+int luna_bb_fputs_unlocked(const char *string, FILE *stream)
+{
+    return luna_bb_fputs(string, stream);
+}
+
+int luna_bb_putc(int character, FILE *stream)
+{
+    int fd = bb_file_fd(stream);
+    if (fd < 0) return EOF;
+    unsigned char value = (unsigned char)character;
+    return bb_write_all(fd, &value, 1) ? EOF : value;
+}
+
+int luna_bb_putc_unlocked(int character, FILE *stream)
+{
+    return luna_bb_putc(character, stream);
+}
+
+int luna_bb_fflush(FILE *stream)
+{
+    if (!stream || stream == stdout || stream == stderr) return 0;
+    task_user_errno = ENOSYS;
+    return EOF;
+}
+
+int luna_bb_ferror(FILE *stream)
+{
+    return bb_file_fd(stream) < 0;
+}
+
+int luna_bb_ferror_unlocked(FILE *stream)
+{
+    return luna_bb_ferror(stream);
+}
+
+void luna_bb_clearerr(FILE *stream)
+{
+    (void)stream;
 }
 
 off_t luna_bb_lseek(int fd, off_t offset, int whence)

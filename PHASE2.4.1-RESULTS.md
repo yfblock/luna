@@ -48,8 +48,8 @@ exit
 `fork/exec/pipe/waitpid`，因此 pipeline、后台任务和非 nofork 外部 applet 尚未实现；这些调用仍以
 `ENOSYS` 拒绝并进入 violation counter。
 
-`printf` builtin 暂未启用：它依赖 libc stdio，而当前静态 ABI 只将 fd syscall 重定向到 LKL；若直接
-启用，ash 会创建重定向目标，但格式化内容仍写到宿主 stdio。后续需先实现 LKL-aware stdio 层。
+后续 Phase 2.4.2 已为 stdout/stderr 增加 LKL-aware stdio subset，并重新启用 `printf` builtin；
+实现与边界见 `PHASE2.4.2-RESULTS.md`。
 
 ## 验证
 
