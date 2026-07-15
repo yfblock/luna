@@ -6,6 +6,7 @@
  */
 #include "luna_isolation.h"
 #include "luna_isolation_protocol.h"
+#include "luna_manager_private.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
@@ -21,11 +22,6 @@
 #define CHILD_BADGE_FAULT 0x41
 #define CHILD_BADGE_CLEAN 0x42
 
-/* Page-aligned manager ELF storage: present in the root VSpace, absent from the
- * separately loaded child ELF, and requires no extra Untyped allocation. */
-static seL4_Word manager_private_page[BIT(seL4_PageBits) / sizeof(seL4_Word)]
-    __attribute__((aligned(BIT(seL4_PageBits))));
-
 struct luna_resource_slot {
     sel4utils_thread_t thread;
     vka_object_t join_ntfn;
@@ -35,8 +31,15 @@ struct luna_resource_slot {
     int join_allocated;
 };
 
+struct luna_sync_slot {
+    vka_object_t ntfn;
+    seL4_CPtr child_ntfn;
+    int allocated;
+};
+
 struct luna_child_resources {
     struct luna_resource_slot slots[LUNA_RESOURCE_SLOTS];
+    struct luna_sync_slot sync[LUNA_SYNC_SLOTS];
 };
 
 static void delete_child_cap(sel4utils_process_t *process, seL4_CPtr cap)
@@ -70,6 +73,12 @@ static void destroy_child(sel4utils_process_t *process,
             sel4utils_clean_up_thread(vka, &process->vspace, &slot->thread);
         if (slot->join_allocated)
             vka_free_object(vka, &slot->join_ntfn);
+    }
+    for (int i = 0; i < LUNA_SYNC_SLOTS; i++) {
+        struct luna_sync_slot *slot = &resources->sync[i];
+        delete_child_cap(process, slot->child_ntfn);
+        if (slot->allocated)
+            vka_free_object(vka, &slot->ntfn);
     }
     if (process->cspace.cptr)
         sel4utils_destroy_process(process, vka);
@@ -122,6 +131,20 @@ static int configure_resource_pool(simple_t *simple, vka_t *vka,
             return -1;
         }
     }
+    for (int i = 0; i < LUNA_SYNC_SLOTS; i++) {
+        struct luna_sync_slot *slot = &resources->sync[i];
+        if (vka_alloc_notification(vka, &slot->ntfn)) {
+            printf("luna: sync slot %d allocation failed\n", i);
+            return -1;
+        }
+        slot->allocated = 1;
+        slot->child_ntfn = sel4utils_copy_cap_to_process(
+            process, vka, slot->ntfn.cptr);
+        if (!slot->child_ntfn) {
+            printf("luna: sync slot %d cap copy failed\n", i);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -160,10 +183,22 @@ static void send_resource_slot(seL4_CPtr command_ep,
     seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 8));
 }
 
-static void send_start(seL4_CPtr command_ep)
+static void send_start(seL4_CPtr command_ep, unsigned long long tsc_frequency)
 {
     seL4_SetMR(0, LUNA_COMMAND_START);
-    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 1));
+    seL4_SetMR(1, (seL4_Word)tsc_frequency);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+}
+
+static void send_sync_slot(seL4_CPtr command_ep,
+                           const struct luna_sync_slot *slot,
+                           seL4_Word index)
+{
+    seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_SYNC);
+    seL4_SetMR(1, index);
+    seL4_SetMR(2, LUNA_SYNC_SLOTS);
+    seL4_SetMR(3, slot->child_ntfn);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 4));
 }
 
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
@@ -232,9 +267,12 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
     return 0;
 }
 
-int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
+int luna_isolation_smoke(simple_t *simple, vka_t *vka,
+                         vspace_t *manager_vspace,
+                         unsigned long long tsc_frequency)
 {
-    const seL4_Word private_addr = (seL4_Word)(uintptr_t)manager_private_page;
+    const seL4_Word private_addr =
+        (seL4_Word)(uintptr_t)luna_manager_private_page;
     vka_object_t control_ep = {0};
     vka_object_t command_ep = {0};
     sel4utils_process_t child = {0};
@@ -244,7 +282,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
     int child_live = 0;
     int result = -1;
 
-    manager_private_page[0] = LUNA_ISOLATION_SECRET;
+    luna_manager_private_page[0] = LUNA_ISOLATION_SECRET;
 
     if (vka_alloc_endpoint(vka, &control_ep)) {
         printf("luna: isolation control endpoint allocation failed\n");
@@ -274,11 +312,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
     printf("LUNA_LKL_CHILD_LINKED\n");
     for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++)
         send_resource_slot(command_ep.cptr, &resources.slots[i], i);
+    for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++)
+        send_sync_slot(command_ep.cptr, &resources.sync[i], i);
     if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                       LUNA_ISOLATION_MODE_FAULT))
         goto out;
-    send_start(command_ep.cptr);
+    send_start(command_ep.cptr, tsc_frequency);
 
     if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
                       LUNA_ISOLATION_EVENT_RESOURCE_OK, LUNA_ISOLATION_MODE_FAULT))
@@ -288,6 +328,14 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
                       LUNA_ISOLATION_EVENT_LKL_INIT_OK, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_INIT_OK\n");
+    if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
+                      LUNA_ISOLATION_EVENT_LKL_BOOT_OK, LUNA_ISOLATION_MODE_FAULT))
+        goto out;
+    printf("LUNA_LKL_CHILD_BOOT_OK\n");
+    if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
+                      LUNA_ISOLATION_EVENT_LKL_HALT_OK, LUNA_ISOLATION_MODE_FAULT))
+        goto out;
+    printf("LUNA_LKL_CHILD_HALT_OK\n");
 
     seL4_Word fault_badge = 0;
     seL4_MessageInfo_t fault_tag = seL4_Recv(child.fault_endpoint.cptr, &fault_badge);
@@ -300,7 +348,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
         goto out;
     }
     sel4utils_print_fault_message(fault_tag, LUNA_ISOLATION_CHILD_IMAGE);
-    if (*(volatile seL4_Word *)(uintptr_t)private_addr != LUNA_ISOLATION_SECRET) {
+    if (*(volatile seL4_Word *)(uintptr_t)private_addr !=
+        LUNA_ISOLATION_SECRET) {
         printf("luna: manager-private page was modified\n");
         goto out;
     }
@@ -323,16 +372,24 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace)
         goto out;
     for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++)
         send_resource_slot(command_ep.cptr, &resources.slots[i], i);
+    for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++)
+        send_sync_slot(command_ep.cptr, &resources.sync[i], i);
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                       LUNA_ISOLATION_MODE_CLEAN))
         goto out;
-    send_start(command_ep.cptr);
+    send_start(command_ep.cptr, tsc_frequency);
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_RESOURCE_OK, LUNA_ISOLATION_MODE_CLEAN))
         goto out;
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_LKL_INIT_OK, LUNA_ISOLATION_MODE_CLEAN))
+        goto out;
+    if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
+                      LUNA_ISOLATION_EVENT_LKL_BOOT_OK, LUNA_ISOLATION_MODE_CLEAN))
+        goto out;
+    if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
+                      LUNA_ISOLATION_EVENT_LKL_HALT_OK, LUNA_ISOLATION_MODE_CLEAN))
         goto out;
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_DONE, LUNA_ISOLATION_MODE_CLEAN))

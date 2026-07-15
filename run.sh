@@ -9,6 +9,7 @@
 #   ./run.sh --run-only      # 只启动（假定已构建）
 #   ./run.sh --timeout 30    # 自定义 QEMU 超时秒数
 #   ./run.sh --no-timeout    # 不超时（手动 Ctrl-A X 退出）
+#   LUNA_QEMU_MEM=2G ./run.sh # 覆盖迁移期 QEMU 内存（默认 1G）
 #
 # 前置：deps/ 已就绪（seL4 manifest 源树 + lkl-linux）；~/bin/xmllint stub 与 python 依赖已装。
 # 详见 README.md / PHASE1-RESULTS.md。
@@ -21,6 +22,7 @@ LKL_LINUX="$DEPS/lkl-linux"
 LKL_LIBA="$LKL_LINUX/tools/lkl/liblkl.a"
 KERNEL_OBJ="$ROOT/build-artifacts/lkl-kernel.o"
 QEMU="$(command -v qemu-system-x86_64 || true)"
+QEMU_MEM="${LUNA_QEMU_MEM:-1G}"
 
 DO_BUILD=1
 DO_RUN=1
@@ -76,15 +78,15 @@ if [[ $DO_BUILD == 1 ]]; then
 fi
 
 if [[ $DO_RUN == 1 ]]; then
-    step "boot on QEMU  (qemu: $QEMU)"
+    step "boot on QEMU  (qemu: $QEMU, memory: $QEMU_MEM)"
     [[ -x "$QEMU" ]] || { echo "缺 qemu-system-x86_64" >&2; exit 1; }
     [[ -x "$BUILD/simulate" ]] || { echo "未构建：先 ./run.sh --build-only" >&2; exit 1; }
     cd "$BUILD"
     # 直接透传，不过 sed：sed 按行处理会吞掉逐字符回显（交互 shell 必须）。
     # 启动时 seL4 的 ANSI（ESC[?7l ESC[2J）会清一次屏，可接受。
     if [[ $TIMEOUT -gt 0 ]]; then
-        timeout "$TIMEOUT" ./simulate -b "$QEMU"
+        timeout "$TIMEOUT" ./simulate -b "$QEMU" -m "$QEMU_MEM"
     else
-        ./simulate -b "$QEMU"
+        ./simulate -b "$QEMU" -m "$QEMU_MEM"
     fi
 fi

@@ -55,6 +55,7 @@ int sel4_lkl_host_init(simple_t *simple, vka_t *vka, vspace_t *vspace,
                        seL4_CPtr cspace, seL4_CPtr root_tcb);
 int sel4_lkl_host_thread_reuse_test(void);
 unsigned long long sel4_lkl_host_time(void);
+unsigned long long sel4_lkl_host_tsc_frequency(void);
 int sel4_lkl_host_console_ready(void);
 void sel4_lkl_host_stop_console(void);
 void sel4_lkl_host_shutdown(void);

@@ -6,6 +6,8 @@
 #include <vka/vka.h>
 #include <vspace/vspace.h>
 
-int luna_isolation_smoke(simple_t *simple, vka_t *vka, vspace_t *manager_vspace);
+int luna_isolation_smoke(simple_t *simple, vka_t *vka,
+                         vspace_t *manager_vspace,
+                         unsigned long long tsc_frequency);
 
 #endif /* LUNA_ISOLATION_H */

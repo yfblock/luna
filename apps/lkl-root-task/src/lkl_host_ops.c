@@ -42,6 +42,11 @@ struct lkl_host_operations seL4_lkl_host_ops;
 static void *bump_alloc(unsigned long sz, unsigned long align);  /* 静态 BSS 堆分配器，见内存段 */
 static void tls_cleanup_thread(lkl_thread_t tid);
 
+static void host_debug(const char *str)
+{
+    while (*str) seL4_DebugPutChar(*str++);
+}
+
 /* ───────── 线程 ───────── */
 struct lkl_thread {
     int                 used;
@@ -80,11 +85,18 @@ static lkl_thread_t host_thread_create(void (*f)(void *), void *arg)
     /* slot 0/tid 1 永久属于根线程；派生线程的 tid 等于 slot+1，可安全复用。 */
     for (int i = 1; i < LKL_MAX_THREADS; i++)
         if (!g_threads[i].used) { lt = &g_threads[i]; memset(lt, 0, sizeof(*lt)); lt->used = 1; break; }
-    if (!lt) return 0;
+    if (!lt) {
+        host_debug("luna: root host thread pool exhausted\n");
+        return 0;
+    }
     lt->tid = (lkl_thread_t)((lt - g_threads) + 1);
     lt->fn = f; lt->arg = arg;
 
-    if (vka_alloc_notification(g_ctx.vka, &lt->join_ntfn)) { lt->used = 0; return 0; }
+    if (vka_alloc_notification(g_ctx.vka, &lt->join_ntfn)) {
+        host_debug("luna: root host join allocation failed\n");
+        lt->used = 0;
+        return 0;
+    }
 
     sel4utils_thread_config_t cfg = {0};
     cfg.fault_endpoint = g_ctx.fault_ep;
@@ -98,6 +110,7 @@ static lkl_thread_t host_thread_create(void (*f)(void *), void *arg)
 
     return lt->tid;
 fail:
+    host_debug("luna: root host thread configure/start failed\n");
     vka_free_object(g_ctx.vka, &lt->join_ntfn);
     lt->used = 0;
     return 0;
@@ -146,8 +159,14 @@ static void ntsem_up(seL4_CPtr n)   { seL4_Signal(n); }
 static struct lkl_sem *host_sem_alloc(int count)
 {
     struct lkl_sem *s = bump_alloc(sizeof(*s), 16);
-    if (!s) return NULL;
-    if (vka_alloc_notification(g_ctx.vka, &s->ntfn)) return NULL;
+    if (!s) {
+        host_debug("luna: root host sem storage exhausted\n");
+        return NULL;
+    }
+    if (vka_alloc_notification(g_ctx.vka, &s->ntfn)) {
+        host_debug("luna: root host sem allocation failed\n");
+        return NULL;
+    }
     for (int i = 0; i < count; i++) seL4_Signal(s->ntfn.cptr);  /* prime；count>1 塌缩为 1 */
     return s;
 }
@@ -163,8 +182,14 @@ static void host_sem_down(struct lkl_sem *s) { ntsem_down(s->ntfn.cptr); }
 static struct lkl_mutex *host_mutex_alloc(int recursive)
 {
     struct lkl_mutex *m = bump_alloc(sizeof(*m), 16);
-    if (!m) return NULL;
-    if (vka_alloc_notification(g_ctx.vka, &m->ntfn)) return NULL;
+    if (!m) {
+        host_debug("luna: root host mutex storage exhausted\n");
+        return NULL;
+    }
+    if (vka_alloc_notification(g_ctx.vka, &m->ntfn)) {
+        host_debug("luna: root host mutex allocation failed\n");
+        return NULL;
+    }
     seL4_Signal(m->ntfn.cptr);   /* prime：未上锁 */
     m->owner = 0; m->count = 0; m->recursive = recursive;
     return m;
@@ -276,6 +301,7 @@ static unsigned long long host_time(void)
     return tsc_get_time(g_ctx.tsc_freq) - g_ctx.tsc_epoch_ns;
 }
 unsigned long long sel4_lkl_host_time(void) { return host_time(); }
+unsigned long long sel4_lkl_host_tsc_frequency(void) { return g_ctx.tsc_freq; }
 
 static void *host_timer_alloc(void (*fn)(void))
 {

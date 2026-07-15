@@ -30,6 +30,8 @@ REQUIRED = [
     b"LUNA_LKL_CHILD_LINKED",
     b"LUNA_RESOURCE_POOL_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
+    b"LUNA_LKL_CHILD_BOOT_OK",
+    b"LUNA_LKL_CHILD_HALT_OK",
     b"LUNA_ISOLATION_RESTART_OK",
     b"LUNA_ISOLATION_OK",
     b"luna: host thread reuse test ok",

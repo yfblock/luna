@@ -33,7 +33,11 @@
 #include <lkl.h>
 void luna_shell_run(void);
 
-#define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 256)
+/* Loading the isolated LKL ELF creates metadata for several thousand frames
+ * and mappings.  Keep this pool independent from the physical Untyped budget:
+ * 1 MiB was sufficient for the pre-kernel child, but exhausted allocman after
+ * the child gained its 32 MiB host heap. */
+#define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 1024)
 static char allocator_mem_pool[ALLOCATOR_STATIC_POOL_SIZE];
 
 static simple_t             simple;
@@ -66,17 +70,13 @@ int main(int argc, char **argv)
     ZF_LOGF_IF(err, "vspace bootstrap failed: %d", err);
     printf("luna: vspace ok\n");
 
-    /* Establish the child-task boundary before LKL is gradually migrated into
-       it. A faulting child must be diagnosable and replaceable without harming
-       the manager or the existing LKL baseline. */
-    err = luna_isolation_smoke(&simple, &vka, &vspace);
-    ZF_LOGF_IF(err, "isolation smoke failed");
-    printf("LUNA_ISOLATION_OK\n");
-
-    /* 2. 初始化 host 后端并验证线程槽可累计复用。 */
+    /* Keep the stable root-hosted shell first while tty/shell migration is
+       incomplete. The isolated child is exercised after this baseline exits. */
     err = sel4_lkl_host_init(&simple, &vka, &vspace, cnode, root_tcb);
     ZF_LOGF_IF(err, "lkl host init failed");
     printf("luna: host backend ok\n");
+
+    /* 2. 验证线程槽可累计复用。 */
     err = sel4_lkl_host_thread_reuse_test();
     ZF_LOGF_IF(err, "host thread reuse test failed");
     printf("luna: host thread reuse test ok\n");
@@ -121,8 +121,15 @@ int main(int argc, char **argv)
     sel4_lkl_host_stop_console();
     long halt_ret = lkl_sys_halt();
     printf("luna: lkl_sys_halt returned %ld\n", halt_ret);
+    unsigned long long tsc_frequency = sel4_lkl_host_tsc_frequency();
     lkl_cleanup();
     sel4_lkl_host_shutdown();
+
+    /* After the comparison path is fully stopped, boot/halt LKL in the
+       isolated task, diagnose its deliberate fault, and verify replacement. */
+    err = luna_isolation_smoke(&simple, &vka, &vspace, tsc_frequency);
+    ZF_LOGF_IF(err, "isolation smoke failed");
+    printf("LUNA_ISOLATION_OK\n");
     printf("LUNA_SHUTDOWN_OK\n");
 
     /* root task 没有父进程可返回；进入明确的 quiescent 状态，由测试端结束 QEMU。 */

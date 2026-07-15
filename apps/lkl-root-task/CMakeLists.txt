@@ -65,6 +65,7 @@ add_executable(luna-lkl
     src/isolation_manager.c
     src/lkl_host_ops.c
     src/shell.c
+    src/manager_private.c
 )
 
 target_include_directories(luna-lkl PRIVATE

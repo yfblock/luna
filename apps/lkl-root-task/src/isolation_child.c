@@ -13,6 +13,18 @@
 #include <lkl_host.h>
 #include <string.h>
 
+struct child_boot_state {
+    seL4_CPtr control_ep;
+    seL4_CPtr command_ep;
+    seL4_Word mode;
+    seL4_Word private_addr;
+};
+
+/* The initial host thread becomes LKL's init task and crosses setjmp/longjmp
+ * scheduler boundaries. Keep lifecycle arguments out of its stack frame so
+ * they remain authoritative after lkl_sys_halt(). */
+static struct child_boot_state child_boot;
+
 static seL4_Word parse_word(const char *s)
 {
     seL4_Word value = 0;
@@ -43,29 +55,53 @@ static seL4_MessageInfo_t receive_command(seL4_CPtr command_ep,
     return tag;
 }
 
+static __attribute__((noreturn)) void finish_child(void)
+{
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_HALT_OK,
+               child_boot.mode);
+
+    if (child_boot.mode == LUNA_ISOLATION_MODE_FAULT) {
+        /* The manager maps this address only in its own VSpace. Reaching the
+         * next send would prove that the child can see manager-private data. */
+        volatile seL4_Word secret =
+            *(volatile seL4_Word *)(uintptr_t)child_boot.private_addr;
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_PRIVATE_PAGE_VISIBLE, secret);
+    } else {
+        send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_DONE,
+                   child_boot.mode);
+    }
+
+    seL4_TCB_Suspend(SEL4UTILS_TCB_SLOT);
+    for (;;) seL4_Yield();
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
         for (;;) seL4_Yield();
     }
 
-    seL4_CPtr control_ep = (seL4_CPtr)parse_word(argv[0]);
-    seL4_CPtr command_ep = (seL4_CPtr)parse_word(argv[1]);
-    seL4_Word mode = parse_word(argv[2]);
-    seL4_Word private_addr = parse_word(argv[3]);
+    child_boot.control_ep = (seL4_CPtr)parse_word(argv[0]);
+    child_boot.command_ep = (seL4_CPtr)parse_word(argv[1]);
+    child_boot.mode = parse_word(argv[2]);
+    child_boot.private_addr = parse_word(argv[3]);
 
-    send_event(control_ep, LUNA_ISOLATION_EVENT_READY, mode);
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_READY,
+               child_boot.mode);
 
     /* Volatile keeps a real relocation to lkl_init in this ELF and proves that
      * the LKL kernel object has moved into the isolated task image. */
     volatile uintptr_t lkl_link_anchor = (uintptr_t)&lkl_init;
     if (!lkl_link_anchor) for (;;) seL4_Yield();
-    send_event(control_ep, LUNA_ISOLATION_EVENT_LKL_LINKED, mode);
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_LINKED,
+               child_boot.mode);
 
     struct luna_task_thread_resource resources[LUNA_RESOURCE_SLOTS];
     for (seL4_Word i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
         seL4_MessageInfo_t config_tag =
-            receive_command(command_ep, LUNA_COMMAND_CONFIGURE_SLOT);
+            receive_command(child_boot.command_ep,
+                            LUNA_COMMAND_CONFIGURE_SLOT);
         if (seL4_MessageInfo_get_length(config_tag) != 8 ||
             seL4_GetMR(1) != i || seL4_GetMR(2) != LUNA_RESOURCE_SLOTS) {
             for (;;) seL4_Yield();
@@ -76,32 +112,45 @@ int main(int argc, char **argv)
         resources[i].ipc_buffer_addr = seL4_GetMR(6);
         resources[i].join_ntfn = (seL4_CPtr)seL4_GetMR(7);
     }
-    if (luna_lkl_task_configure_resources(resources))
+    struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS];
+    for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++) {
+        seL4_MessageInfo_t config_tag =
+            receive_command(child_boot.command_ep,
+                            LUNA_COMMAND_CONFIGURE_SYNC);
+        if (seL4_MessageInfo_get_length(config_tag) != 4 ||
+            seL4_GetMR(1) != i || seL4_GetMR(2) != LUNA_SYNC_SLOTS) {
+            for (;;) seL4_Yield();
+        }
+        sync[i].ntfn = (seL4_CPtr)seL4_GetMR(3);
+    }
+    if (luna_lkl_task_configure_resources(resources, sync))
         for (;;) seL4_Yield();
-    send_event(control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode);
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
+               child_boot.mode);
 
-    receive_command(command_ep, LUNA_COMMAND_START);
+    seL4_MessageInfo_t start_tag =
+        receive_command(child_boot.command_ep, LUNA_COMMAND_START);
+    if (seL4_MessageInfo_get_length(start_tag) != 2 || !seL4_GetMR(1))
+        for (;;) seL4_Yield();
+    unsigned long long tsc_frequency = seL4_GetMR(1);
 
     if (luna_lkl_task_thread_test())
         for (;;) seL4_Yield();
-    send_event(control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK, mode);
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK,
+               child_boot.mode);
 
     if (luna_lkl_task_init()) {
         for (;;) seL4_Yield();
     }
-    send_event(control_ep, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode);
-    luna_lkl_task_cleanup();
-
-    if (mode == LUNA_ISOLATION_MODE_FAULT) {
-        /* The manager maps this address only in its own VSpace.  Reaching the
-         * next send would prove that the child can see manager-private data. */
-        volatile seL4_Word secret = *(volatile seL4_Word *)(uintptr_t)private_addr;
-        send_event(control_ep, LUNA_ISOLATION_EVENT_PRIVATE_PAGE_VISIBLE, secret);
-    } else {
-        send_event(control_ep, LUNA_ISOLATION_EVENT_DONE, mode);
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_INIT_OK,
+               child_boot.mode);
+    if (luna_lkl_task_start_kernel(tsc_frequency)) {
+        for (;;) seL4_Yield();
     }
-
-    /* A sel4utils process receives a cap to its initial TCB in this slot. */
-    seL4_TCB_Suspend(SEL4UTILS_TCB_SLOT);
-    for (;;) seL4_Yield();
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_BOOT_OK,
+               child_boot.mode);
+    if (luna_lkl_task_halt()) {
+        for (;;) seL4_Yield();
+    }
+    finish_child();
 }
