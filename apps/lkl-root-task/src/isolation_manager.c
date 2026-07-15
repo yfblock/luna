@@ -6,6 +6,7 @@
  */
 #include "luna_isolation.h"
 #include "luna_isolation_protocol.h"
+#include "luna_network_manager.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
@@ -95,6 +96,7 @@ struct luna_child_resources {
     struct luna_console_resource console;
     struct luna_heap_resource heap;
     struct luna_disk_mapping disk;
+    struct luna_net_mapping net;
 };
 
 struct luna_event_context {
@@ -257,6 +259,7 @@ static int destroy_child(sel4utils_process_t *process,
 {
     int result = 0;
     size_t disk_mapped_pages = resources->disk.mapped_pages;
+    size_t net_mapped_pages = resources->net.mapped_pages;
     if (process->thread.tcb.cptr)
         seL4_TCB_Suspend(process->thread.tcb.cptr);
     for (int i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
@@ -316,6 +319,11 @@ static int destroy_child(sel4utils_process_t *process,
         if (!resources->disk.cap_allocated[i]) continue;
         if (vka_cnode_delete(&resources->disk.frame_caps[i])) result = -1;
         vka_cspace_free_path(vka, resources->disk.frame_caps[i]);
+    }
+    for (size_t i = net_mapped_pages; i < LUNA_NET_IO_PAGES; i++) {
+        if (!resources->net.cap_allocated[i]) continue;
+        if (vka_cnode_delete(&resources->net.frame_caps[i])) result = -1;
+        vka_cspace_free_path(vka, resources->net.frame_caps[i]);
     }
     memset(resources, 0, sizeof(*resources));
     memset(process, 0, sizeof(*process));
@@ -530,6 +538,16 @@ static int receive_event(struct luna_event_context *context,
             continue;
         }
 
+        if (label == 0 && length == 3 && badge == context->badge &&
+            (event == LUNA_ISOLATION_EVENT_NET_TX ||
+             event == LUNA_ISOLATION_EVENT_NET_RX)) {
+            if (seL4_GetMR(2) ||
+                luna_network_service(context->command_ep, event,
+                                     seL4_GetMR(1)))
+                return -1;
+            continue;
+        }
+
         if (label != 0 || length < 2 || badge != context->badge ||
             event != expected_event || detail != expected_detail) {
             printf("luna: isolation event mismatch label=%lu len=%lu badge=%lu "
@@ -606,6 +624,16 @@ static void send_disk_resource(seL4_CPtr command_ep)
     seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 4));
 }
 
+static void send_net_resource(seL4_CPtr command_ep)
+{
+    seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_NET);
+    seL4_SetMR(1, LUNA_NET_IO_BASE);
+    seL4_SetMR(2, LUNA_NET_IO_SIZE);
+    seL4_SetMR(3, LUNA_NET_MAC_WORD0);
+    seL4_SetMR(4, LUNA_NET_MAC_WORD1);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 5));
+}
+
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
                        seL4_CPtr control_ep, seL4_CPtr command_ep,
                        seL4_Word badge,
@@ -644,6 +672,12 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
     resources->heap.reserved = 1;
 
     if (map_persistent_disk(disk, vka, manager_vspace, process, resources)) {
+        (void)destroy_child(process, resources, vka);
+        return -1;
+    }
+    if (luna_network_map_child(vka, manager_vspace, process,
+                               &resources->net)) {
+        printf("luna: child network window mapping failed\n");
         (void)destroy_child(process, resources, vka);
         return -1;
     }
@@ -723,6 +757,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
         send_sync_slot(command_ep, &resources->sync[i], i);
     send_console_resource(command_ep, &resources->console);
     send_disk_resource(command_ep);
+    send_net_resource(command_ep);
     if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode))
         return -1;
@@ -734,8 +769,15 @@ static int boot_child(simple_t *simple, vka_t *vka,
         receive_event(event_context, LUNA_ISOLATION_EVENT_THREAD_TIMER_OK,
                       mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode) ||
-        receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode) ||
-        receive_event(event_context,
+        receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode))
+        return -1;
+    if (mode != LUNA_ISOLATION_MODE_STRESS &&
+        (receive_event(event_context,
+                       LUNA_ISOLATION_EVENT_VIRTIO_NET_OK, mode) ||
+         receive_event(event_context,
+                       LUNA_ISOLATION_EVENT_NETWORK_IPV4_OK, mode)))
+        return -1;
+    if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_VIRTIO_BLOCK_OK, mode))
         return -1;
     return 0;
@@ -793,6 +835,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
 
     manager_private_page[0] = LUNA_ISOLATION_SECRET;
 
+    if (luna_network_manager_init(simple, vka, manager_vspace)) goto out;
     if (init_persistent_disk(&disk, manager_vspace)) goto out;
 
     if (vka_alloc_endpoint(vka, &control_ep)) {
@@ -823,6 +866,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_LKL_CHILD_BOOT_OK\n");
     printf("LUNA_VIRTIO_BLOCK_OK bytes=%lu\n",
            (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
+    printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
+    printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_HALT_OK\n");
@@ -867,17 +912,25 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
            LUNA_RESTART_STRESS_ROUNDS);
     printf("LUNA_PERSISTENCE_OK rounds=%d\n",
            LUNA_RESTART_STRESS_ROUNDS);
+    printf("LUNA_NETWORK_RECLAIM_OK rounds=%d\n",
+           LUNA_RESTART_STRESS_ROUNDS);
 
     if (boot_child(simple, vka, manager_vspace, control_ep.cptr,
                    command_ep.cptr, CHILD_BADGE_CLEAN,
                    LUNA_ISOLATION_MODE_CLEAN, private_addr, tsc_frequency,
                    &child, &resources, &disk, &child_live, &event_context))
         goto out;
-    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
+    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK,
+                      LUNA_ISOLATION_MODE_CLEAN) ||
+        receive_event(&event_context, LUNA_ISOLATION_EVENT_NETWORK_TCP_OK,
+                      LUNA_ISOLATION_MODE_CLEAN) ||
+        receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
                       LUNA_ISOLATION_MODE_CLEAN))
         goto out;
+    printf("LUNA_NETWORK_ICMP_OK peer=10.0.2.2\n");
+    printf("LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080\n");
     printf("LUNA_PHASE2_4_USER_OK\n");
     printf("LUNA_LKL_CHILD_SHELL_READY\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_CLEAN))

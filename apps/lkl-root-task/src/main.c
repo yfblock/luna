@@ -30,7 +30,10 @@
 /* allocman's fixed-pool mspace keeps boundary metadata immediately after the
  * supplied arena. Isolate unrelated root state from that implementation
  * detail instead of relying on linker ordering between translation units. */
-static char allocator_mem_guard[BIT(seL4_PageBits) * 16]
+/* The persistent virtio-net DMA rings add manager-owned frame metadata beyond
+ * the block-only baseline. Keep the root stack and globals well clear of the
+ * fixed-pool allocator's out-of-arena boundary bookkeeping. */
+static char allocator_mem_guard[BIT(seL4_PageBits) * 256]
     __attribute__((used));
 static char allocator_mem_pool[ALLOCATOR_STATIC_POOL_SIZE];
 

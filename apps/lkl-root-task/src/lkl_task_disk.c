@@ -179,10 +179,9 @@ static int task_unmount_and_remove(void)
     if (result < 0) return (int)result;
     result = lkl_sys_unlink(TASK_DISK_DEVICE_PATH);
     if (result < 0) return (int)result;
-    result = lkl_disk_remove(task_disk);
-    if (result < 0) return (int)result;
-    task_disk_id = -1;
-    memset(&task_disk, 0, sizeof(task_disk));
+    /* Keep the virtio block backend alive through lkl_sys_halt(). The ext4
+     * shutdown path can still issue final superblock writes after umount;
+     * removing the backend here turns those valid writes into I/O errors. */
     return 0;
 }
 
@@ -233,8 +232,6 @@ int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode)
         return 0;
     }
 
-    result = task_unmount_and_remove();
-    if (result) goto fail;
     return 0;
 
 fail:

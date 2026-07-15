@@ -53,6 +53,7 @@ add_executable(luna-lkl-task
     src/isolation_child.c
     src/lkl_task_host.c
     src/lkl_task_disk.c
+    src/lkl_task_net.c
     src/lkl_task_user.c
     src/shell.c
     "${LUNA_BUSYBOX_OBJECT}"
@@ -60,6 +61,9 @@ add_executable(luna-lkl-task
     ${LKL_LINUX_DIR}/tools/lkl/lib/iomem.c
     ${LKL_LINUX_DIR}/tools/lkl/lib/virtio.c
     ${LKL_LINUX_DIR}/tools/lkl/lib/virtio_blk.c
+    ${LKL_LINUX_DIR}/tools/lkl/lib/virtio_net.c
+    ${LKL_LINUX_DIR}/tools/lkl/lib/net.c
+    ${LKL_LINUX_DIR}/tools/lkl/lib/utils.c
 )
 target_include_directories(luna-lkl-task PRIVATE include)
 target_include_directories(luna-lkl-task PRIVATE
@@ -121,6 +125,7 @@ add_executable(luna-lkl
     isolation-child-archive.o
     src/main.c
     src/isolation_manager.c
+    src/isolation_net.c
 )
 
 target_include_directories(luna-lkl PRIVATE
@@ -138,6 +143,7 @@ target_link_libraries(luna-lkl
     sel4runtime sel4 muslc utils
     sel4muslcsys sel4platsupport sel4utils sel4debug
     sel4allocman sel4simple sel4simple-default sel4vka sel4vspace
+    ethdrivers
 )
 
 # 作为 root task

@@ -24,6 +24,8 @@ LKL_LIBA="$LKL_LINUX/tools/lkl/liblkl.a"
 KERNEL_OBJ="$ROOT/build-artifacts/lkl-kernel.o"
 QEMU="$(command -v qemu-system-x86_64 || true)"
 QEMU_MEM="${LUNA_QEMU_MEM:-512M}"
+NET_PEER_PORT="${LUNA_NET_PEER_PORT:-18081}"
+NET_QEMU_PORT="${LUNA_NET_QEMU_PORT:-18082}"
 
 DO_BUILD=1
 DO_RUN=1
@@ -88,12 +90,44 @@ if [[ $DO_RUN == 1 ]]; then
     step "boot on QEMU  (qemu: $QEMU, memory: $QEMU_MEM)"
     [[ -x "$QEMU" ]] || { echo "缺 qemu-system-x86_64" >&2; exit 1; }
     [[ -x "$BUILD/simulate" ]] || { echo "未构建：先 ./run.sh --build-only" >&2; exit 1; }
+    "$QEMU" -netdev help 2>&1 | grep -q '^socket$' || {
+        echo "QEMU 缺少 Phase 2.5 所需的 socket netdev backend" >&2
+        exit 1
+    }
+    "$QEMU" -device help 2>&1 | grep -q 'virtio-net-pci' || {
+        echo "QEMU 缺少 Phase 2.5 所需的 virtio-net-pci device" >&2
+        exit 1
+    }
+    NET_READY="$(mktemp)"
+    rm -f "$NET_READY"
+    python3 "$ROOT/tools/net-peer.py" \
+        --listen-port "$NET_PEER_PORT" --qemu-port "$NET_QEMU_PORT" \
+        --ready-file "$NET_READY" &
+    NET_PEER_PID=$!
+    cleanup_net_peer() {
+        kill "$NET_PEER_PID" >/dev/null 2>&1 || true
+        wait "$NET_PEER_PID" >/dev/null 2>&1 || true
+        rm -f "$NET_READY"
+    }
+    trap cleanup_net_peer EXIT
+    for _ in $(seq 1 100); do
+        [[ -s "$NET_READY" ]] && break
+        kill -0 "$NET_PEER_PID" >/dev/null 2>&1 || {
+            echo "Phase 2.5 主机网络对端启动失败" >&2
+            exit 1
+        }
+        sleep 0.01
+    done
+    [[ -s "$NET_READY" ]] || { echo "Phase 2.5 主机网络对端未就绪" >&2; exit 1; }
+    QEMU_NET_ARGS="-nic none -netdev socket,id=lunanet,udp=127.0.0.1:${NET_PEER_PORT},localaddr=127.0.0.1:${NET_QEMU_PORT} -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
     cd "$BUILD"
     # 直接透传，不过 sed：sed 按行处理会吞掉逐字符回显（交互 shell 必须）。
     # 启动时 seL4 的 ANSI（ESC[?7l ESC[2J）会清一次屏，可接受。
     if [[ $TIMEOUT -gt 0 ]]; then
-        timeout "$TIMEOUT" ./simulate -b "$QEMU" -m "$QEMU_MEM"
+        timeout "$TIMEOUT" ./simulate -b "$QEMU" -m "$QEMU_MEM" \
+            --extra-qemu-args="$QEMU_NET_ARGS"
     else
-        ./simulate -b "$QEMU" -m "$QEMU_MEM"
+        ./simulate -b "$QEMU" -m "$QEMU_MEM" \
+            --extra-qemu-args="$QEMU_NET_ARGS"
     fi
 fi

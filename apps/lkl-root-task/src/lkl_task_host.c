@@ -483,8 +483,10 @@ static void task_heap_init(void)
     task_heap_peak_bytes = 0;
 }
 
-int luna_lkl_task_manager_request(enum luna_isolation_event event,
-                                  seL4_Word value1, seL4_Word value2)
+int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
+                                        seL4_Word value1,
+                                        seL4_Word value2,
+                                        seL4_Word *response_value)
 {
     if (!task_manager_control_ep || !task_manager_command_ep) return -1;
     seL4_SetMR(0, event);
@@ -495,15 +497,31 @@ int luna_lkl_task_manager_request(enum luna_isolation_event event,
 
     seL4_Word badge = 0;
     seL4_MessageInfo_t tag = seL4_Recv(task_manager_command_ep, &badge);
-    seL4_Word expected =
-        event == LUNA_ISOLATION_EVENT_MEMORY_MAP ||
-        event == LUNA_ISOLATION_EVENT_MEMORY_UNMAP ?
-        LUNA_COMMAND_MEMORY_RESULT : LUNA_COMMAND_DISK_RESULT;
+    seL4_Word expected;
+    seL4_Word expected_length = 2;
+    if (event == LUNA_ISOLATION_EVENT_MEMORY_MAP ||
+        event == LUNA_ISOLATION_EVENT_MEMORY_UNMAP) {
+        expected = LUNA_COMMAND_MEMORY_RESULT;
+    } else if (event == LUNA_ISOLATION_EVENT_NET_TX ||
+               event == LUNA_ISOLATION_EVENT_NET_RX) {
+        expected = LUNA_COMMAND_NET_RESULT;
+        expected_length = 3;
+    } else {
+        expected = LUNA_COMMAND_DISK_RESULT;
+    }
     if (badge || seL4_MessageInfo_get_label(tag) != 0 ||
-        seL4_MessageInfo_get_length(tag) != 2 ||
+        seL4_MessageInfo_get_length(tag) != expected_length ||
         seL4_GetMR(0) != expected)
         return -1;
+    if (response_value)
+        *response_value = expected_length > 2 ? seL4_GetMR(2) : 0;
     return (int)seL4_GetMR(1);
+}
+
+int luna_lkl_task_manager_request(enum luna_isolation_event event,
+                                  seL4_Word value1, seL4_Word value2)
+{
+    return luna_lkl_task_manager_request_value(event, value1, value2, NULL);
 }
 
 static int task_heap_request(enum luna_isolation_event event, void *address,
@@ -1441,37 +1459,6 @@ int luna_lkl_task_allocator_idle(void)
         return 0;
     }
     return 1;
-}
-
-int lkl_printf(const char *fmt, ...)
-{
-    char buffer[256];
-    va_list args;
-    va_start(args, fmt);
-    int result = vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-    int length = result < 0 ? 0 :
-                 (result < (int)sizeof(buffer) ? result : (int)sizeof(buffer) - 1);
-    if (length) task_print(buffer, length);
-    return result;
-}
-
-void lkl_bug(const char *fmt, ...)
-{
-    char buffer[256];
-    va_list args;
-    va_start(args, fmt);
-    int result = vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-    int length = result < 0 ? 0 :
-                 (result < (int)sizeof(buffer) ? result : (int)sizeof(buffer) - 1);
-    if (length) task_print(buffer, length);
-    task_panic();
-}
-
-void lkl_perror(char *message, int error)
-{
-    lkl_printf("%s: %d\n", message ? message : "LKL error", error);
 }
 
 int luna_lkl_task_init(void)

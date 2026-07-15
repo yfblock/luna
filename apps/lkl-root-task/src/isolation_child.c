@@ -143,12 +143,27 @@ int main(int argc, char **argv)
     void *disk_io_base = (void *)(uintptr_t)seL4_GetMR(1);
     unsigned long disk_io_size = seL4_GetMR(2);
     unsigned long disk_size = seL4_GetMR(3);
+    seL4_MessageInfo_t net_tag =
+        receive_command(child_boot.command_ep,
+                        LUNA_COMMAND_CONFIGURE_NET);
+    if (seL4_MessageInfo_get_length(net_tag) != 5 ||
+        seL4_GetMR(1) != LUNA_NET_IO_BASE ||
+        seL4_GetMR(2) != LUNA_NET_IO_SIZE ||
+        seL4_GetMR(3) != LUNA_NET_MAC_WORD0 ||
+        seL4_GetMR(4) != LUNA_NET_MAC_WORD1)
+        for (;;) seL4_Yield();
+    void *net_io_base = (void *)(uintptr_t)seL4_GetMR(1);
+    unsigned long net_io_size = seL4_GetMR(2);
 
     if (luna_lkl_task_configure_resources(
             resources, sync, console_io_port, child_boot.control_ep,
             child_boot.command_ep))
         for (;;) seL4_Yield();
     if (luna_lkl_task_configure_disk(disk_io_base, disk_io_size, disk_size))
+        for (;;) seL4_Yield();
+    if (luna_lkl_task_configure_net(net_io_base, net_io_size,
+                                    LUNA_NET_MAC_WORD0,
+                                    LUNA_NET_MAC_WORD1))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                child_boot.mode);
@@ -181,7 +196,8 @@ int main(int argc, char **argv)
     if (luna_lkl_task_init()) {
         for (;;) seL4_Yield();
     }
-    if (luna_lkl_task_disk_add()) {
+    if ((child_boot.mode != LUNA_ISOLATION_MODE_STRESS &&
+         luna_lkl_task_net_add()) || luna_lkl_task_disk_add()) {
         for (;;) seL4_Yield();
     }
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_INIT_OK,
@@ -191,11 +207,25 @@ int main(int argc, char **argv)
     }
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_BOOT_OK,
                child_boot.mode);
+    if (child_boot.mode != LUNA_ISOLATION_MODE_STRESS) {
+        if (luna_lkl_task_net_prepare())
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_VIRTIO_NET_OK, child_boot.mode);
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_NETWORK_IPV4_OK, child_boot.mode);
+    }
     if (luna_lkl_task_disk_prepare(child_boot.mode))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep,
                LUNA_ISOLATION_EVENT_VIRTIO_BLOCK_OK, child_boot.mode);
     if (child_boot.mode == LUNA_ISOLATION_MODE_CLEAN) {
+        if (luna_lkl_task_net_smoke())
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK, child_boot.mode);
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_NETWORK_TCP_OK, child_boot.mode);
         if (luna_shell_prepare(luna_lkl_task_console_ready()))
             for (;;) seL4_Yield();
         if (luna_lkl_task_user_smoke())
@@ -206,7 +236,7 @@ int main(int argc, char **argv)
                    LUNA_ISOLATION_EVENT_LKL_SHELL_READY, child_boot.mode);
         luna_shell_run(luna_lkl_task_time);
     }
-    if (luna_lkl_task_disk_finish())
+    if (luna_lkl_task_disk_finish() || luna_lkl_task_net_finish())
         for (;;) seL4_Yield();
     luna_lkl_task_console_stop();
     if (luna_lkl_task_halt()) {
