@@ -73,13 +73,14 @@ slot reuse；timer 测试覆盖立即 cancel、连续 32 次 rearm 覆盖旧 dea
 验收门槛：QEMU smoke test 能创建文件、正常销毁 LKL child、再次创建并读取同一文件，seed 镜像通过
 `e2fsck -fn`。
 
-完成状态：Phase 2.3 已完成。构建生成固定 UUID 的 16MiB ext4，运行 `e2fsck -fn` 后稀疏打包；manager
-持有完整 backing，只向 child 映射 64KiB 传输窗。fault child 写入持久 marker，100 个 replacement
+完成状态：Phase 2.3 已完成。构建生成固定 UUID 的 16MiB ext4 并运行 `e2fsck -fn`；QEMU 通过
+`memory-backend-file` 和 `ivshmem-plain` 将宿主文件映射给 manager，manager 只向 child 映射 64KiB
+传输窗。fault child 写入持久 marker，100 个 replacement
 stress child 均重新探测 `vda`、挂载并读取同一文件，最终 clean child 以该 ext4 为 `/` 运行 shell，
 随后正常 sync、halt 和回收 host virtio 对象。实现与证据见 `PHASE2.3-RESULTS.md`。
 
-当前 backing 是 manager RAM，因此持久化边界覆盖完整 LKL child restart，而非整个 QEMU 电源周期；
-文件或真实设备 backing 可作为后续平台 backend 扩展，不阻塞 Phase 2.4 用户程序工作。
+Phase 2.3.1 已将持久化边界扩展到整个 QEMU 进程重启。`--cross-qemu` 回归使用同一个临时 ext4
+文件启动两次 QEMU，第二次读回第一次写入的标记；详见 `PHASE2.3.1-RESULTS.md`。
 
 ## Phase 2.4：真实用户程序与 BusyBox
 
@@ -127,6 +128,15 @@ Endpoint 和 child LKL 网络栈。实现与证据见 `PHASE2.5-RESULTS.md`。
 - [x] 通过 64×1200-byte UDP burst 验证慢消费者、overflow accounting 和恢复。
 
 完成状态：Phase 2.5.1 已完成。实现与证据见 `PHASE2.5.1-RESULTS.md`。
+
+### Phase 2.5.3：TX bounded queue 与持续吞吐
+
+- [x] manager 私有 16-entry TX SPSC queue 隔离 child window 与 DMA 生命周期。
+- [x] queue full 返回可重试背压，child 保持数据直到 enqueue 成功。
+- [x] high-water、backpressure、driver retry 和 completed 统计。
+- [x] 2048×1200-byte UDP 持续发送与对端逐包完整性确认。
+
+完成状态：Phase 2.5.3 已完成。实现与证据见 `PHASE2.5.3-RESULTS.md`。
 
 ## Phase 3：UINTR 实验
 

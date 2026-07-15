@@ -64,8 +64,9 @@ git -C deps/busybox apply ../../patches/busybox-nofork-cat.patch
 Phase 2.4 additionally uses `ld`, `objcopy`, and `nm` to produce and audit the
 minimal relocatable BusyBox host-program object.
 
-Phase 2.5 requires a QEMU build with the `socket` netdev backend and legacy
-`virtio-net-pci` support. It does not require slirp, TAP, root privileges, or
+Phase 2.5 requires a QEMU build with the `socket` netdev backend, legacy
+`virtio-net-pci` support, and `ivshmem-plain` for the host-file ext4 backing.
+It does not require slirp, TAP, root privileges, or
 external network access. `tools/net-peer.py` uses only the Python standard
 library and binds two configurable localhost UDP ports (18081/18082 by
 default).

@@ -13,7 +13,7 @@ from pathlib import Path
 
 LONG_UNKNOWN = "x" * 240
 
-COMMANDS = [
+BASE_COMMANDS = [
     LONG_UNKNOWN,
     "time",
     "sleep 100",
@@ -37,6 +37,7 @@ REQUIRED = [
     b"LUNA_SYNC_TLS_OK",
     b"LUNA_THREAD_TIMER_OK",
     b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
+    b"LUNA_HOST_FILE_BACKING_OK bytes=16777216",
     b"LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci",
     b"LUNA_NETWORK_IPV4_OK address=10.0.2.15/24",
     b"LUNA_NETWORK_ASYNC_RX_OK notification=receive-only",
@@ -46,6 +47,8 @@ REQUIRED = [
     b"high_water=31 backpressure=1",
     b"empty_fetches=0",
     b"LUNA_NETWORK_PRESSURE_OK burst=64 payload=1200",
+    b"LUNA_NET_TX_QUEUE_STATS sent=2048",
+    b"LUNA_NETWORK_TX_PRESSURE_OK packets=2048 payload=1200",
     b"LUNA_NETWORK_RECLAIM_OK rounds=100",
     b"LUNA_PERSISTENCE_OK rounds=100",
     b"LUNA_STATIC_USER_OK path=/bin/busybox abi=1",
@@ -100,6 +103,11 @@ FORBIDDEN = [
     b"ICMP smoke failed",
     b"TCP smoke failed",
     b"network pressure smoke failed",
+    b"network TX pressure smoke failed",
+    b"host-file disk I/O setup failed",
+    b"ivshmem disk missing",
+    b"ivshmem disk PCI configuration invalid",
+    b"ivshmem host-file disk mapping failed",
     b"Buffer I/O error",
     b"I/O error while writing superblock",
     b"persistent rootfs pack metadata invalid",
@@ -132,9 +140,30 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drive the luna LKL shell and verify a QEMU boot")
     parser.add_argument("--timeout", type=float, default=480.0)
+    parser.add_argument("--disk-image", type=Path)
+    parser.add_argument("--reset-disk", action="store_true")
+    parser.add_argument("--persist-write")
+    parser.add_argument("--persist-read")
     args = parser.parse_args()
+    for value in (args.persist_write, args.persist_read):
+        if value and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+            parser.error("persistence marker must use 1-64 safe characters")
+
+    commands = list(BASE_COMMANDS)
+    required = list(REQUIRED)
+    if args.persist_write:
+        commands.insert(-1, f"write /qemu-power-persist {args.persist_write}")
+        commands.insert(-1, "sync")
+    if args.persist_read:
+        commands.insert(-1, "cat /qemu-power-persist")
+        required.append(args.persist_read.encode())
 
     root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    if args.disk_image:
+        env["LUNA_DISK_IMAGE"] = str(args.disk_image.resolve())
+    if args.reset_disk:
+        env["LUNA_DISK_RESET"] = "1"
     proc = subprocess.Popen(
         [str(root / "run.sh"), "--run-only", "--no-timeout"],
         cwd=root,
@@ -143,6 +172,7 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         bufsize=0,
         start_new_session=True,
+        env=env,
     )
     assert proc.stdout is not None and proc.stdin is not None
 
@@ -165,12 +195,12 @@ def main() -> int:
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
 
-                while command_index < len(COMMANDS):
+                while command_index < len(commands):
                     match = PROMPT.search(output, prompt_scan)
                     if not match:
                         break
                     prompt_scan = match.end()
-                    command = COMMANDS[command_index]
+                    command = commands[command_index]
                     proc.stdin.write(command.encode() + b"\n")
                     proc.stdin.flush()
                     command_index += 1
@@ -188,9 +218,9 @@ def main() -> int:
     errors = []
     if not success_marker:
         errors.append("shutdown success marker was not observed")
-    if command_index != len(COMMANDS):
-        errors.append(f"only sent {command_index}/{len(COMMANDS)} shell commands")
-    for marker in REQUIRED:
+    if command_index != len(commands):
+        errors.append(f"only sent {command_index}/{len(commands)} shell commands")
+    for marker in required:
         if marker not in data:
             errors.append(f"missing output: {marker.decode(errors='replace')}")
     for marker in FORBIDDEN:

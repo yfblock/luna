@@ -49,6 +49,7 @@ int luna_lkl_task_net_add(void);
 int luna_lkl_task_net_prepare(void);
 int luna_lkl_task_net_smoke(void);
 int luna_lkl_task_net_pressure_smoke(void);
+int luna_lkl_task_net_tx_pressure_smoke(void);
 int luna_lkl_task_net_finish(void);
 int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode);
 int luna_lkl_task_disk_finish(void);

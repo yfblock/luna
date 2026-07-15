@@ -15,7 +15,10 @@ GUEST_IP = socket.inet_aton("10.0.2.15")
 PEER_IP = socket.inet_aton("10.0.2.2")
 TCP_PORT = 18080
 UDP_PORT = 18081
+TX_UDP_PORT = 18082
 BURST_MAGIC = b"LUNABRST"
+TX_MAGIC = b"LUNATX25"
+TX_ACK_MAGIC = b"LUNATXOK"
 
 
 def checksum(data: bytes) -> int:
@@ -79,6 +82,7 @@ def udp_segment(src_port: int, dst_port: int, payload: bytes,
 class Peer:
     def __init__(self) -> None:
         self.connections: dict[int, dict[str, int]] = {}
+        self.tx_streams: dict[tuple[int, int], set[int]] = {}
 
     def handle_arp(self, packet: bytes) -> bytes | None:
         if len(packet) < 42:
@@ -147,14 +151,36 @@ class Peer:
             )
         return None
 
-    def handle_udp(self, ip_payload: bytes) -> list[bytes] | None:
+    def handle_tx_stream(self, src_port: int,
+                         payload: bytes) -> bytes | None:
+        if len(payload) != 1200 or payload[:8] != TX_MAGIC:
+            return None
+        sequence, count = struct.unpack("!II", payload[8:16])
+        if not 1 <= count <= 4096 or sequence >= count:
+            return None
+        if payload[16:] != bytes([sequence & 0xFF]) * (len(payload) - 16):
+            return None
+        key = (src_port, count)
+        received = self.tx_streams.setdefault(key, set())
+        received.add(sequence)
+        if len(received) != count:
+            return None
+        del self.tx_streams[key]
+        ack = TX_ACK_MAGIC + struct.pack("!II", count, count * len(payload))
+        return udp_segment(TX_UDP_PORT, src_port, ack, 0x4000)
+
+    def handle_udp(self, ip_payload: bytes) -> list[bytes] | bytes | None:
         if len(ip_payload) < 8:
             return None
         src_port, dst_port, length, _value = struct.unpack("!HHHH",
                                                            ip_payload[:8])
-        if dst_port != UDP_PORT or length < 8 or length > len(ip_payload):
+        if length < 8 or length > len(ip_payload):
             return None
         payload = ip_payload[8:length]
+        if dst_port == TX_UDP_PORT:
+            return self.handle_tx_stream(src_port, payload)
+        if dst_port != UDP_PORT:
+            return None
         if len(payload) != 12 or payload[:8] != BURST_MAGIC:
             return None
         count, payload_size = struct.unpack("!HH", payload[8:12])
@@ -220,6 +246,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     sock.bind(("127.0.0.1", args.listen_port))
     sock.settimeout(0.25)
     if args.ready_file:

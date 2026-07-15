@@ -83,7 +83,6 @@ include(cpio)
 set(LUNA_CHILD_CPIO_DIR "${CMAKE_CURRENT_BINARY_DIR}/child-cpio")
 set(LUNA_CHILD_CPIO_ELF "${LUNA_CHILD_CPIO_DIR}/luna-lkl-task")
 set(LUNA_ROOTFS_IMAGE "${CMAKE_CURRENT_BINARY_DIR}/luna-rootfs.ext4")
-set(LUNA_ROOTFS_PACK "${CMAKE_CURRENT_BINARY_DIR}/luna-rootfs.pack")
 set(LUNA_ROOTFS_SEED "${CMAKE_CURRENT_SOURCE_DIR}/rootfs")
 set(LUNA_ROOTFS_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/make-rootfs.sh")
 find_program(LUNA_MKE2FS mke2fs)
@@ -99,15 +98,7 @@ add_custom_command(
     COMMENT "Create checked 16MiB ext4 persistent rootfs image"
     VERBATIM
 )
-add_custom_command(
-    OUTPUT "${LUNA_ROOTFS_PACK}"
-    COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/pack-rootfs.py"
-            "${LUNA_ROOTFS_IMAGE}" "${LUNA_ROOTFS_PACK}"
-    DEPENDS "${LUNA_ROOTFS_IMAGE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/pack-rootfs.py"
-    COMMENT "Pack non-zero persistent rootfs blocks"
-    VERBATIM
-)
+add_custom_target(luna-rootfs-image ALL DEPENDS "${LUNA_ROOTFS_IMAGE}")
 add_custom_command(
     OUTPUT "${LUNA_CHILD_CPIO_ELF}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${LUNA_CHILD_CPIO_DIR}"
@@ -117,9 +108,9 @@ add_custom_command(
     COMMENT "Strip debug sections from embedded isolation child"
     VERBATIM
 )
-set(LUNA_BOOT_ARCHIVE_FILES "${LUNA_CHILD_CPIO_ELF};${LUNA_ROOTFS_PACK}")
+set(LUNA_BOOT_ARCHIVE_FILES "${LUNA_CHILD_CPIO_ELF}")
 MakeCPIO(isolation-child-archive.o "${LUNA_BOOT_ARCHIVE_FILES}"
-         DEPENDS luna-lkl-task "${LUNA_ROOTFS_PACK}")
+         DEPENDS luna-lkl-task)
 
 add_executable(luna-lkl
     isolation-child-archive.o

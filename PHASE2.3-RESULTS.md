@@ -39,12 +39,13 @@ POSIX host glue 或 hijack 库。`lkl_host_ops` 新增：
 sync 和 `/proc` 卸载，再 halt LKL，最后在 `lkl_is_running == false` 后释放 host virtio 对象。allocator
 idle 断言仍要求所有 child host allocation 完整归零。
 
-## ext4 镜像与稀疏打包
+## ext4 镜像与历史稀疏打包
 
 构建阶段由 `tools/make-rootfs.sh` 创建固定 UUID、无 journal 的 16MiB ext4 镜像，并立即运行
 `e2fsck -fn`。seed rootfs 包含 `/etc/luna-release`。
 
-直接把 16MiB 原始镜像放入 CPIO 会显著扩大 root ELF 映射元数据，因此 `tools/pack-rootfs.py` 只打包
+Phase 2.3 最初直接把 backing 放在 manager RAM。为避免将 16MiB 原始镜像放入 CPIO，
+`tools/pack-rootfs.py` 只打包
 非零 4KiB block。manager 校验 magic、容量、block size、record 数和每个 block index 后，在私有
 大页 backing 中重建完整镜像。当前 seed 的 pack 约 169KiB，原始 ext4 容量仍为 16MiB。
 
@@ -93,9 +94,9 @@ LUNA_SHUTDOWN_OK
 SMOKE TEST PASSED
 ```
 
-本阶段的“持久”边界是同一 seL4 manager 生命周期内的完整 LKL task 销毁/重建；backing store 当前由
-manager RAM 持有。将 backing 接到 QEMU 文件或真实块设备、从而跨整个 seL4/QEMU 电源周期保存，属于
-后续平台存储 backend 工作。
+本阶段最初的“持久”边界是同一 seL4 manager 生命周期内的完整 LKL task 销毁/重建。Phase 2.3.1
+已将 manager RAM backing 替换为 QEMU host-file ivshmem backing，并完成跨两次 QEMU 进程启动的
+持久化验收；详见 `PHASE2.3.1-RESULTS.md`。
 
 ## 后续
 

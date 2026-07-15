@@ -233,6 +233,11 @@ int main(int argc, char **argv)
         send_event(child_boot.control_ep,
                    LUNA_ISOLATION_EVENT_NETWORK_PRESSURE_OK,
                    child_boot.mode);
+        if (luna_lkl_task_net_tx_pressure_smoke())
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_NETWORK_TX_PRESSURE_OK,
+                   child_boot.mode);
         if (luna_shell_prepare(luna_lkl_task_console_ready()))
             for (;;) seL4_Yield();
         if (luna_lkl_task_user_smoke())

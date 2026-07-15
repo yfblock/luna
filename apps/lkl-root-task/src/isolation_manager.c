@@ -12,6 +12,9 @@
 #include <sel4utils/process.h>
 #include <sel4utils/process_config.h>
 #include <sel4utils/thread.h>
+#include <sel4platsupport/arch/io.h>
+#include <sel4platsupport/io.h>
+#include <platsupport/io.h>
 #include <vka/object.h>
 #include <vka/capops.h>
 #include <cpio/cpio.h>
@@ -25,17 +28,17 @@
 #define CHILD_BADGE_CLEAN 0x42
 #define CHILD_BADGE_STRESS 0x43
 #define MANAGER_PRIVATE_ADDR ((void *)(uintptr_t)0x40000000UL)
-#define MANAGER_DISK_ADDR    ((void *)(uintptr_t)0x50000000UL)
 #define MANAGER_DISK_IO_ADDR ((void *)(uintptr_t)0x52000000UL)
-#define LUNA_ROOTFS_PACK "luna-rootfs.pack"
-#define LUNA_ROOTFS_PACK_BLOCK_SIZE 4096UL
-
-struct luna_rootfs_pack_header {
-    char magic[8];
-    uint64_t disk_size;
-    uint32_t block_size;
-    uint32_t block_count;
-};
+#define LUNA_DISK_PCI_BUS 0U
+#define LUNA_DISK_PCI_DEVICE 6U
+#define LUNA_DISK_PCI_FUNCTION 0U
+#define LUNA_DISK_PCI_VENDOR 0x1af4U
+#define LUNA_DISK_PCI_DEVICE_ID 0x1110U
+#define PCI_CONFIG_ADDRESS 0x0cf8U
+#define PCI_CONFIG_DATA 0x0cfcU
+#define PCI_COMMAND 0x04U
+#define PCI_BAR2 0x18U
+#define PCI_COMMAND_MEMORY 0x2U
 
 extern char _cpio_archive[];
 extern char _cpio_archive_end[];
@@ -79,10 +82,9 @@ struct luna_disk_mapping {
 };
 
 struct luna_persistent_disk {
+    ps_io_ops_t io_ops;
     void *mapping;
     size_t bytes;
-    reservation_t reservation;
-    int reserved;
     int allocated;
     void *io_mapping;
     reservation_t io_reservation;
@@ -123,64 +125,80 @@ static int delete_child_cap(sel4utils_process_t *process, seL4_CPtr cap)
     return error;
 }
 
+static uint32_t disk_pci_config_key(unsigned offset)
+{
+    return 0x80000000U | (LUNA_DISK_PCI_BUS << 16) |
+           (LUNA_DISK_PCI_DEVICE << 11) |
+           (LUNA_DISK_PCI_FUNCTION << 8) | (offset & ~3U);
+}
+
+static int disk_pci_read(struct luna_persistent_disk *disk,
+                         unsigned offset, int size, uint32_t *value)
+{
+    if (ps_io_port_out(&disk->io_ops.io_port_ops, PCI_CONFIG_ADDRESS,
+                       4, disk_pci_config_key(offset)))
+        return -1;
+    return ps_io_port_in(&disk->io_ops.io_port_ops,
+                         PCI_CONFIG_DATA + (offset & 3U), size, value);
+}
+
+static int disk_pci_write(struct luna_persistent_disk *disk,
+                          unsigned offset, int size, uint32_t value)
+{
+    if (ps_io_port_out(&disk->io_ops.io_port_ops, PCI_CONFIG_ADDRESS,
+                       4, disk_pci_config_key(offset)))
+        return -1;
+    return ps_io_port_out(&disk->io_ops.io_port_ops,
+                          PCI_CONFIG_DATA + (offset & 3U), size, value);
+}
+
 static int init_persistent_disk(struct luna_persistent_disk *disk,
+                                simple_t *simple, vka_t *vka,
                                 vspace_t *manager_vspace)
 {
-    unsigned long pack_size = 0;
-    const unsigned char *pack = cpio_get_file(
-        _cpio_archive, (unsigned long)(_cpio_archive_end - _cpio_archive),
-        LUNA_ROOTFS_PACK, &pack_size);
-    struct luna_rootfs_pack_header header = {0};
-    if (!pack || pack_size < sizeof(header)) {
-        printf("luna: persistent rootfs pack missing or truncated\n");
+    uint32_t vendor = 0, device = 0, bar_low = 0, bar_high = 0;
+    uint32_t command = 0;
+    if (sel4platsupport_new_io_ops(manager_vspace, vka, simple,
+                                   &disk->io_ops) ||
+        sel4platsupport_new_arch_ops(&disk->io_ops, simple, vka)) {
+        printf("luna: host-file disk I/O setup failed\n");
         return -1;
     }
-    memcpy(&header, pack, sizeof(header));
-    size_t record_size = sizeof(uint32_t) + LUNA_ROOTFS_PACK_BLOCK_SIZE;
-    if (memcmp(header.magic, "LUNAFS23", sizeof(header.magic)) ||
-        header.disk_size != LUNA_PERSISTENT_DISK_SIZE ||
-        header.block_size != LUNA_ROOTFS_PACK_BLOCK_SIZE ||
-        header.block_count > LUNA_PERSISTENT_DISK_SIZE /
-                             LUNA_ROOTFS_PACK_BLOCK_SIZE ||
-        pack_size != sizeof(header) + header.block_count * record_size) {
-        printf("luna: persistent rootfs pack metadata invalid\n");
+    if (disk_pci_read(disk, 0x00, 2, &vendor) ||
+        disk_pci_read(disk, 0x02, 2, &device) ||
+        vendor != LUNA_DISK_PCI_VENDOR ||
+        device != LUNA_DISK_PCI_DEVICE_ID) {
+        printf("luna: ivshmem disk missing at 00:06.0 "
+               "vendor=%04x device=%04x\n", vendor, device);
         return -1;
     }
-    disk->reservation = vspace_reserve_range_at(
-        manager_vspace, MANAGER_DISK_ADDR, LUNA_PERSISTENT_DISK_SIZE,
-        seL4_AllRights, 1);
-    if (!disk->reservation.res) {
-        printf("luna: persistent disk manager reservation failed\n");
+    if (disk_pci_read(disk, PCI_BAR2, 4, &bar_low) ||
+        disk_pci_read(disk, PCI_BAR2 + 4, 4, &bar_high) ||
+        (bar_low & 1U) || (bar_low & 6U) != 4U ||
+        disk_pci_read(disk, PCI_COMMAND, 2, &command) ||
+        disk_pci_write(disk, PCI_COMMAND, 2,
+                       command | PCI_COMMAND_MEMORY)) {
+        printf("luna: ivshmem disk PCI configuration invalid "
+               "bar=%08x:%08x\n", bar_high, bar_low);
         return -1;
     }
-    disk->reserved = 1;
-    if (vspace_new_pages_at_vaddr(
-            manager_vspace, MANAGER_DISK_ADDR,
-            LUNA_PERSISTENT_DISK_PAGES,
-            LUNA_PERSISTENT_DISK_PAGE_BITS,
-            disk->reservation)) {
-        printf("luna: persistent disk backing allocation failed\n");
+    uint64_t physical = ((uint64_t)bar_high << 32) |
+                        (uint64_t)(bar_low & ~0xfU);
+    if (!physical || physical % LUNA_PERSISTENT_DISK_SIZE) {
+        printf("luna: ivshmem disk BAR alignment invalid: %llx\n",
+               (unsigned long long)physical);
         return -1;
     }
-    disk->mapping = MANAGER_DISK_ADDR;
+    disk->mapping = ps_io_map(&disk->io_ops.io_mapper, (uintptr_t)physical,
+                              LUNA_PERSISTENT_DISK_SIZE, 1,
+                              PS_MEM_NORMAL);
+    if (!disk->mapping) {
+        printf("luna: ivshmem host-file disk mapping failed: %llx\n",
+               (unsigned long long)physical);
+        return -1;
+    }
     disk->allocated = 1;
-    disk->bytes = header.disk_size;
-    memset(disk->mapping, 0, disk->bytes);
-    const unsigned char *record = pack + sizeof(header);
-    for (uint32_t i = 0; i < header.block_count; i++) {
-        uint32_t block_index = 0;
-        memcpy(&block_index, record, sizeof(block_index));
-        if (block_index >= disk->bytes /
-                           LUNA_ROOTFS_PACK_BLOCK_SIZE) {
-            printf("luna: persistent rootfs block index invalid\n");
-            return -1;
-        }
-        memcpy((unsigned char *)disk->mapping +
-                   block_index * LUNA_ROOTFS_PACK_BLOCK_SIZE,
-               record + sizeof(block_index),
-               LUNA_ROOTFS_PACK_BLOCK_SIZE);
-        record += record_size;
-    }
+    disk->bytes = LUNA_PERSISTENT_DISK_SIZE;
     disk->io_reservation = vspace_reserve_range_at(
         manager_vspace, MANAGER_DISK_IO_ADDR, LUNA_DISK_IO_SIZE,
         seL4_AllRights, 1);
@@ -198,6 +216,9 @@ static int init_persistent_disk(struct luna_persistent_disk *disk,
     disk->io_mapping = MANAGER_DISK_IO_ADDR;
     disk->io_allocated = 1;
     memset(disk->io_mapping, 0, LUNA_DISK_IO_SIZE);
+    printf("luna: host-file ext4 backing ready PCI=00:06.0 "
+           "paddr=%llx bytes=%zu\n",
+           (unsigned long long)physical, disk->bytes);
     return 0;
 }
 
@@ -544,7 +565,8 @@ static int receive_event(struct luna_event_context *context,
              event == LUNA_ISOLATION_EVENT_NET_RX ||
              event == LUNA_ISOLATION_EVENT_NET_WAKE ||
              event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
-             event == LUNA_ISOLATION_EVENT_NET_STATS)) {
+             event == LUNA_ISOLATION_EVENT_NET_STATS ||
+             event == LUNA_ISOLATION_EVENT_NET_TX_STATS)) {
             if (seL4_GetMR(2) ||
                 luna_network_service(context->command_ep, event,
                                      seL4_GetMR(1)))
@@ -843,7 +865,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     manager_private_page[0] = LUNA_ISOLATION_SECRET;
 
     if (luna_network_manager_init(simple, vka, manager_vspace)) goto out;
-    if (init_persistent_disk(&disk, manager_vspace)) goto out;
+    if (init_persistent_disk(&disk, simple, vka, manager_vspace)) goto out;
 
     if (vka_alloc_endpoint(vka, &control_ep)) {
         printf("luna: isolation control endpoint allocation failed\n");
@@ -872,6 +894,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_LKL_CHILD_INIT_OK\n");
     printf("LUNA_LKL_CHILD_BOOT_OK\n");
     printf("LUNA_VIRTIO_BLOCK_OK bytes=%lu\n",
+           (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
+    printf("LUNA_HOST_FILE_BACKING_OK bytes=%lu\n",
            (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
     printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
     printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
@@ -935,6 +959,9 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         receive_event(&event_context,
                       LUNA_ISOLATION_EVENT_NETWORK_PRESSURE_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
+        receive_event(&event_context,
+                      LUNA_ISOLATION_EVENT_NETWORK_TX_PRESSURE_OK,
+                      LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
@@ -945,6 +972,9 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_NETWORK_PRESSURE_OK burst=%lu payload=%lu\n",
            (unsigned long)LUNA_NET_STRESS_BURST,
            (unsigned long)LUNA_NET_STRESS_PAYLOAD);
+    printf("LUNA_NETWORK_TX_PRESSURE_OK packets=%lu payload=%lu\n",
+           (unsigned long)LUNA_NET_TX_STRESS_PACKETS,
+           (unsigned long)LUNA_NET_TX_STRESS_PAYLOAD);
     printf("LUNA_PHASE2_4_USER_OK\n");
     printf("LUNA_LKL_CHILD_SHELL_READY\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_CLEAN))

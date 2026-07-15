@@ -26,6 +26,9 @@ QEMU="$(command -v qemu-system-x86_64 || true)"
 QEMU_MEM="${LUNA_QEMU_MEM:-512M}"
 NET_PEER_PORT="${LUNA_NET_PEER_PORT:-18081}"
 NET_QEMU_PORT="${LUNA_NET_QEMU_PORT:-18082}"
+DISK_IMAGE="${LUNA_DISK_IMAGE:-$BUILD/luna-rootfs-state.ext4}"
+DISK_RESET="${LUNA_DISK_RESET:-0}"
+DISK_SIZE=16777216
 
 DO_BUILD=1
 DO_RUN=1
@@ -98,6 +101,22 @@ if [[ $DO_RUN == 1 ]]; then
         echo "QEMU 缺少 Phase 2.5 所需的 virtio-net-pci device" >&2
         exit 1
     }
+    "$QEMU" -device help 2>&1 | grep -q 'ivshmem-plain' || {
+        echo "QEMU 缺少 host-file ext4 所需的 ivshmem-plain device" >&2
+        exit 1
+    }
+    [[ -f "$BUILD/luna-rootfs.ext4" ]] || {
+        echo "缺少 rootfs seed image：先 ./run.sh --build-only" >&2
+        exit 1
+    }
+    if [[ "$DISK_RESET" == 1 || ! -f "$DISK_IMAGE" ]]; then
+        mkdir -p "$(dirname "$DISK_IMAGE")"
+        cp --reflink=auto "$BUILD/luna-rootfs.ext4" "$DISK_IMAGE"
+    fi
+    [[ "$(stat -c '%s' "$DISK_IMAGE")" == "$DISK_SIZE" ]] || {
+        echo "ext4 backing 大小必须为 $DISK_SIZE bytes：$DISK_IMAGE" >&2
+        exit 1
+    }
     NET_READY="$(mktemp)"
     rm -f "$NET_READY"
     python3 "$ROOT/tools/net-peer.py" \
@@ -120,14 +139,17 @@ if [[ $DO_RUN == 1 ]]; then
     done
     [[ -s "$NET_READY" ]] || { echo "Phase 2.5 主机网络对端未就绪" >&2; exit 1; }
     QEMU_NET_ARGS="-nic none -netdev socket,id=lunanet,udp=127.0.0.1:${NET_PEER_PORT},localaddr=127.0.0.1:${NET_QEMU_PORT} -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
+    printf -v DISK_IMAGE_Q '%q' "$DISK_IMAGE"
+    QEMU_DISK_ARGS="-object memory-backend-file,id=lunadisk,mem-path=${DISK_IMAGE_Q},size=${DISK_SIZE},share=on -device ivshmem-plain,memdev=lunadisk,addr=06.0"
+    QEMU_EXTRA_ARGS="$QEMU_NET_ARGS $QEMU_DISK_ARGS"
     cd "$BUILD"
     # 直接透传，不过 sed：sed 按行处理会吞掉逐字符回显（交互 shell 必须）。
     # 启动时 seL4 的 ANSI（ESC[?7l ESC[2J）会清一次屏，可接受。
     if [[ $TIMEOUT -gt 0 ]]; then
         timeout "$TIMEOUT" ./simulate -b "$QEMU" -m "$QEMU_MEM" \
-            --extra-qemu-args="$QEMU_NET_ARGS"
+            --extra-qemu-args="$QEMU_EXTRA_ARGS"
     else
         ./simulate -b "$QEMU" -m "$QEMU_MEM" \
-            --extra-qemu-args="$QEMU_NET_ARGS"
+            --extra-qemu-args="$QEMU_EXTRA_ARGS"
     fi
 fi
