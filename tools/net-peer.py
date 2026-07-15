@@ -14,6 +14,8 @@ PEER_MAC = bytes.fromhex("525400123401")
 GUEST_IP = socket.inet_aton("10.0.2.15")
 PEER_IP = socket.inet_aton("10.0.2.2")
 TCP_PORT = 18080
+UDP_PORT = 18081
+BURST_MAGIC = b"LUNABRST"
 
 
 def checksum(data: bytes) -> int:
@@ -66,6 +68,12 @@ def tcp_segment(src_port: int, dst_port: int, seq: int, ack: int,
     value = checksum(pseudo + header + payload)
     header = header[:16] + struct.pack("!H", value) + header[18:]
     return ipv4(header + payload, 6)
+
+
+def udp_segment(src_port: int, dst_port: int, payload: bytes,
+                ident: int) -> bytes:
+    header = struct.pack("!HHHH", src_port, dst_port, 8 + len(payload), 0)
+    return ipv4(header + payload, 17, ident)
 
 
 class Peer:
@@ -139,7 +147,28 @@ class Peer:
             )
         return None
 
-    def handle_ipv4(self, packet: bytes) -> bytes | None:
+    def handle_udp(self, ip_payload: bytes) -> list[bytes] | None:
+        if len(ip_payload) < 8:
+            return None
+        src_port, dst_port, length, _value = struct.unpack("!HHHH",
+                                                           ip_payload[:8])
+        if dst_port != UDP_PORT or length < 8 or length > len(ip_payload):
+            return None
+        payload = ip_payload[8:length]
+        if len(payload) != 12 or payload[:8] != BURST_MAGIC:
+            return None
+        count, payload_size = struct.unpack("!HH", payload[8:12])
+        if not 1 <= count <= 64 or not 4 <= payload_size <= 1400:
+            return None
+        replies = []
+        for sequence in range(count):
+            body = struct.pack("!HH", sequence, count)
+            body += bytes([sequence & 0xFF]) * (payload_size - len(body))
+            replies.append(udp_segment(UDP_PORT, src_port, body,
+                                       0x3000 + sequence))
+        return replies
+
+    def handle_ipv4(self, packet: bytes) -> bytes | list[bytes] | None:
         if len(packet) < 34:
             return None
         ip = packet[14:]
@@ -154,17 +183,24 @@ class Peer:
             return self.handle_icmp(payload)
         if ip[9] == 6:
             return self.handle_tcp(payload)
+        if ip[9] == 17:
+            return self.handle_udp(payload)
         return None
 
-    def handle(self, packet: bytes) -> bytes | None:
+    def handle(self, packet: bytes) -> list[bytes]:
         if len(packet) < 14 or packet[6:12] != GUEST_MAC:
-            return None
+            return []
         ethertype = struct.unpack("!H", packet[12:14])[0]
+        reply: bytes | list[bytes] | None = None
         if ethertype == 0x0806:
-            return self.handle_arp(packet)
-        if ethertype == 0x0800:
-            return self.handle_ipv4(packet)
-        return None
+            reply = self.handle_arp(packet)
+        elif ethertype == 0x0800:
+            reply = self.handle_ipv4(packet)
+        if reply is None:
+            return []
+        if isinstance(reply, bytes):
+            return [reply]
+        return reply
 
 
 def main() -> int:
@@ -194,8 +230,7 @@ def main() -> int:
             packet, _address = sock.recvfrom(65535)
         except TimeoutError:
             continue
-        reply = peer.handle(packet)
-        if reply:
+        for reply in peer.handle(packet):
             sock.sendto(reply, ("127.0.0.1", args.qemu_port))
     sock.close()
     return 0

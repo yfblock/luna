@@ -503,7 +503,10 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
         event == LUNA_ISOLATION_EVENT_MEMORY_UNMAP) {
         expected = LUNA_COMMAND_MEMORY_RESULT;
     } else if (event == LUNA_ISOLATION_EVENT_NET_TX ||
-               event == LUNA_ISOLATION_EVENT_NET_RX) {
+               event == LUNA_ISOLATION_EVENT_NET_RX ||
+               event == LUNA_ISOLATION_EVENT_NET_WAKE ||
+               event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
+               event == LUNA_ISOLATION_EVENT_NET_STATS) {
         expected = LUNA_COMMAND_NET_RESULT;
         expected_length = 3;
     } else {

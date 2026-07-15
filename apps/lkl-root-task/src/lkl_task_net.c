@@ -25,12 +25,15 @@
 #define TASK_NET_IPV4_D 15U
 #define TASK_NET_PEER_D 2U
 #define TASK_NET_TCP_PORT 18080U
+#define TASK_NET_UDP_PORT 18081U
+#define TASK_NET_PRESSURE_MIN_RX 24U
 
 struct task_net_backend {
     struct lkl_netdev dev;
     unsigned char *tx_page;
     unsigned char *rx_page;
     size_t pending_rx;
+    seL4_CPtr rx_ntfn;
     volatile int hup;
     int configured;
 };
@@ -115,6 +118,10 @@ static int task_net_poll(struct lkl_netdev *nd)
     for (;;) {
         if (__atomic_load_n(&backend->hup, __ATOMIC_ACQUIRE))
             return LKL_DEV_NET_POLL_HUP;
+        seL4_Word badge = 0;
+        seL4_Wait(backend->rx_ntfn, &badge);
+        if (__atomic_load_n(&backend->hup, __ATOMIC_ACQUIRE))
+            return LKL_DEV_NET_POLL_HUP;
         seL4_Word length = 0;
         luna_lkl_task_manager_lock();
         int result = luna_lkl_task_manager_request_value(
@@ -125,7 +132,6 @@ static int task_net_poll(struct lkl_netdev *nd)
             backend->pending_rx = (size_t)length;
             return LKL_DEV_NET_POLL_RX;
         }
-        seL4_Yield();
     }
 }
 
@@ -134,6 +140,10 @@ static void task_net_poll_hup(struct lkl_netdev *nd)
     struct task_net_backend *backend =
         (struct task_net_backend *)nd;
     __atomic_store_n(&backend->hup, 1, __ATOMIC_RELEASE);
+    luna_lkl_task_manager_lock();
+    (void)luna_lkl_task_manager_request(
+        LUNA_ISOLATION_EVENT_NET_WAKE, 0, 0);
+    luna_lkl_task_manager_unlock();
 }
 
 static void task_net_free(struct lkl_netdev *nd)
@@ -153,12 +163,13 @@ static struct lkl_dev_net_ops task_net_ops = {
 };
 
 int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
-                                seL4_Word mac_word0, seL4_Word mac_word1)
+                                seL4_Word mac_word0, seL4_Word mac_word1,
+                                seL4_CPtr rx_ntfn)
 {
     if ((uintptr_t)io_base != LUNA_NET_IO_BASE ||
         io_size != LUNA_NET_IO_SIZE ||
         mac_word0 != LUNA_NET_MAC_WORD0 ||
-        mac_word1 != LUNA_NET_MAC_WORD1)
+        mac_word1 != LUNA_NET_MAC_WORD1 || !rx_ntfn)
         return -1;
     memset(&task_net, 0, sizeof(task_net));
     task_net.dev.ops = &task_net_ops;
@@ -171,6 +182,7 @@ int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
     task_net.dev.mac[5] = 0x56;
     task_net.tx_page = (unsigned char *)io_base + LUNA_NET_TX_OFFSET;
     task_net.rx_page = (unsigned char *)io_base + LUNA_NET_RX_OFFSET;
+    task_net.rx_ntfn = rx_ntfn;
     task_net.configured = 1;
     task_net_id = -1;
     task_net_ifindex = -1;
@@ -317,6 +329,126 @@ int luna_lkl_task_net_smoke(void)
         return -1;
     }
     return 0;
+}
+
+static int task_net_control(seL4_Word control)
+{
+    luna_lkl_task_manager_lock();
+    int result = luna_lkl_task_manager_request(
+        LUNA_ISOLATION_EVENT_NET_CONTROL, control, 0);
+    luna_lkl_task_manager_unlock();
+    return result;
+}
+
+static int task_net_stats(seL4_Word *stats)
+{
+    luna_lkl_task_manager_lock();
+    int result = luna_lkl_task_manager_request_value(
+        LUNA_ISOLATION_EVENT_NET_STATS, 0, 0, stats);
+    luna_lkl_task_manager_unlock();
+    return result;
+}
+
+int luna_lkl_task_net_pressure_smoke(void)
+{
+    static const unsigned char magic[8] = {
+        'L', 'U', 'N', 'A', 'B', 'R', 'S', 'T'
+    };
+    unsigned char trigger[12];
+    unsigned char packet[LUNA_NET_STRESS_PAYLOAD];
+    struct lkl_sockaddr_in peer;
+    long fd = -1;
+    int masked = 0;
+    int result = -1;
+    uint64_t seen = 0;
+    unsigned received = 0;
+
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = LKL_AF_INET;
+    peer.sin_port = task_htons(TASK_NET_UDP_PORT);
+    peer.sin_addr.lkl_s_addr = task_ipv4(
+        TASK_NET_IPV4_A, TASK_NET_IPV4_B, TASK_NET_IPV4_C,
+        TASK_NET_PEER_D);
+    memcpy(trigger, magic, sizeof(magic));
+    uint16_t burst = task_htons((uint16_t)LUNA_NET_STRESS_BURST);
+    uint16_t payload = task_htons((uint16_t)LUNA_NET_STRESS_PAYLOAD);
+    memcpy(trigger + 8, &burst, sizeof(burst));
+    memcpy(trigger + 10, &payload, sizeof(payload));
+
+    fd = lkl_sys_socket(LKL_AF_INET, LKL_SOCK_DGRAM, LKL_IPPROTO_UDP);
+    if (fd < 0 || task_net_control(1)) goto out;
+    masked = 1;
+    long syscall_result = lkl_sys_sendto((int)fd, trigger,
+        sizeof(trigger), 0, (struct lkl_sockaddr *)&peer, sizeof(peer));
+    if (syscall_result != (long)sizeof(trigger)) goto out;
+    struct __lkl__kernel_timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 100000000,
+    };
+    if (lkl_sys_nanosleep(&delay, NULL) < 0) goto out;
+
+    seL4_Word paused_stats = 0;
+    if (task_net_stats(&paused_stats)) goto out;
+    unsigned paused_high_water = (unsigned)(paused_stats & 0xffffU);
+    unsigned paused_backpressure =
+        (unsigned)((paused_stats >> 16) & 0xffffU);
+    if (paused_high_water < TASK_NET_PRESSURE_MIN_RX ||
+        !paused_backpressure)
+        goto out;
+    if (task_net_control(0)) goto out;
+    masked = 0;
+
+    for (unsigned attempt = 0;
+         attempt < 30 && received < LUNA_NET_STRESS_BURST; attempt++) {
+        struct lkl_pollfd pollfd = {
+            .fd = (int)fd,
+            .events = LKL_POLLIN,
+        };
+        syscall_result = lkl_sys_poll(&pollfd, 1, 200);
+        if (syscall_result < 0) goto out;
+        if (!syscall_result) continue;
+        syscall_result = lkl_sys_recv((int)fd, packet, sizeof(packet),
+                                      LKL_MSG_DONTWAIT);
+        if (syscall_result != (long)LUNA_NET_STRESS_PAYLOAD) goto out;
+        uint16_t sequence_word = 0, count_word = 0;
+        memcpy(&sequence_word, packet, sizeof(sequence_word));
+        memcpy(&count_word, packet + 2, sizeof(count_word));
+        unsigned sequence = task_htons(sequence_word);
+        unsigned count = task_htons(count_word);
+        if (count != LUNA_NET_STRESS_BURST ||
+            sequence >= LUNA_NET_STRESS_BURST)
+            goto out;
+        for (size_t i = 4; i < sizeof(packet); i++) {
+            if (packet[i] != (unsigned char)sequence) goto out;
+        }
+        uint64_t bit = 1ULL << sequence;
+        if (!(seen & bit)) {
+            seen |= bit;
+            received++;
+        }
+    }
+
+    seL4_Word stats = 0;
+    if (task_net_stats(&stats)) goto out;
+    unsigned high_water = (unsigned)(stats & 0xffffU);
+    unsigned backpressure = (unsigned)((stats >> 16) & 0xffffU);
+    unsigned drops = (unsigned)((stats >> 32) & 0xffffU);
+    unsigned empty_fetches = (unsigned)((stats >> 48) & 0xffffU);
+    if (received < TASK_NET_PRESSURE_MIN_RX ||
+        high_water < TASK_NET_PRESSURE_MIN_RX || !backpressure ||
+        empty_fetches)
+        goto out;
+    lkl_printf("LUNA_NET_QUEUE_STATS received=%u high_water=%u "
+               "backpressure=%u drops=%u empty_fetches=%u\n",
+               received, high_water, backpressure, drops, empty_fetches);
+    result = 0;
+
+out:
+    if (masked) (void)task_net_control(0);
+    if (fd >= 0) lkl_sys_close((unsigned int)fd);
+    if (result)
+        lkl_printf("luna-lkl-task: network pressure smoke failed\n");
+    return result;
 }
 
 int luna_lkl_task_net_finish(void)

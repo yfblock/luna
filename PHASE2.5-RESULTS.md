@@ -89,6 +89,7 @@ SMOKE TEST PASSED
 
 ## 后续
 
-Phase 2.5 的单队列外部网络数据通路已完成。后续可以增加异步 RX Notification/IRQ，减少当前 poll
-Endpoint 的调度开销；也可以在具备 slirp、passt 或 TAP 权限的环境加入 DHCP/DNS/互联网互通，或进入
-Phase 3 的 UINTR 通知实验。上述扩展不能扩大 child 的 PCI/DMA capability 集合。
+Phase 2.5 的单队列外部网络数据通路已完成。同步 RX polling 已在 Phase 2.5.1 中替换为
+receive-only Notification、manager poll thread 和 bounded queue 背压；详见
+`PHASE2.5.1-RESULTS.md`。后续仍可在具备 slirp、passt 或 TAP 权限的环境加入 DHCP/DNS/互联网互通，
+或进入 Phase 3 的 UINTR 通知实验。上述扩展不能扩大 child 的 PCI/DMA capability 集合。

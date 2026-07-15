@@ -26,7 +26,8 @@ int luna_lkl_task_configure_resources(
 int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
                                  unsigned long disk_size);
 int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
-                                seL4_Word mac_word0, seL4_Word mac_word1);
+                                seL4_Word mac_word0, seL4_Word mac_word1,
+                                seL4_CPtr rx_ntfn);
 void luna_lkl_task_manager_lock(void);
 void luna_lkl_task_manager_unlock(void);
 int luna_lkl_task_manager_request(enum luna_isolation_event event,
@@ -47,6 +48,7 @@ int luna_lkl_task_disk_add(void);
 int luna_lkl_task_net_add(void);
 int luna_lkl_task_net_prepare(void);
 int luna_lkl_task_net_smoke(void);
+int luna_lkl_task_net_pressure_smoke(void);
 int luna_lkl_task_net_finish(void);
 int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode);
 int luna_lkl_task_disk_finish(void);

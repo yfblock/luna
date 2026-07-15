@@ -146,14 +146,15 @@ int main(int argc, char **argv)
     seL4_MessageInfo_t net_tag =
         receive_command(child_boot.command_ep,
                         LUNA_COMMAND_CONFIGURE_NET);
-    if (seL4_MessageInfo_get_length(net_tag) != 5 ||
+    if (seL4_MessageInfo_get_length(net_tag) != 6 ||
         seL4_GetMR(1) != LUNA_NET_IO_BASE ||
         seL4_GetMR(2) != LUNA_NET_IO_SIZE ||
         seL4_GetMR(3) != LUNA_NET_MAC_WORD0 ||
-        seL4_GetMR(4) != LUNA_NET_MAC_WORD1)
+        seL4_GetMR(4) != LUNA_NET_MAC_WORD1 || !seL4_GetMR(5))
         for (;;) seL4_Yield();
     void *net_io_base = (void *)(uintptr_t)seL4_GetMR(1);
     unsigned long net_io_size = seL4_GetMR(2);
+    seL4_CPtr net_rx_ntfn = (seL4_CPtr)seL4_GetMR(5);
 
     if (luna_lkl_task_configure_resources(
             resources, sync, console_io_port, child_boot.control_ep,
@@ -163,7 +164,8 @@ int main(int argc, char **argv)
         for (;;) seL4_Yield();
     if (luna_lkl_task_configure_net(net_io_base, net_io_size,
                                     LUNA_NET_MAC_WORD0,
-                                    LUNA_NET_MAC_WORD1))
+                                    LUNA_NET_MAC_WORD1,
+                                    net_rx_ntfn))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                child_boot.mode);
@@ -226,6 +228,11 @@ int main(int argc, char **argv)
                    LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK, child_boot.mode);
         send_event(child_boot.control_ep,
                    LUNA_ISOLATION_EVENT_NETWORK_TCP_OK, child_boot.mode);
+        if (luna_lkl_task_net_pressure_smoke())
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_NETWORK_PRESSURE_OK,
+                   child_boot.mode);
         if (luna_shell_prepare(luna_lkl_task_console_ready()))
             for (;;) seL4_Yield();
         if (luna_lkl_task_user_smoke())

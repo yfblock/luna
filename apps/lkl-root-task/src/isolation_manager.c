@@ -260,6 +260,7 @@ static int destroy_child(sel4utils_process_t *process,
     int result = 0;
     size_t disk_mapped_pages = resources->disk.mapped_pages;
     size_t net_mapped_pages = resources->net.mapped_pages;
+    luna_network_deactivate_child();
     if (process->thread.tcb.cptr)
         seL4_TCB_Suspend(process->thread.tcb.cptr);
     for (int i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
@@ -540,7 +541,10 @@ static int receive_event(struct luna_event_context *context,
 
         if (label == 0 && length == 3 && badge == context->badge &&
             (event == LUNA_ISOLATION_EVENT_NET_TX ||
-             event == LUNA_ISOLATION_EVENT_NET_RX)) {
+             event == LUNA_ISOLATION_EVENT_NET_RX ||
+             event == LUNA_ISOLATION_EVENT_NET_WAKE ||
+             event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
+             event == LUNA_ISOLATION_EVENT_NET_STATS)) {
             if (seL4_GetMR(2) ||
                 luna_network_service(context->command_ep, event,
                                      seL4_GetMR(1)))
@@ -624,14 +628,16 @@ static void send_disk_resource(seL4_CPtr command_ep)
     seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 4));
 }
 
-static void send_net_resource(seL4_CPtr command_ep)
+static void send_net_resource(seL4_CPtr command_ep,
+                              const struct luna_net_mapping *mapping)
 {
     seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_NET);
     seL4_SetMR(1, LUNA_NET_IO_BASE);
     seL4_SetMR(2, LUNA_NET_IO_SIZE);
     seL4_SetMR(3, LUNA_NET_MAC_WORD0);
     seL4_SetMR(4, LUNA_NET_MAC_WORD1);
-    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 5));
+    seL4_SetMR(5, mapping->child_rx_ntfn);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 6));
 }
 
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
@@ -676,7 +682,8 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         return -1;
     }
     if (luna_network_map_child(vka, manager_vspace, process,
-                               &resources->net)) {
+                               &resources->net,
+                               mode != LUNA_ISOLATION_MODE_STRESS)) {
         printf("luna: child network window mapping failed\n");
         (void)destroy_child(process, resources, vka);
         return -1;
@@ -757,7 +764,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
         send_sync_slot(command_ep, &resources->sync[i], i);
     send_console_resource(command_ep, &resources->console);
     send_disk_resource(command_ep);
-    send_net_resource(command_ep);
+    send_net_resource(command_ep, &resources->net);
     if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode))
         return -1;
@@ -868,6 +875,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
            (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
     printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
     printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
+    printf("LUNA_NETWORK_ASYNC_RX_OK notification=receive-only\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_HALT_OK\n");
@@ -924,6 +932,9 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_NETWORK_TCP_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
+        receive_event(&event_context,
+                      LUNA_ISOLATION_EVENT_NETWORK_PRESSURE_OK,
+                      LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
@@ -931,6 +942,9 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         goto out;
     printf("LUNA_NETWORK_ICMP_OK peer=10.0.2.2\n");
     printf("LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080\n");
+    printf("LUNA_NETWORK_PRESSURE_OK burst=%lu payload=%lu\n",
+           (unsigned long)LUNA_NET_STRESS_BURST,
+           (unsigned long)LUNA_NET_STRESS_PAYLOAD);
     printf("LUNA_PHASE2_4_USER_OK\n");
     printf("LUNA_LKL_CHILD_SHELL_READY\n");
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_CLEAN))
