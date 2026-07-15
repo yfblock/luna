@@ -31,6 +31,7 @@ REQUIRED = [
     b"LUNA_RESOURCE_POOL_OK",
     b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
     b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
+    b"LUNA_SYNC_TLS_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
     b"LUNA_LKL_CHILD_HALT_OK",
@@ -60,6 +61,11 @@ FORBIDDEN = [
     b"failed to delete child resource cap",
     b"Cannot clear reserved entries mid level",
     b"Untyped Retype",
+    b"freeing semaphore with waiters",
+    b"semaphore count overflow",
+    b"freeing owned mutex",
+    b"mutex unlock by non-owner",
+    b"mutex owner errors during LKL runtime",
 ]
 PROMPT = re.compile(rb"lkl:[^\r\n]*# ")
 

@@ -56,8 +56,8 @@ luna/
 |---|---|
 | 内存（mem/page/mmap/shmem） | child 位图分配器 + manager 按需 map/unmap；child 不持有 VKA/Untyped |
 | 线程 | manager 预建的固定 TCB 池（全部配置到 child VSpace/CSpace） |
-| mutex/sem | Notification 二值信号量 |
-| TLS | `[tid][key]` 表 + `__thread current_tid`（根线程 tid=1） |
+| mutex/sem | 原子计数 semaphore + Notification 唤醒；mutex 记录 owner/递归深度并拒绝非 owner 解锁 |
+| TLS | `[tid][key]` 表 + 最多 4 轮可重入 destructor（根线程 tid=1） |
 | jmp_buf | musl setjmp/longjmp |
 | timer/time | PIT 校准 TSC 单调时钟 + seL4 polling TCB oneshot（不占用冲突 IRQ） |
 | console | 输出走 `seL4_DebugPutChar`；输入只使用 `0x3f8–0x3ff` COM1 capability |
@@ -118,5 +118,9 @@ host operation 请求时由 manager 映射，释放时立即 unmap 并归还 VKA
 BSS heap；allocator 自测覆盖全 arena、释放复用和清零，manager 在每次 halt 后断言映射页计数为 0，
 并连续完成 100 轮 LKL 启动/关闭/销毁。
 
-当前限制包括：小于一页的 host allocation 仍按页计费、mutex/sem 为二值，以及尚无 virtio 块设备/网络。
+Phase 2.2 的同步与 TLS 语义也已完成：semaphore 保存真实 token 计数并支持多个阻塞 waiter，mutex
+拒绝非 owner 解锁并验证 recursive depth；TLS destructor 在重新设置 key 时最多重试 4 轮。以上自测
+在每个 stress child 中执行，LKL 运行期出现任何 owner/sync 错误都会使 smoke 失败。
+
+当前限制包括：小于一页的 host allocation 仍按页计费，以及尚无 virtio 块设备/网络。
 后续工作见 [`next-plan.md`](next-plan.md)。

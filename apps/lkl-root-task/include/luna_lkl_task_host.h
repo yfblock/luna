@@ -24,6 +24,8 @@ int luna_lkl_task_configure_resources(
     seL4_CPtr console_io_port, seL4_CPtr control_ep,
     seL4_CPtr command_ep);
 int luna_lkl_task_thread_test(void);
+int luna_lkl_task_sync_tls_test(void);
+int luna_lkl_task_sync_tls_runtime_ok(void);
 int luna_lkl_task_allocator_test(void);
 int luna_lkl_task_allocator_idle(void);
 int luna_lkl_task_init(void);

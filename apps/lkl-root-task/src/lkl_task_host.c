@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <setjmp.h>
 #include <string.h>
+#include <limits.h>
 
 struct task_thread_slot {
     sel4utils_thread_t thread;
@@ -113,7 +114,11 @@ enum task_sync_kind {
 };
 
 struct task_sync_slot;
-struct lkl_sem { struct task_sync_slot *slot; };
+struct lkl_sem {
+    struct task_sync_slot *slot;
+    volatile int count;
+    volatile int waiters;
+};
 struct lkl_mutex {
     struct task_sync_slot *slot;
     lkl_thread_t owner;
@@ -163,23 +168,70 @@ static void task_sync_release(struct task_sync_slot *slot)
 
 static struct lkl_sem *task_sem_alloc(int count)
 {
+    if (count < 0) return NULL;
     struct task_sync_slot *slot = task_sync_claim(TASK_SYNC_SEM);
     if (!slot) return NULL;
     slot->sem.slot = slot;
-    if (count > 0) seL4_Signal(slot->ntfn);
+    slot->sem.count = count;
+    slot->sem.waiters = 0;
     return &slot->sem;
 }
 
 static void task_sem_free(struct lkl_sem *sem)
 {
-    if (sem) task_sync_release(sem->slot);
+    if (!sem) return;
+    if (__atomic_load_n(&sem->waiters, __ATOMIC_ACQUIRE) != 0) {
+        task_debug("luna-lkl-task: freeing semaphore with waiters\n");
+        return;
+    }
+    task_sync_release(sem->slot);
 }
 
-static void task_sem_up(struct lkl_sem *sem) { seL4_Signal(sem->slot->ntfn); }
+static int task_sem_try_down(struct lkl_sem *sem)
+{
+    int count = __atomic_load_n(&sem->count, __ATOMIC_ACQUIRE);
+    while (count > 0) {
+        if (__atomic_compare_exchange_n(&sem->count, &count, count - 1,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            return 1;
+    }
+    return 0;
+}
+
+static void task_sem_up(struct lkl_sem *sem)
+{
+    int count = __atomic_load_n(&sem->count, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (count == INT_MAX) {
+            task_debug("luna-lkl-task: semaphore count overflow\n");
+            return;
+        }
+        if (__atomic_compare_exchange_n(&sem->count, &count, count + 1,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            break;
+    }
+    if (__atomic_load_n(&sem->waiters, __ATOMIC_ACQUIRE) > 0)
+        seL4_Signal(sem->slot->ntfn);
+}
+
 static void task_sem_down(struct lkl_sem *sem)
 {
-    seL4_Word badge = 0;
-    seL4_Wait(sem->slot->ntfn, &badge);
+    if (task_sem_try_down(sem)) return;
+    __atomic_fetch_add(&sem->waiters, 1, __ATOMIC_ACQ_REL);
+    for (;;) {
+        if (task_sem_try_down(sem)) {
+            int remaining = __atomic_sub_fetch(&sem->waiters, 1,
+                                               __ATOMIC_ACQ_REL);
+            if (remaining > 0 &&
+                __atomic_load_n(&sem->count, __ATOMIC_ACQUIRE) > 0)
+                seL4_Signal(sem->slot->ntfn);
+            return;
+        }
+        seL4_Word badge = 0;
+        seL4_Wait(sem->slot->ntfn, &badge);
+    }
 }
 
 static struct lkl_mutex *task_mutex_alloc(int recursive)
@@ -196,7 +248,12 @@ static struct lkl_mutex *task_mutex_alloc(int recursive)
 
 static void task_mutex_free(struct lkl_mutex *mutex)
 {
-    if (mutex) task_sync_release(mutex->slot);
+    if (!mutex) return;
+    if (mutex->owner || mutex->count) {
+        task_debug("luna-lkl-task: freeing owned mutex\n");
+        return;
+    }
+    task_sync_release(mutex->slot);
 }
 
 static void task_mutex_lock(struct lkl_mutex *mutex)
@@ -211,16 +268,29 @@ static void task_mutex_lock(struct lkl_mutex *mutex)
     mutex->count = 1;
 }
 
-static void task_mutex_unlock(struct lkl_mutex *mutex)
+static volatile unsigned task_mutex_owner_errors;
+
+static int task_mutex_unlock_checked(struct lkl_mutex *mutex)
 {
-    if (mutex->owner != current_tid) return;
-    if (mutex->recursive && --mutex->count > 0) return;
+    if (mutex->owner != current_tid || mutex->count <= 0) {
+        __atomic_fetch_add(&task_mutex_owner_errors, 1, __ATOMIC_RELAXED);
+        return -1;
+    }
+    if (mutex->recursive && --mutex->count > 0) return 0;
     mutex->owner = 0;
     mutex->count = 0;
     seL4_Signal(mutex->slot->ntfn);
+    return 0;
+}
+
+static void task_mutex_unlock(struct lkl_mutex *mutex)
+{
+    if (task_mutex_unlock_checked(mutex))
+        task_debug("luna-lkl-task: mutex unlock by non-owner\n");
 }
 
 #define TASK_TLS_KEYS 16
+#define TASK_TLS_DESTRUCTOR_ITERATIONS 4
 struct lkl_tls_key {
     volatile int used;
     void *data[LUNA_RESOURCE_SLOTS + 2];
@@ -231,12 +301,23 @@ static struct lkl_tls_key task_tls[TASK_TLS_KEYS];
 static void task_tls_cleanup(lkl_thread_t tid)
 {
     if (tid >= LUNA_RESOURCE_SLOTS + 2) return;
-    for (int i = 0; i < TASK_TLS_KEYS; i++) {
-        void *data = task_tls[i].data[tid];
-        task_tls[i].data[tid] = NULL;
-        if (data && task_tls[i].used && task_tls[i].destructor)
-            task_tls[i].destructor(data);
+    for (int pass = 0; pass < TASK_TLS_DESTRUCTOR_ITERATIONS; pass++) {
+        int called = 0;
+        for (int i = 0; i < TASK_TLS_KEYS; i++) {
+            struct lkl_tls_key *key = &task_tls[i];
+            void *data = key->data[tid];
+            key->data[tid] = NULL;
+            void (*destructor)(void *) = key->destructor;
+            if (data && __atomic_load_n(&key->used, __ATOMIC_ACQUIRE) &&
+                destructor) {
+                called = 1;
+                destructor(data);
+            }
+        }
+        if (!called) break;
     }
+    for (int i = 0; i < TASK_TLS_KEYS; i++)
+        task_tls[i].data[tid] = NULL;
 }
 
 static struct lkl_tls_key *task_tls_alloc(void (*destructor)(void *))
@@ -257,25 +338,25 @@ static struct lkl_tls_key *task_tls_alloc(void (*destructor)(void *))
 static void task_tls_free(struct lkl_tls_key *key)
 {
     if (!key) return;
-    for (int i = 0; i < LUNA_RESOURCE_SLOTS + 2; i++) {
-        void *data = key->data[i];
-        key->data[i] = NULL;
-        if (data && key->destructor) key->destructor(data);
-    }
-    key->destructor = NULL;
     __atomic_store_n(&key->used, 0, __ATOMIC_RELEASE);
+    memset(key->data, 0, sizeof(key->data));
+    key->destructor = NULL;
 }
 
 static int task_tls_set(struct lkl_tls_key *key, void *data)
 {
-    if (!key || current_tid >= LUNA_RESOURCE_SLOTS + 2) return -1;
+    if (!key || !__atomic_load_n(&key->used, __ATOMIC_ACQUIRE) ||
+        current_tid >= LUNA_RESOURCE_SLOTS + 2)
+        return -1;
     key->data[current_tid] = data;
     return 0;
 }
 
 static void *task_tls_get(struct lkl_tls_key *key)
 {
-    if (!key || current_tid >= LUNA_RESOURCE_SLOTS + 2) return NULL;
+    if (!key || !__atomic_load_n(&key->used, __ATOMIC_ACQUIRE) ||
+        current_tid >= LUNA_RESOURCE_SLOTS + 2)
+        return NULL;
     return key->data[current_tid];
 }
 
@@ -805,6 +886,186 @@ int luna_lkl_task_thread_test(void)
     return 0;
 }
 
+#define TASK_SEM_TEST_WAITERS 4
+#define TASK_MUTEX_TEST_WORKERS 4
+#define TASK_MUTEX_TEST_ITERATIONS 32
+
+static struct lkl_sem *task_test_sem;
+static volatile int task_test_sem_ready;
+static volatile int task_test_sem_passed;
+
+static void task_sem_test_worker(void *arg)
+{
+    (void)arg;
+    __atomic_fetch_add(&task_test_sem_ready, 1, __ATOMIC_RELEASE);
+    task_sem_down(task_test_sem);
+    __atomic_fetch_add(&task_test_sem_passed, 1, __ATOMIC_RELEASE);
+}
+
+static struct lkl_mutex *task_test_mutex;
+static volatile int task_test_mutex_owner_rejected;
+static volatile int task_test_mutex_value;
+
+static void task_mutex_owner_test_worker(void *arg)
+{
+    (void)arg;
+    task_test_mutex_owner_rejected =
+        task_mutex_unlock_checked(task_test_mutex) == -1;
+}
+
+static void task_mutex_contention_worker(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < TASK_MUTEX_TEST_ITERATIONS; i++) {
+        task_mutex_lock(task_test_mutex);
+        int value = task_test_mutex_value;
+        seL4_Yield();
+        task_test_mutex_value = value + 1;
+        task_mutex_unlock(task_test_mutex);
+    }
+}
+
+static struct lkl_tls_key *task_test_tls_key;
+static volatile int task_test_tls_destructor_calls;
+static volatile int task_test_tls_set_errors;
+static int task_test_tls_rearm_limit;
+
+static void task_tls_reentrant_destructor(void *data)
+{
+    (void)data;
+    int call = __atomic_add_fetch(&task_test_tls_destructor_calls, 1,
+                                  __ATOMIC_ACQ_REL);
+    if (call < task_test_tls_rearm_limit &&
+        task_tls_set(task_test_tls_key, (void *)(uintptr_t)(call + 1)))
+        __atomic_fetch_add(&task_test_tls_set_errors, 1,
+                           __ATOMIC_RELAXED);
+}
+
+static void task_tls_test_worker(void *arg)
+{
+    if (task_tls_set(task_test_tls_key, arg))
+        __atomic_fetch_add(&task_test_tls_set_errors, 1,
+                           __ATOMIC_RELAXED);
+}
+
+static int task_tls_reentry_test(int rearm_limit, int expected_calls)
+{
+    task_test_tls_destructor_calls = 0;
+    task_test_tls_set_errors = 0;
+    task_test_tls_rearm_limit = rearm_limit;
+    task_test_tls_key = task_tls_alloc(task_tls_reentrant_destructor);
+    if (!task_test_tls_key) return -1;
+
+    lkl_thread_t tid = task_thread_create(task_tls_test_worker,
+                                          (void *)(uintptr_t)1);
+    if (!tid || task_thread_join(tid) ||
+        task_test_tls_destructor_calls != expected_calls ||
+        task_test_tls_set_errors != 0 || task_test_tls_key->data[tid] != NULL) {
+        task_tls_free(task_test_tls_key);
+        task_test_tls_key = NULL;
+        return -1;
+    }
+    task_tls_free(task_test_tls_key);
+    task_test_tls_key = NULL;
+    return task_test_tls_destructor_calls == expected_calls ? 0 : -1;
+}
+
+int luna_lkl_task_sync_tls_test(void)
+{
+    struct lkl_sem *counting = task_sem_alloc(3);
+    if (!counting) return -1;
+    task_sem_down(counting);
+    task_sem_down(counting);
+    task_sem_down(counting);
+    if (__atomic_load_n(&counting->count, __ATOMIC_ACQUIRE) != 0) return -1;
+    task_sem_up(counting);
+    task_sem_up(counting);
+    task_sem_down(counting);
+    task_sem_down(counting);
+    if (__atomic_load_n(&counting->count, __ATOMIC_ACQUIRE) != 0) return -1;
+    task_sem_free(counting);
+
+    task_test_sem = task_sem_alloc(0);
+    if (!task_test_sem) return -1;
+    task_test_sem_ready = 0;
+    task_test_sem_passed = 0;
+    lkl_thread_t sem_tids[TASK_SEM_TEST_WAITERS];
+    for (int i = 0; i < TASK_SEM_TEST_WAITERS; i++) {
+        sem_tids[i] = task_thread_create(task_sem_test_worker, NULL);
+        if (!sem_tids[i]) return -1;
+    }
+    while (__atomic_load_n(&task_test_sem_ready, __ATOMIC_ACQUIRE) !=
+               TASK_SEM_TEST_WAITERS ||
+           __atomic_load_n(&task_test_sem->waiters, __ATOMIC_ACQUIRE) !=
+               TASK_SEM_TEST_WAITERS)
+        seL4_Yield();
+    for (int i = 0; i < TASK_SEM_TEST_WAITERS; i++)
+        task_sem_up(task_test_sem);
+    for (int i = 0; i < TASK_SEM_TEST_WAITERS; i++)
+        if (task_thread_join(sem_tids[i])) return -1;
+    if (task_test_sem_passed != TASK_SEM_TEST_WAITERS ||
+        task_test_sem->count != 0 || task_test_sem->waiters != 0)
+        return -1;
+    task_sem_free(task_test_sem);
+    task_test_sem = NULL;
+
+    task_test_mutex = task_mutex_alloc(0);
+    if (!task_test_mutex) return -1;
+    task_mutex_lock(task_test_mutex);
+    unsigned owner_errors = __atomic_load_n(&task_mutex_owner_errors,
+                                            __ATOMIC_ACQUIRE);
+    task_test_mutex_owner_rejected = 0;
+    lkl_thread_t owner_tid = task_thread_create(
+        task_mutex_owner_test_worker, NULL);
+    if (!owner_tid || task_thread_join(owner_tid) ||
+        !task_test_mutex_owner_rejected || task_test_mutex->owner != 1 ||
+        task_test_mutex->count != 1 ||
+        task_mutex_owner_errors != owner_errors + 1 ||
+        task_mutex_unlock_checked(task_test_mutex))
+        return -1;
+
+    task_test_mutex_value = 0;
+    lkl_thread_t mutex_tids[TASK_MUTEX_TEST_WORKERS];
+    for (int i = 0; i < TASK_MUTEX_TEST_WORKERS; i++) {
+        mutex_tids[i] = task_thread_create(task_mutex_contention_worker, NULL);
+        if (!mutex_tids[i]) return -1;
+    }
+    for (int i = 0; i < TASK_MUTEX_TEST_WORKERS; i++)
+        if (task_thread_join(mutex_tids[i])) return -1;
+    if (task_test_mutex_value !=
+        TASK_MUTEX_TEST_WORKERS * TASK_MUTEX_TEST_ITERATIONS)
+        return -1;
+    task_mutex_free(task_test_mutex);
+
+    task_test_mutex = task_mutex_alloc(1);
+    if (!task_test_mutex) return -1;
+    task_mutex_lock(task_test_mutex);
+    task_mutex_lock(task_test_mutex);
+    if (task_test_mutex->owner != 1 || task_test_mutex->count != 2 ||
+        task_mutex_unlock_checked(task_test_mutex) ||
+        task_test_mutex->owner != 1 || task_test_mutex->count != 1 ||
+        task_mutex_unlock_checked(task_test_mutex) ||
+        task_test_mutex->owner != 0 || task_test_mutex->count != 0)
+        return -1;
+    task_mutex_free(task_test_mutex);
+    task_test_mutex = NULL;
+
+    if (task_tls_reentry_test(3, 3) ||
+        task_tls_reentry_test(TASK_TLS_DESTRUCTOR_ITERATIONS + 2,
+                              TASK_TLS_DESTRUCTOR_ITERATIONS))
+        return -1;
+    return 0;
+}
+
+int luna_lkl_task_sync_tls_runtime_ok(void)
+{
+    if (__atomic_load_n(&task_mutex_owner_errors, __ATOMIC_ACQUIRE) != 0) {
+        task_debug("luna-lkl-task: mutex owner errors during LKL runtime\n");
+        return 0;
+    }
+    return 1;
+}
+
 int luna_lkl_task_allocator_test(void)
 {
     task_heap_init();
@@ -887,6 +1148,7 @@ void lkl_bug(const char *fmt, ...)
 int luna_lkl_task_init(void)
 {
     task_heap_init();
+    task_mutex_owner_errors = 0;
     memset(task_tls, 0, sizeof(task_tls));
     for (int i = 0; i < LUNA_SYNC_SLOTS; i++) {
         task_sync_drain(task_sync[i].ntfn);

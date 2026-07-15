@@ -154,6 +154,10 @@ int main(int argc, char **argv)
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_ALLOCATOR_OK,
                child_boot.mode);
+    if (luna_lkl_task_sync_tls_test())
+        for (;;) seL4_Yield();
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_SYNC_TLS_OK,
+               child_boot.mode);
 
     if (luna_lkl_task_init()) {
         for (;;) seL4_Yield();
@@ -177,6 +181,8 @@ int main(int argc, char **argv)
         for (;;) seL4_Yield();
     }
     if (!luna_lkl_task_allocator_idle())
+        for (;;) seL4_Yield();
+    if (!luna_lkl_task_sync_tls_runtime_ok())
         for (;;) seL4_Yield();
     finish_child();
 }
