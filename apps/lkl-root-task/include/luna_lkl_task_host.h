@@ -39,6 +39,7 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
 int luna_lkl_task_thread_test(void);
 int luna_lkl_task_sync_tls_test(void);
 int luna_lkl_task_sync_tls_runtime_ok(void);
+void luna_lkl_task_resource_stats(void);
 int luna_lkl_task_prepare_time(unsigned long long tsc_frequency);
 int luna_lkl_task_thread_timer_test(void);
 int luna_lkl_task_allocator_test(void);

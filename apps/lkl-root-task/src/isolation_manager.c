@@ -90,6 +90,11 @@ struct luna_persistent_disk {
     reservation_t io_reservation;
     int io_reserved;
     int io_allocated;
+    unsigned long long ipc_count;
+    unsigned long long batch_count;
+    unsigned long long request_count;
+    unsigned long long copy_count;
+    unsigned long long queue_high_water;
 };
 
 struct luna_child_resources {
@@ -511,19 +516,29 @@ static int service_disk_request(struct luna_event_context *context,
     if (!disk || !disk->allocated || !disk->io_allocated ||
         offset > disk->bytes ||
         length > disk->bytes - offset ||
-        length > LUNA_DISK_IO_SIZE) {
+        length > LUNA_DISK_IO_SIZE - LUNA_DISK_BATCH_DATA_OFFSET) {
         error = -1;
     } else if (event == LUNA_ISOLATION_EVENT_DISK_READ) {
         if (!length) error = -1;
-        else memcpy(disk->io_mapping,
+        else memcpy((unsigned char *)disk->io_mapping +
+                        LUNA_DISK_BATCH_DATA_OFFSET,
                     (unsigned char *)disk->mapping + offset,
                     length);
     } else if (event == LUNA_ISOLATION_EVENT_DISK_WRITE) {
         if (!length) error = -1;
         else memcpy((unsigned char *)disk->mapping + offset,
-                    disk->io_mapping, length);
+                    (unsigned char *)disk->io_mapping +
+                        LUNA_DISK_BATCH_DATA_OFFSET,
+                    length);
     } else if (event != LUNA_ISOLATION_EVENT_DISK_FLUSH || length) {
         error = -1;
+    }
+    if (!error) {
+        disk->ipc_count++;
+        disk->request_count++;
+        if (event == LUNA_ISOLATION_EVENT_DISK_READ ||
+            event == LUNA_ISOLATION_EVENT_DISK_WRITE)
+            disk->copy_count++;
     }
     __sync_synchronize();
     seL4_SetMR(0, LUNA_COMMAND_DISK_RESULT);
@@ -535,6 +550,69 @@ static int service_disk_request(struct luna_event_context *context,
                event, offset_word, length_word, disk ? disk->allocated : 0,
                disk ? disk->io_allocated : 0, disk ? disk->bytes : 0,
                (unsigned long)LUNA_DISK_IO_SIZE);
+    return error;
+}
+
+static int service_disk_batch(struct luna_event_context *context,
+                              seL4_Word count_word)
+{
+    struct luna_persistent_disk *disk = context->disk;
+    struct luna_disk_batch_header *header = disk ? disk->io_mapping : NULL;
+    size_t count = (size_t)count_word;
+    int error = 0;
+    if (!disk || !disk->allocated || !disk->io_allocated || !count ||
+        count > LUNA_DISK_BATCH_SLOTS || header->count != count) {
+        error = -1;
+    } else {
+        disk->ipc_count++;
+        disk->batch_count++;
+        disk->request_count += count;
+        if (count > disk->queue_high_water) disk->queue_high_water = count;
+        for (size_t i = 0; i < count; i++) {
+            struct luna_disk_batch_descriptor *descriptor =
+                &header->descriptors[i];
+            size_t offset = (size_t)descriptor->offset;
+            size_t length = (size_t)descriptor->length;
+            seL4_Word event = descriptor->event;
+            descriptor->status = (seL4_Word)-1;
+            if (event == LUNA_ISOLATION_EVENT_DISK_FLUSH) {
+                if (offset || length) {
+                    error = -1;
+                    break;
+                }
+            } else if ((event != LUNA_ISOLATION_EVENT_DISK_READ &&
+                        event != LUNA_ISOLATION_EVENT_DISK_WRITE) ||
+                       !length || length > LUNA_DISK_BATCH_SLOT_SIZE ||
+                       offset > disk->bytes ||
+                       length > disk->bytes - offset) {
+                error = -1;
+                break;
+            } else if (event == LUNA_ISOLATION_EVENT_DISK_READ) {
+                memcpy((unsigned char *)disk->io_mapping +
+                           LUNA_DISK_BATCH_DATA_OFFSET +
+                           i * LUNA_DISK_BATCH_SLOT_SIZE,
+                       (unsigned char *)disk->mapping + offset, length);
+                disk->copy_count++;
+            } else {
+                memcpy((unsigned char *)disk->mapping + offset,
+                       (unsigned char *)disk->io_mapping +
+                           LUNA_DISK_BATCH_DATA_OFFSET +
+                           i * LUNA_DISK_BATCH_SLOT_SIZE,
+                       length);
+                disk->copy_count++;
+            }
+            descriptor->status = 0;
+        }
+    }
+    if (header) header->completed = error ? 0 : count;
+    __sync_synchronize();
+    seL4_SetMR(0, LUNA_COMMAND_DISK_RESULT);
+    seL4_SetMR(1, (seL4_Word)error);
+    seL4_Send(context->command_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    if (error)
+        printf("luna: child disk batch failed count=%lu allocated=%d "
+               "io=%d\n", count_word, disk ? disk->allocated : 0,
+               disk ? disk->io_allocated : 0);
     return error;
 }
 
@@ -570,8 +648,17 @@ static int receive_event(struct luna_event_context *context,
         }
 
         if (label == 0 && length == 3 && badge == context->badge &&
+            event == LUNA_ISOLATION_EVENT_DISK_SUBMIT_BATCH &&
+            !seL4_GetMR(2)) {
+            if (service_disk_batch(context, seL4_GetMR(1))) return -1;
+            continue;
+        }
+
+        if (label == 0 && length == 3 && badge == context->badge &&
             (event == LUNA_ISOLATION_EVENT_NET_TX ||
              event == LUNA_ISOLATION_EVENT_NET_RX ||
+             event == LUNA_ISOLATION_EVENT_NET_TX_BATCH ||
+             event == LUNA_ISOLATION_EVENT_NET_RX_BATCH ||
              event == LUNA_ISOLATION_EVENT_NET_WAKE ||
              event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
              event == LUNA_ISOLATION_EVENT_NET_STATS ||
@@ -1024,6 +1111,10 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_ISOLATION_CHANNEL_OK\n");
     printf("LUNA_ISOLATION_RESTART_OK\n");
     if (release_child(&child, &resources, vka, &child_live)) goto out;
+    printf("LUNA_DISK_MANAGER_COUNTERS ipc=%llu batches=%llu "
+           "requests=%llu copies=%llu queue_high_water=%llu\n",
+           disk.ipc_count, disk.batch_count, disk.request_count,
+           disk.copy_count, disk.queue_high_water);
     result = 0;
 
 out:

@@ -32,6 +32,7 @@ struct task_thread_slot {
     volatile int used;
     volatile int exited;
     volatile int join_claimed;
+    volatile int detached;
 };
 
 static struct task_thread_slot task_threads[LUNA_RESOURCE_SLOTS];
@@ -39,7 +40,21 @@ static __thread lkl_thread_t current_tid = 1;
 static __thread unsigned current_tls_index = 1;
 static volatile lkl_thread_t task_next_tid = 2;
 static volatile int task_thread_table_lock_word;
+static volatile unsigned task_thread_current;
+static volatile unsigned task_thread_peak;
+static volatile unsigned task_sync_current;
+static volatile unsigned task_sync_peak;
+static volatile unsigned long long task_manager_ipc_count;
 static void task_tls_cleanup(unsigned tls_index);
+
+static void task_resource_peak(volatile unsigned *peak, unsigned current)
+{
+    unsigned value = __atomic_load_n(peak, __ATOMIC_RELAXED);
+    while (current > value &&
+           !__atomic_compare_exchange_n(peak, &value, current, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) { }
+}
 
 static void task_debug(const char *str)
 {
@@ -112,6 +127,20 @@ static lkl_thread_t task_thread_create(void (*fn)(void *), void *arg)
     task_thread_table_lock();
     for (int i = 0; i < LUNA_LKL_THREAD_SLOTS; i++) {
         struct task_thread_slot *slot = &task_threads[i];
+        if (!slot->used || !slot->detached || !slot->exited) continue;
+        seL4_TCB_Suspend(slot->self_tcb);
+        task_thread_drain_join(slot);
+        slot->fn = NULL;
+        slot->arg = NULL;
+        slot->tid = 0;
+        slot->exited = 0;
+        slot->join_claimed = 0;
+        slot->detached = 0;
+        slot->used = 0;
+        __atomic_sub_fetch(&task_thread_current, 1U, __ATOMIC_RELAXED);
+    }
+    for (int i = 0; i < LUNA_LKL_THREAD_SLOTS; i++) {
+        struct task_thread_slot *slot = &task_threads[i];
         if (slot->used) continue;
         slot->used = 1;
         task_thread_drain_join(slot);
@@ -123,6 +152,10 @@ static lkl_thread_t task_thread_create(void (*fn)(void *), void *arg)
         slot->arg = arg;
         slot->exited = 0;
         slot->join_claimed = 0;
+        slot->detached = 0;
+        unsigned current = __atomic_add_fetch(&task_thread_current, 1U,
+                                              __ATOMIC_RELAXED);
+        task_resource_peak(&task_thread_peak, current);
         selected = slot;
         break;
     }
@@ -138,6 +171,7 @@ static lkl_thread_t task_thread_create(void (*fn)(void *), void *arg)
         selected->fn = NULL;
         selected->arg = NULL;
         selected->used = 0;
+        __atomic_sub_fetch(&task_thread_current, 1U, __ATOMIC_RELAXED);
         task_thread_table_unlock();
         task_debug("luna-lkl-task: host thread start failed\n");
         return 0;
@@ -145,7 +179,13 @@ static lkl_thread_t task_thread_create(void (*fn)(void *), void *arg)
     return selected->tid;
 }
 
-static void task_thread_detach(void) { }
+static void task_thread_detach(void)
+{
+    task_thread_table_lock();
+    struct task_thread_slot *slot = thread_by_tid_unlocked(current_tid);
+    if (slot) slot->detached = 1;
+    task_thread_table_unlock();
+}
 
 static void task_thread_exit(void)
 {
@@ -159,7 +199,7 @@ static int task_thread_join(lkl_thread_t tid)
     if (tid == 1) return 0;
     task_thread_table_lock();
     struct task_thread_slot *slot = thread_by_tid_unlocked(tid);
-    if (!slot || slot->join_claimed) {
+    if (!slot || slot->join_claimed || slot->detached) {
         task_thread_table_unlock();
         return -1;
     }
@@ -175,11 +215,14 @@ static int task_thread_join(lkl_thread_t tid)
         task_thread_table_unlock();
         return -1;
     }
+    seL4_TCB_Suspend(slot->self_tcb);
     slot->fn = NULL;
     slot->arg = NULL;
     slot->tid = 0;
     slot->exited = 0;
+    slot->detached = 0;
     slot->used = 0;
+    __atomic_sub_fetch(&task_thread_current, 1U, __ATOMIC_RELAXED);
     task_thread_table_unlock();
     return 0;
 }
@@ -233,6 +276,9 @@ static struct task_sync_slot *task_sync_claim(enum task_sync_kind kind)
             continue;
         task_sync[i].kind = kind;
         task_sync_drain(task_sync[i].ntfn);
+        unsigned current = __atomic_add_fetch(&task_sync_current, 1U,
+                                              __ATOMIC_RELAXED);
+        task_resource_peak(&task_sync_peak, current);
         return &task_sync[i];
     }
     task_debug("luna-lkl-task: sync pool exhausted\n");
@@ -245,6 +291,7 @@ static void task_sync_release(struct task_sync_slot *slot)
     task_sync_drain(slot->ntfn);
     slot->kind = TASK_SYNC_FREE;
     __atomic_store_n(&slot->used, 0, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&task_sync_current, 1U, __ATOMIC_RELAXED);
 }
 
 static struct lkl_sem *task_sem_alloc(int count)
@@ -489,6 +536,7 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
                                         seL4_Word *response_value)
 {
     if (!task_manager_control_ep || !task_manager_command_ep) return -1;
+    __atomic_fetch_add(&task_manager_ipc_count, 1ULL, __ATOMIC_RELAXED);
     seL4_SetMR(0, event);
     seL4_SetMR(1, value1);
     seL4_SetMR(2, value2);
@@ -504,6 +552,8 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
         expected = LUNA_COMMAND_MEMORY_RESULT;
     } else if (event == LUNA_ISOLATION_EVENT_NET_TX ||
                event == LUNA_ISOLATION_EVENT_NET_RX ||
+               event == LUNA_ISOLATION_EVENT_NET_TX_BATCH ||
+               event == LUNA_ISOLATION_EVENT_NET_RX_BATCH ||
                event == LUNA_ISOLATION_EVENT_NET_WAKE ||
                event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
                event == LUNA_ISOLATION_EVENT_NET_STATS ||
@@ -1026,6 +1076,11 @@ int luna_lkl_task_configure_resources(
     current_tls_index = 1;
     task_next_tid = 2;
     task_thread_table_lock_word = 0;
+    task_thread_current = 0;
+    task_thread_peak = 0;
+    task_sync_current = 0;
+    task_sync_peak = 0;
+    task_manager_ipc_count = 0;
     for (int i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
         struct task_thread_slot *slot = &task_threads[i];
         slot->self_tcb = resources[i].tcb;
@@ -1464,6 +1519,18 @@ int luna_lkl_task_allocator_idle(void)
         return 0;
     }
     return 1;
+}
+
+void luna_lkl_task_resource_stats(void)
+{
+    lkl_printf("LUNA_CHILD_RESOURCE_HIGH_WATER threads=%u/%u sync=%u/%u "
+               "manager_ipc=%llu\n",
+               __atomic_load_n(&task_thread_peak, __ATOMIC_ACQUIRE),
+               LUNA_LKL_THREAD_SLOTS,
+               __atomic_load_n(&task_sync_peak, __ATOMIC_ACQUIRE),
+               LUNA_SYNC_SLOTS,
+               __atomic_load_n(&task_manager_ipc_count,
+                               __ATOMIC_ACQUIRE));
 }
 
 int luna_lkl_task_init(void)

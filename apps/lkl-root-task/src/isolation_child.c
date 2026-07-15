@@ -257,6 +257,7 @@ int main(int argc, char **argv)
     }
     if (luna_lkl_task_disk_cleanup_after_halt())
         for (;;) seL4_Yield();
+    luna_lkl_task_resource_stats();
     if (!luna_lkl_task_allocator_idle())
         for (;;) seL4_Yield();
     if (!luna_lkl_task_sync_tls_runtime_ok())

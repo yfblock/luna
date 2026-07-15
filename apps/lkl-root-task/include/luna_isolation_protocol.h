@@ -6,13 +6,13 @@
 
 #define LUNA_ISOLATION_CHILD_IMAGE "luna-lkl-task"
 #define LUNA_ISOLATION_SECRET        ((seL4_Word)0x4c554e4153454352ULL)
-#define LUNA_LKL_THREAD_SLOTS        63
-#define LUNA_TIMER_SLOT              63
-#define LUNA_CONSOLE_SLOT            64
-#define LUNA_RESOURCE_SLOTS          65
+#define LUNA_LKL_THREAD_SLOTS        47
+#define LUNA_TIMER_SLOT              47
+#define LUNA_CONSOLE_SLOT            48
+#define LUNA_RESOURCE_SLOTS          49
 #define LUNA_RESOURCE_STACK_PAGES    64
 #define LUNA_RESOURCE_TLS_VALUE      ((seL4_Word)0x4c4b4c544c53504fULL)
-#define LUNA_SYNC_SLOTS              128
+#define LUNA_SYNC_SLOTS              96
 #define LUNA_ROOT_ALLOCATOR_POOL_SIZE (8UL * 1024UL * 1024UL)
 #define LUNA_RESTART_STRESS_ROUNDS   100
 #define LUNA_CHILD_HEAP_BASE          0x20000000UL
@@ -25,12 +25,22 @@
 #define LUNA_DISK_IO_BASE              0x24000000UL
 #define LUNA_DISK_IO_SIZE              (64UL * 1024UL)
 #define LUNA_DISK_IO_PAGES             (LUNA_DISK_IO_SIZE / 4096UL)
+#define LUNA_DISK_BATCH_SLOTS           15UL
+#define LUNA_DISK_BATCH_HEADER_SIZE     4096UL
+#define LUNA_DISK_BATCH_SLOT_SIZE       4096UL
+#define LUNA_DISK_BATCH_DATA_OFFSET     LUNA_DISK_BATCH_HEADER_SIZE
+#define LUNA_DISK_LOCAL_QUEUE_COUNT     8UL
 #define LUNA_NET_IO_BASE                0x25000000UL
 #define LUNA_NET_PACKET_SIZE            2048UL
-#define LUNA_NET_IO_SIZE                (2UL * 4096UL)
+#define LUNA_NET_BATCH_SLOTS             16UL
+#define LUNA_NET_BATCH_HEADER_SIZE       4096UL
+#define LUNA_NET_TX_OFFSET               LUNA_NET_BATCH_HEADER_SIZE
+#define LUNA_NET_RX_OFFSET               \
+    (LUNA_NET_TX_OFFSET + LUNA_NET_BATCH_SLOTS * LUNA_NET_PACKET_SIZE)
+#define LUNA_NET_IO_SIZE                 \
+    (LUNA_NET_RX_OFFSET + LUNA_NET_BATCH_SLOTS * LUNA_NET_PACKET_SIZE)
 #define LUNA_NET_IO_PAGES               (LUNA_NET_IO_SIZE / 4096UL)
-#define LUNA_NET_TX_OFFSET              0UL
-#define LUNA_NET_RX_OFFSET              4096UL
+#define LUNA_NET_CHILD_TX_QUEUE_COUNT    64UL
 #define LUNA_NET_MAC_WORD0              ((seL4_Word)0x12005452UL)
 #define LUNA_NET_MAC_WORD1              ((seL4_Word)0x00005634UL)
 #define LUNA_NET_STRESS_BURST            64UL
@@ -78,6 +88,26 @@ static inline unsigned luna_net_stats_unpack(seL4_Word stats,
     return (unsigned)((stats >> shift) & LUNA_NET_STATS_FIELD_MASK);
 }
 
+struct luna_net_batch_header {
+    volatile seL4_Word tx_count;
+    volatile seL4_Word rx_count;
+    volatile seL4_Word tx_lengths[LUNA_NET_BATCH_SLOTS];
+    volatile seL4_Word rx_lengths[LUNA_NET_BATCH_SLOTS];
+};
+
+struct luna_disk_batch_descriptor {
+    volatile seL4_Word event;
+    volatile seL4_Word offset;
+    volatile seL4_Word length;
+    volatile seL4_Word status;
+};
+
+struct luna_disk_batch_header {
+    volatile seL4_Word count;
+    volatile seL4_Word completed;
+    struct luna_disk_batch_descriptor descriptors[LUNA_DISK_BATCH_SLOTS];
+};
+
 enum luna_isolation_mode {
     LUNA_ISOLATION_MODE_FAULT = 1,
     LUNA_ISOLATION_MODE_CLEAN = 2,
@@ -119,6 +149,9 @@ enum luna_isolation_event {
     LUNA_ISOLATION_EVENT_NET_STATS = 0x209,
     LUNA_ISOLATION_EVENT_NET_TX_STATS = 0x20a,
     LUNA_ISOLATION_EVENT_NET_TX_STRESS = 0x20b,
+    LUNA_ISOLATION_EVENT_NET_TX_BATCH = 0x20c,
+    LUNA_ISOLATION_EVENT_NET_RX_BATCH = 0x20d,
+    LUNA_ISOLATION_EVENT_DISK_SUBMIT_BATCH = 0x20e,
     LUNA_ISOLATION_EVENT_PRIVATE_PAGE_VISIBLE = 0x1ff,
 };
 

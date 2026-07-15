@@ -40,8 +40,11 @@
 #define LUNA_STATIC_ARGC_MAX 16
 #define LUNA_STATIC_ARG_BYTES 1024
 #define LUNA_PIPELINE_BENCH_BYTES (1024UL * 1024UL)
+#define LUNA_PIPELINE_BENCH_SAMPLES 7U
 #define LUNA_BLOCK_BENCH_BYTES (1024UL * 1024UL)
 #define LUNA_BLOCK_BENCH_BLOCK 4096UL
+#define LUNA_STDIO_IO_CHUNK (64UL * 1024UL)
+#define LUNA_STDIO_GETC_BUFFER (16UL * 1024UL)
 #define LUNA_BLOCK_BENCH_OPS \
     (LUNA_BLOCK_BENCH_BYTES / LUNA_BLOCK_BENCH_BLOCK)
 
@@ -93,6 +96,20 @@ static volatile size_t task_user_heap_current;
 static volatile size_t task_user_heap_peak;
 static volatile unsigned task_static_current;
 static volatile unsigned task_static_peak;
+static volatile int task_stdio_benchmarking;
+static volatile unsigned long long task_stdio_read_calls;
+static volatile unsigned long long task_stdio_read_bytes;
+static volatile unsigned long long task_stdio_write_calls;
+static volatile unsigned long long task_stdio_write_bytes;
+
+static void task_stdio_record(volatile unsigned long long *calls,
+                              volatile unsigned long long *bytes,
+                              ssize_t result)
+{
+    if (!task_stdio_benchmarking || result < 0) return;
+    __atomic_fetch_add(calls, 1ULL, __ATOMIC_RELAXED);
+    __atomic_fetch_add(bytes, (unsigned long long)result, __ATOMIC_RELAXED);
+}
 
 struct task_static_worker {
     volatile int in_use;
@@ -108,6 +125,9 @@ struct task_static_worker {
     int argc;
     char *argv[LUNA_STATIC_ARGC_MAX + 1];
     char argument_data[LUNA_STATIC_ARG_BYTES];
+    size_t stdin_buffer_offset;
+    size_t stdin_buffer_length;
+    unsigned char stdin_buffer[LUNA_STDIO_GETC_BUFFER];
 };
 
 static struct task_static_worker task_static_workers[LUNA_STATIC_WORKERS];
@@ -330,7 +350,10 @@ int luna_bb_close(int fd)
 {
     struct task_static_worker *worker = bb_current_worker();
     int actual = bb_fd(fd);
-    if (worker && fd >= 0 && fd < 3) worker->fd_map[fd] = -1;
+    if (worker && fd >= 0 && fd < 3) {
+        worker->fd_map[fd] = -1;
+        if (!fd) worker->stdin_buffer_offset = worker->stdin_buffer_length = 0;
+    }
     if (actual < 0) {
         task_user_errno = EBADF;
         return -1;
@@ -340,18 +363,38 @@ int luna_bb_close(int fd)
 
 ssize_t luna_bb_read(int fd, void *buffer, size_t count)
 {
+    if (!count) return 0;
     int actual = bb_fd(fd);
     if (actual < 0) return (ssize_t)bb_result(-LKL_EBADF);
-    return (ssize_t)bb_result(lkl_sys_read((unsigned int)actual,
-                                           buffer, count));
+    size_t buffered = 0;
+    struct task_static_worker *worker = bb_current_worker();
+    if (worker && !fd && worker->stdin_buffer_offset <
+                            worker->stdin_buffer_length) {
+        size_t available = worker->stdin_buffer_length -
+                           worker->stdin_buffer_offset;
+        buffered = count < available ? count : available;
+        memcpy(buffer, worker->stdin_buffer + worker->stdin_buffer_offset,
+               buffered);
+        worker->stdin_buffer_offset += buffered;
+        if (buffered == count) return (ssize_t)buffered;
+    }
+    ssize_t result = (ssize_t)bb_result(lkl_sys_read(
+        (unsigned int)actual, (unsigned char *)buffer + buffered,
+        count - buffered));
+    task_stdio_record(&task_stdio_read_calls, &task_stdio_read_bytes, result);
+    return result < 0 ? (buffered ? (ssize_t)buffered : result) :
+                        (ssize_t)buffered + result;
 }
 
 ssize_t luna_bb_write(int fd, const void *buffer, size_t count)
 {
     int actual = bb_fd(fd);
     if (actual < 0) return (ssize_t)bb_result(-LKL_EBADF);
-    return (ssize_t)bb_result(lkl_sys_write((unsigned int)actual,
-                                            (void *)buffer, count));
+    ssize_t result = (ssize_t)bb_result(lkl_sys_write((unsigned int)actual,
+                                                      (void *)buffer, count));
+    task_stdio_record(&task_stdio_write_calls, &task_stdio_write_bytes,
+                      result);
+    return result;
 }
 
 static int bb_write_all(int fd, const void *buffer, size_t count)
@@ -417,6 +460,17 @@ static struct luna_bb_file *bb_file_object(FILE *stream)
     struct luna_bb_file *file = (void *)stream;
     return file && stream != stdin && stream != stdout && stream != stderr &&
            file->magic == LUNA_BB_FILE_MAGIC ? file : NULL;
+}
+
+static ssize_t bb_stream_read(struct luna_bb_file *file, int fd,
+                              void *buffer, size_t count)
+{
+    if (!file) return luna_bb_read(fd, buffer, count);
+    long raw = lkl_sys_read((unsigned int)file->fd, buffer, count);
+    if (raw < 0) return (ssize_t)bb_result(raw);
+    task_stdio_record(&task_stdio_read_calls, &task_stdio_read_bytes,
+                      (ssize_t)raw);
+    return (ssize_t)raw;
 }
 
 static int bb_mode_flags(const char *mode)
@@ -510,16 +564,25 @@ int luna_bb_getc(FILE *stream)
         file->eof = 0;
         return value;
     }
+    if (!file && stream == stdin) {
+        struct task_static_worker *worker = bb_current_worker();
+        if (worker) {
+            if (worker->stdin_buffer_offset == worker->stdin_buffer_length) {
+                ssize_t filled = luna_bb_read(
+                    fd, worker->stdin_buffer, sizeof(worker->stdin_buffer));
+                if (filled <= 0) return EOF;
+                worker->stdin_buffer_offset = 0;
+                worker->stdin_buffer_length = (size_t)filled;
+            }
+            return worker->stdin_buffer[worker->stdin_buffer_offset++];
+        }
+    }
     unsigned char value;
-    long result = file ? lkl_sys_read((unsigned int)fd, (char *)&value, 1) :
-                         luna_bb_read(fd, &value, 1);
+    ssize_t result = bb_stream_read(file, fd, &value, 1);
     if (result == 1) return value;
     if (file) {
         if (result == 0) file->eof = 1;
-        else {
-            file->error = 1;
-            bb_result(result);
-        }
+        else file->error = 1;
     }
     return EOF;
 }
@@ -546,13 +609,37 @@ int luna_bb_ungetc(int character, FILE *stream)
 size_t luna_bb_fread(void *buffer, size_t size, size_t count, FILE *stream)
 {
     if (!size || !count) return 0;
+    if (count > SIZE_MAX / size) {
+        task_user_errno = EOVERFLOW;
+        struct luna_bb_file *overflow_file = bb_file_object(stream);
+        if (overflow_file) overflow_file->error = 1;
+        return 0;
+    }
+    struct luna_bb_file *file = bb_file_object(stream);
+    int fd = luna_bb_fileno(stream);
+    if (fd < 0) return 0;
     unsigned char *cursor = buffer;
     size_t bytes = size * count;
     size_t read_count = 0;
+    if (file && file->ungot >= 0) {
+        cursor[read_count++] = (unsigned char)file->ungot;
+        file->ungot = -1;
+        file->eof = 0;
+    }
     while (read_count < bytes) {
-        int value = luna_bb_getc(stream);
-        if (value == EOF) break;
-        cursor[read_count++] = (unsigned char)value;
+        size_t remaining = bytes - read_count;
+        size_t chunk = remaining < LUNA_STDIO_IO_CHUNK ? remaining :
+                       LUNA_STDIO_IO_CHUNK;
+        ssize_t result = bb_stream_read(file, fd, cursor + read_count, chunk);
+        if (result <= 0) {
+            if (file) {
+                if (!result) file->eof = 1;
+                else file->error = 1;
+            }
+            break;
+        }
+        read_count += (size_t)result;
+        if ((size_t)result < chunk) break;
     }
     return read_count / size;
 }
@@ -561,13 +648,22 @@ size_t luna_bb_fwrite(const void *buffer, size_t size, size_t count,
                       FILE *stream)
 {
     if (!size || !count) return 0;
+    if (count > SIZE_MAX / size) {
+        task_user_errno = EOVERFLOW;
+        struct luna_bb_file *overflow_file = bb_file_object(stream);
+        if (overflow_file) overflow_file->error = 1;
+        return 0;
+    }
     int fd = luna_bb_fileno(stream);
     if (fd < 0) return 0;
     size_t bytes = size * count;
     const unsigned char *cursor = buffer;
     size_t written = 0;
     while (written < bytes) {
-        ssize_t result = luna_bb_write(fd, cursor + written, bytes - written);
+        size_t remaining = bytes - written;
+        size_t chunk = remaining < LUNA_STDIO_IO_CHUNK ? remaining :
+                       LUNA_STDIO_IO_CHUNK;
+        ssize_t result = luna_bb_write(fd, cursor + written, chunk);
         if (result <= 0) break;
         written += (size_t)result;
     }
@@ -772,8 +868,16 @@ void luna_bb_clearerr(FILE *stream)
 
 off_t luna_bb_lseek(int fd, off_t offset, int whence)
 {
-    return (off_t)bb_result(lkl_sys_lseek((unsigned int)bb_fd(fd),
-                                          offset, whence));
+    struct task_static_worker *worker = bb_current_worker();
+    if (worker && !fd && worker->stdin_buffer_offset <
+                            worker->stdin_buffer_length) {
+        if (whence == SEEK_CUR)
+            offset -= (off_t)(worker->stdin_buffer_length -
+                              worker->stdin_buffer_offset);
+        worker->stdin_buffer_offset = worker->stdin_buffer_length = 0;
+    }
+    return (off_t)bb_result(lkl_sys_lseek((unsigned int)bb_fd(fd), offset,
+                                          whence));
 }
 
 int luna_bb_dup(int fd)
@@ -791,6 +895,8 @@ int luna_bb_dup2(int oldfd, int newfd)
         if (worker->fd_map[newfd] >= 0)
             lkl_sys_close((unsigned int)worker->fd_map[newfd]);
         worker->fd_map[newfd] = (int)duplicate;
+        if (!newfd)
+            worker->stdin_buffer_offset = worker->stdin_buffer_length = 0;
         return newfd;
     }
     return (int)bb_result(lkl_sys_dup3((unsigned int)bb_fd(oldfd),
@@ -1528,6 +1634,8 @@ static struct task_static_worker *task_static_allocate(void)
             worker->status = 255;
             worker->error_number = 0;
             worker->getopt_locked = 0;
+            worker->stdin_buffer_offset = 0;
+            worker->stdin_buffer_length = 0;
             for (int fd = 0; fd < 3; fd++) worker->fd_map[fd] = -1;
             unsigned current = __atomic_add_fetch(&task_static_current, 1U,
                                                   __ATOMIC_RELAXED);
@@ -1809,6 +1917,26 @@ static void task_user_heap_reset(void)
     task_user_heap_head->free = 1;
 }
 
+static int task_block_drop_cache(int fd)
+{
+    lkl_sys_sync();
+    long drop = lkl_sys_open("/proc/sys/vm/drop_caches", LKL_O_WRONLY, 0);
+    if (drop >= 0) {
+        static const char command[] = "3\n";
+        long written = lkl_sys_write((unsigned int)drop, (void *)command,
+                                     sizeof(command) - 1U);
+        long closed = lkl_sys_close((unsigned int)drop);
+        if (written == (long)(sizeof(command) - 1U) && !closed) return 0;
+    }
+    long parameters[6] = {
+        fd, 0, (long)LUNA_BLOCK_BENCH_BYTES, 4 /* POSIX_FADV_DONTNEED */
+    };
+    long result = lkl_syscall(__lkl__NR_fadvise64, parameters);
+    if (result < 0)
+        lkl_printf("luna-lkl-task: block cache drop failed: %ld\n", result);
+    return result < 0 ? -1 : 0;
+}
+
 static int task_block_benchmark(void)
 {
     static const char path[] = "/luna-block-benchmark";
@@ -1834,7 +1962,7 @@ static int task_block_benchmark(void)
         for (size_t i = 0; i < sizeof(buffer); i++)
             if ((unsigned char)buffer[i] != (unsigned char)block) goto fail;
     }
-    unsigned long long sequential_read = luna_lkl_task_time() - start;
+    unsigned long long hot_read = luna_lkl_task_time() - start;
 
     start = luna_lkl_task_time();
     for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
@@ -1864,13 +1992,25 @@ static int task_block_benchmark(void)
                 (unsigned char)(block ^ 0xa5U)) goto fail;
     }
     unsigned long long random_read = luna_lkl_task_time() - start;
+
+    if (task_block_drop_cache((int)fd) ||
+        lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
+    start = luna_lkl_task_time();
+    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
+        if (lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
+            (long)sizeof(buffer)) goto fail;
+        for (size_t i = 0; i < sizeof(buffer); i++)
+            if ((unsigned char)buffer[i] !=
+                (unsigned char)(block ^ 0xa5U)) goto fail;
+    }
+    unsigned long long cold_read = luna_lkl_task_time() - start;
     if (lkl_sys_close((unsigned int)fd) || !sequential_write ||
-        !sequential_read || !random_write || !random_read) return -1;
+        !cold_read || !hot_read || !random_write || !random_read) return -1;
     lkl_printf("LUNA_BLOCK_BENCHMARK_OK bytes=%lu seq_write_ns=%llu "
-               "seq_read_ns=%llu random_ops=%lu random_write_ns=%llu "
-               "random_read_ns=%llu\n",
+               "cold_read_ns=%llu hot_read_ns=%llu random_ops=%lu "
+               "random_write_ns=%llu random_read_ns=%llu\n",
                (unsigned long)LUNA_BLOCK_BENCH_BYTES, sequential_write,
-               sequential_read, (unsigned long)LUNA_BLOCK_BENCH_OPS,
+               cold_read, hot_read, (unsigned long)LUNA_BLOCK_BENCH_OPS,
                random_write, random_read);
     return 0;
 
@@ -1898,27 +2038,72 @@ static int task_pipeline_benchmark(void)
     }
     if (lkl_sys_close((unsigned int)fd)) return -1;
 
-    char *cat_argv[] = { "cat", (char *)path, NULL };
-    char dd_output[] = "of=/run/luna-pipeline-output";
-    char *dd_argv[] = { "dd", dd_output, "bs=4096", NULL };
-    char **commands[] = { cat_argv, dd_argv };
-    unsigned long long start = luna_lkl_task_time();
-    int result = luna_bb_run_pipeline(2, commands);
-    unsigned long long elapsed = luna_lkl_task_time() - start;
-    lkl_sys_unlink(path);
+    unsigned long long samples[LUNA_PIPELINE_BENCH_SAMPLES];
+    task_stdio_read_calls = 0;
+    task_stdio_read_bytes = 0;
+    task_stdio_write_calls = 0;
+    task_stdio_write_bytes = 0;
+    task_stdio_benchmarking = 1;
+    int result = 0;
+    for (unsigned sample = 0; sample < LUNA_PIPELINE_BENCH_SAMPLES;
+         sample++) {
+        char *cat_argv[] = { "cat", (char *)path, NULL };
+        char dd_output[] = "of=/run/luna-pipeline-output";
+        char *dd_argv[] = { "dd", dd_output, "bs=65536", NULL };
+        char **commands[] = { cat_argv, dd_argv };
+        unsigned long long start = luna_lkl_task_time();
+        result = luna_bb_run_pipeline(2, commands);
+        samples[sample] = luna_lkl_task_time() - start;
+        if (result || !samples[sample]) {
+            result = -1;
+            break;
+        }
+        lkl_printf("LUNA_PIPELINE_SAMPLE ns=%llu\n", samples[sample]);
+    }
+    task_stdio_benchmarking = 0;
     struct lkl_stat output_stat;
-    if (result || !elapsed || lkl_sys_stat(output_path, &output_stat) ||
+    if (result || lkl_sys_stat(output_path, &output_stat) ||
         output_stat.st_size != LUNA_PIPELINE_BENCH_BYTES) {
         lkl_sys_unlink(output_path);
         return -1;
     }
     lkl_sys_unlink(output_path);
+
+    /* Exercise the FILE-backed consumer that previously fell into a
+     * byte-at-a-time fread/getc loop. */
+    char *cat_argv[] = { "cat", (char *)path, NULL };
+    char *wc_argv[] = { "wc", "-c", NULL };
+    char **wc_commands[] = { cat_argv, wc_argv };
+    if (luna_bb_run_pipeline(2, wc_commands)) {
+        lkl_sys_unlink(path);
+        return -1;
+    }
+    lkl_sys_unlink(path);
+
+    unsigned long long ordered[LUNA_PIPELINE_BENCH_SAMPLES];
+    memcpy(ordered, samples, sizeof(ordered));
+    for (unsigned i = 1; i < LUNA_PIPELINE_BENCH_SAMPLES; i++) {
+        unsigned long long value = ordered[i];
+        unsigned j = i;
+        while (j && ordered[j - 1] > value) {
+            ordered[j] = ordered[j - 1];
+            j--;
+        }
+        ordered[j] = value;
+    }
+    unsigned long long p50 = ordered[(LUNA_PIPELINE_BENCH_SAMPLES - 1) / 2];
+    unsigned long long p95 = ordered[LUNA_PIPELINE_BENCH_SAMPLES - 1];
+    unsigned long long p99 = p95;
     unsigned long long bytes_per_second =
-        (LUNA_PIPELINE_BENCH_BYTES * 1000000000ULL) / elapsed;
+        (LUNA_PIPELINE_BENCH_BYTES * 1000000000ULL) / p50;
     lkl_printf("LUNA_PIPELINE_BENCHMARK_OK bytes=%lu elapsed_ns=%llu "
-               "bytes_per_sec=%llu\n",
-               (unsigned long)LUNA_PIPELINE_BENCH_BYTES, elapsed,
-               bytes_per_second);
+               "bytes_per_sec=%llu samples=%u p50_ns=%llu p95_ns=%llu "
+               "p99_ns=%llu read_calls=%llu read_bytes=%llu "
+               "write_calls=%llu write_bytes=%llu\n",
+               (unsigned long)LUNA_PIPELINE_BENCH_BYTES, p50,
+               bytes_per_second, LUNA_PIPELINE_BENCH_SAMPLES, p50, p95,
+               p99, task_stdio_read_calls, task_stdio_read_bytes,
+               task_stdio_write_calls, task_stdio_write_bytes);
     return 0;
 }
 

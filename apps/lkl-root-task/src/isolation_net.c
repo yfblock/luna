@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Manager-owned QEMU virtio-net backend. The child only receives two bounded
- * packet pages; PCI I/O authority and all DMA memory stay in the root manager.
+ * Manager-owned QEMU virtio-net backend. The child only receives a bounded
+ * packet batch window; PCI I/O authority and all DMA memory stay in the root
+ * manager.
  */
 #include "luna_network_manager.h"
 
@@ -32,7 +33,8 @@
 #define LUNA_NET_PCI_DEVICE_ID 0x1000U
 #define LUNA_NET_RX_DMA_COUNT 64U
 #define LUNA_NET_RX_QUEUE_COUNT 32U
-#define LUNA_NET_TX_QUEUE_COUNT 16U
+#define LUNA_NET_TX_QUEUE_COUNT 64U
+#define LUNA_NET_TX_DMA_COUNT 16U
 #define LUNA_NET_POLL_PRIORITY 100U
 #define LUNA_NET_POLL_STACK_PAGES 8U
 #define LUNA_NET_IRQ_PRIORITY 100U
@@ -50,6 +52,7 @@ struct luna_dma_buffer {
     void *virt;
     uintptr_t phys;
     int in_use;
+    unsigned queue_index;
 };
 
 struct luna_rx_packet {
@@ -66,14 +69,15 @@ struct luna_network_state {
     ps_io_ops_t io_ops;
     struct eth_driver driver;
     struct luna_dma_buffer rx_dma[LUNA_NET_RX_DMA_COUNT];
-    struct luna_dma_buffer tx_dma;
+    struct luna_dma_buffer tx_dma[LUNA_NET_TX_DMA_COUNT];
     struct luna_rx_packet rx_queue[LUNA_NET_RX_QUEUE_COUNT];
     struct luna_tx_packet tx_queue[LUNA_NET_TX_QUEUE_COUNT];
     volatile unsigned rx_head;
     volatile unsigned rx_tail;
     volatile unsigned tx_head;
     volatile unsigned tx_tail;
-    volatile int tx_pending;
+    volatile unsigned tx_submit;
+    volatile unsigned tx_pending;
     volatile int tx_stress_gate;
     volatile int child_active;
     volatile int poll_in_driver;
@@ -89,6 +93,15 @@ struct luna_network_state {
     volatile uint64_t tx_backpressure;
     volatile uint64_t tx_driver_retries;
     volatile uint64_t tx_completed;
+    volatile uint64_t tx_endpoint_requests;
+    volatile uint64_t tx_endpoint_batches;
+    volatile uint64_t tx_endpoint_packets;
+    volatile uint64_t tx_shared_copies;
+    volatile uint64_t tx_kicks;
+    volatile uint64_t rx_endpoint_requests;
+    volatile uint64_t rx_endpoint_batches;
+    volatile uint64_t rx_endpoint_packets;
+    volatile uint64_t rx_shared_copies;
     volatile uint64_t irq_count;
     volatile uint64_t irq_kick_polls;
     volatile uint64_t fallback_polls;
@@ -258,41 +271,66 @@ static void receive_complete(void *cookie, unsigned int num_buffers,
 static void transmit_complete(void *cookie, void *buffer_cookie)
 {
     struct luna_network_state *state = cookie;
-    if (buffer_cookie == &state->tx_dma) {
-        unsigned tail = __atomic_load_n(&state->tx_tail, __ATOMIC_RELAXED);
-        state->tx_queue[tail].length = 0;
-        tail = (tail + 1U) % LUNA_NET_TX_QUEUE_COUNT;
-        __atomic_store_n(&state->tx_tail, tail, __ATOMIC_RELEASE);
-        __atomic_fetch_add(&state->tx_completed, 1, __ATOMIC_RELAXED);
-        __atomic_store_n(&state->tx_pending, 0, __ATOMIC_RELEASE);
+    struct luna_dma_buffer *buffer = NULL;
+    for (unsigned i = 0; i < LUNA_NET_TX_DMA_COUNT; i++) {
+        if (buffer_cookie == &state->tx_dma[i]) {
+            buffer = &state->tx_dma[i];
+            break;
+        }
     }
+    if (!buffer || !buffer->in_use ||
+        buffer->queue_index >= LUNA_NET_TX_QUEUE_COUNT) return;
+    state->tx_queue[buffer->queue_index].length = 0;
+    buffer->in_use = 0;
+    __atomic_fetch_add(&state->tx_completed, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&state->tx_pending, 1U, __ATOMIC_ACQ_REL);
+    unsigned tail = __atomic_load_n(&state->tx_tail, __ATOMIC_RELAXED);
+    unsigned head = __atomic_load_n(&state->tx_head, __ATOMIC_ACQUIRE);
+    while (tail != head && !state->tx_queue[tail].length) {
+        tail = (tail + 1U) % LUNA_NET_TX_QUEUE_COUNT;
+    }
+    __atomic_store_n(&state->tx_tail, tail, __ATOMIC_RELEASE);
 }
 
 static void process_tx_queue(struct luna_network_state *state)
 {
     if (__atomic_load_n(&state->tx_stress_gate, __ATOMIC_ACQUIRE))
         return;
-    if (__atomic_load_n(&state->tx_pending, __ATOMIC_ACQUIRE))
-        return;
-    unsigned tail = __atomic_load_n(&state->tx_tail, __ATOMIC_RELAXED);
-    unsigned head = __atomic_load_n(&state->tx_head, __ATOMIC_ACQUIRE);
-    if (tail == head) return;
-    struct luna_tx_packet *packet = &state->tx_queue[tail];
-    size_t length = packet->length;
-    if (!length || length > LUNA_NET_PACKET_SIZE) return;
-    memcpy(state->tx_dma.virt, packet->data, length);
-    uintptr_t phys = state->tx_dma.phys;
-    unsigned int packet_length = (unsigned int)length;
-    __atomic_store_n(&state->tx_pending, 1, __ATOMIC_RELEASE);
-    int result = state->driver.i_fn.raw_tx(&state->driver, 1, &phys,
-                                           &packet_length,
-                                           &state->tx_dma);
-    if (result == ETHIF_TX_FAILED) {
-        __atomic_store_n(&state->tx_pending, 0, __ATOMIC_RELEASE);
-        __atomic_fetch_add(&state->tx_driver_retries, 1,
-                           __ATOMIC_RELAXED);
-    } else if (result == ETHIF_TX_COMPLETE) {
-        transmit_complete(state, &state->tx_dma);
+    for (;;) {
+        unsigned submit = __atomic_load_n(&state->tx_submit,
+                                           __ATOMIC_RELAXED);
+        unsigned head = __atomic_load_n(&state->tx_head, __ATOMIC_ACQUIRE);
+        if (submit == head) return;
+        struct luna_dma_buffer *buffer = NULL;
+        for (unsigned i = 0; i < LUNA_NET_TX_DMA_COUNT; i++) {
+            if (!state->tx_dma[i].in_use) {
+                buffer = &state->tx_dma[i];
+                break;
+            }
+        }
+        if (!buffer) return;
+        struct luna_tx_packet *packet = &state->tx_queue[submit];
+        size_t length = packet->length;
+        if (!length || length > LUNA_NET_PACKET_SIZE) return;
+        memcpy(buffer->virt, packet->data, length);
+        uintptr_t phys = buffer->phys;
+        unsigned int packet_length = (unsigned int)length;
+        buffer->queue_index = submit;
+        buffer->in_use = 1;
+        unsigned next = (submit + 1U) % LUNA_NET_TX_QUEUE_COUNT;
+        __atomic_store_n(&state->tx_submit, next, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&state->tx_pending, 1U, __ATOMIC_ACQ_REL);
+        int result = state->driver.i_fn.raw_tx(&state->driver, 1, &phys,
+                                               &packet_length, buffer);
+        if (result == ETHIF_TX_FAILED) {
+            __atomic_store_n(&state->tx_submit, submit, __ATOMIC_RELEASE);
+            __atomic_fetch_sub(&state->tx_pending, 1U, __ATOMIC_ACQ_REL);
+            buffer->in_use = 0;
+            __atomic_fetch_add(&state->tx_driver_retries, 1,
+                               __ATOMIC_RELAXED);
+            return;
+        }
+        if (result == ETHIF_TX_COMPLETE) transmit_complete(state, buffer);
     }
 }
 
@@ -569,14 +607,21 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
                bar0);
         return -1;
     }
-    dma_addr_t tx = dma_alloc_pin(&network.io_ops.dma_manager,
-                                  LUNA_NET_PACKET_SIZE, 1, 16);
-    if (!tx.virt || !tx.phys || init_shared_window(manager_vspace)) {
-        printf("luna: manager network DMA/window allocation failed\n");
+    for (unsigned i = 0; i < LUNA_NET_TX_DMA_COUNT; i++) {
+        dma_addr_t tx = dma_alloc_pin(&network.io_ops.dma_manager,
+                                      LUNA_NET_PACKET_SIZE, 1, 16);
+        if (!tx.virt || !tx.phys) {
+            printf("luna: manager network TX DMA allocation failed "
+                   "slot=%u\n", i);
+            return -1;
+        }
+        network.tx_dma[i].virt = tx.virt;
+        network.tx_dma[i].phys = tx.phys;
+    }
+    if (init_shared_window(manager_vspace)) {
+        printf("luna: manager network window allocation failed\n");
         return -1;
     }
-    network.tx_dma.virt = tx.virt;
-    network.tx_dma.phys = tx.phys;
     network.mac[0] = 0x52;
     network.mac[1] = 0x54;
     network.mac[2] = 0x00;
@@ -679,6 +724,7 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.rx_tail, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_head, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_tail, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_submit, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.notification_masked, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.rx_drops, 0, __ATOMIC_RELEASE);
@@ -689,12 +735,25 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.tx_backpressure, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_driver_retries, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_completed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_endpoint_requests, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_endpoint_batches, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_endpoint_packets, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_shared_copies, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_kicks, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.rx_endpoint_requests, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.rx_endpoint_batches, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.rx_endpoint_packets, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.rx_shared_copies, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_stress_gate, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_count, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_kick_polls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.fallback_polls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_errors, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_pending, 0, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < LUNA_NET_TX_DMA_COUNT; i++) {
+        network.tx_dma[i].in_use = 0;
+        network.tx_dma[i].queue_index = 0;
+    }
     __atomic_store_n(&network.child_active, activate != 0,
                      __ATOMIC_RELEASE);
     if (activate) seL4_Signal(network.poll_kick_ntfn.cptr);
@@ -739,6 +798,28 @@ int luna_network_verify_irq(void)
                network.irq_line, (unsigned long long)interrupts,
                (unsigned long long)kick_polls,
                (unsigned long long)fallback_polls);
+        printf("LUNA_NET_MANAGER_COUNTERS tx_ipc=%llu tx_batches=%llu "
+               "tx_packets=%llu tx_copies=%llu tx_kicks=%llu "
+               "rx_ipc=%llu rx_batches=%llu rx_packets=%llu "
+               "rx_copies=%llu\n",
+               (unsigned long long)__atomic_load_n(
+                   &network.tx_endpoint_requests, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.tx_endpoint_batches, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.tx_endpoint_packets, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.tx_shared_copies, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.tx_kicks, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.rx_endpoint_requests, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.rx_endpoint_batches, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.rx_endpoint_packets, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &network.rx_shared_copies, __ATOMIC_ACQUIRE));
         return 0;
     }
     if (!fallback_polls) return -1;
@@ -748,29 +829,49 @@ int luna_network_verify_irq(void)
     return 0;
 }
 
-static int service_tx(size_t length)
+static int service_tx_batch(size_t requested, seL4_Word *response)
 {
-    if (!length || length > LUNA_NET_PACKET_SIZE ||
+    struct luna_net_batch_header *header = network.io_mapping;
+    __atomic_fetch_add(&network.tx_endpoint_requests, 1,
+                       __ATOMIC_RELAXED);
+    if (!requested || requested > LUNA_NET_BATCH_SLOTS ||
+        header->tx_count != requested ||
         !__atomic_load_n(&network.child_active, __ATOMIC_ACQUIRE))
         return -1;
     unsigned head = __atomic_load_n(&network.tx_head, __ATOMIC_RELAXED);
     unsigned tail = __atomic_load_n(&network.tx_tail, __ATOMIC_ACQUIRE);
-    unsigned next = (head + 1U) % LUNA_NET_TX_QUEUE_COUNT;
-    if (next == tail) {
+    unsigned used = (head + LUNA_NET_TX_QUEUE_COUNT - tail) %
+                    LUNA_NET_TX_QUEUE_COUNT;
+    unsigned available = LUNA_NET_TX_QUEUE_COUNT - 1U - used;
+    unsigned accepted = requested < available ? (unsigned)requested :
+                        available;
+    if (!accepted) {
         __atomic_fetch_add(&network.tx_backpressure, 1, __ATOMIC_RELAXED);
         if (__atomic_exchange_n(&network.tx_stress_gate, 0,
-                                __ATOMIC_ACQ_REL))
+                                __ATOMIC_ACQ_REL)) {
             seL4_Signal(network.poll_kick_ntfn.cptr);
-        return LUNA_NET_TX_RETRY;
+            __atomic_fetch_add(&network.tx_kicks, 1, __ATOMIC_RELAXED);
+        }
+        *response = 0;
+        return 0;
     }
-    struct luna_tx_packet *packet = &network.tx_queue[head];
-    memcpy(packet->data,
-           (unsigned char *)network.io_mapping + LUNA_NET_TX_OFFSET,
-           length);
-    packet->length = length;
-    __atomic_store_n(&network.tx_head, next, __ATOMIC_RELEASE);
-    unsigned used = (next + LUNA_NET_TX_QUEUE_COUNT - tail) %
-                    LUNA_NET_TX_QUEUE_COUNT;
+    for (unsigned i = 0; i < accepted; i++) {
+        size_t length = (size_t)header->tx_lengths[i];
+        if (!length || length > LUNA_NET_PACKET_SIZE) return -1;
+    }
+    int was_empty = head == tail;
+    for (unsigned i = 0; i < accepted; i++) {
+        size_t length = (size_t)header->tx_lengths[i];
+        struct luna_tx_packet *packet = &network.tx_queue[head];
+        memcpy(packet->data,
+               (unsigned char *)network.io_mapping + LUNA_NET_TX_OFFSET +
+                   i * LUNA_NET_PACKET_SIZE,
+               length);
+        packet->length = length;
+        head = (head + 1U) % LUNA_NET_TX_QUEUE_COUNT;
+    }
+    __atomic_store_n(&network.tx_head, head, __ATOMIC_RELEASE);
+    used += accepted;
     uint64_t high_water = __atomic_load_n(&network.tx_high_water,
                                            __ATOMIC_RELAXED);
     while (used > high_water &&
@@ -778,31 +879,80 @@ static int service_tx(size_t length)
                                         &high_water, used, false,
                                         __ATOMIC_RELAXED,
                                         __ATOMIC_RELAXED)) { }
-    seL4_Signal(network.poll_kick_ntfn.cptr);
+    __atomic_fetch_add(&network.tx_endpoint_batches, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&network.tx_endpoint_packets, accepted,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&network.tx_shared_copies, accepted,
+                       __ATOMIC_RELAXED);
+    if (was_empty) {
+        seL4_Signal(network.poll_kick_ntfn.cptr);
+        __atomic_fetch_add(&network.tx_kicks, 1, __ATOMIC_RELAXED);
+    }
+    *response = accepted;
+    return 0;
+}
+
+static int service_tx(size_t length)
+{
+    struct luna_net_batch_header *header = network.io_mapping;
+    if (!length || length > LUNA_NET_PACKET_SIZE) return -1;
+    header->tx_count = 1;
+    header->tx_lengths[0] = length;
+    seL4_Word accepted = 0;
+    int result = service_tx_batch(1, &accepted);
+    return result || !accepted ? LUNA_NET_TX_RETRY : 0;
+}
+
+static int service_rx_batch(size_t requested, seL4_Word *response)
+{
+    __atomic_fetch_add(&network.rx_endpoint_requests, 1,
+                       __ATOMIC_RELAXED);
+    if (!requested || requested > LUNA_NET_BATCH_SLOTS) return -1;
+    struct luna_net_batch_header *header = network.io_mapping;
+    unsigned tail = __atomic_load_n(&network.rx_tail, __ATOMIC_RELAXED);
+    unsigned head = __atomic_load_n(&network.rx_head, __ATOMIC_ACQUIRE);
+    if (tail == head) {
+        __atomic_fetch_add(&network.rx_empty_fetches, 1, __ATOMIC_RELAXED);
+        header->rx_count = 0;
+        *response = 0;
+        return 0;
+    }
+    unsigned count = 0;
+    while (tail != head && count < requested) {
+        struct luna_rx_packet *packet = &network.rx_queue[tail];
+        if (!packet->length || packet->length > LUNA_NET_PACKET_SIZE)
+            return -1;
+        memcpy((unsigned char *)network.io_mapping + LUNA_NET_RX_OFFSET +
+                   count * LUNA_NET_PACKET_SIZE,
+               packet->data, packet->length);
+        header->rx_lengths[count] = packet->length;
+        packet->length = 0;
+        tail = (tail + 1U) % LUNA_NET_RX_QUEUE_COUNT;
+        count++;
+    }
+    header->rx_count = count;
+    *response = count;
+    __atomic_store_n(&network.rx_tail, tail, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&network.rx_endpoint_batches, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&network.rx_endpoint_packets, count,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&network.rx_shared_copies, count, __ATOMIC_RELAXED);
+    if (tail != __atomic_load_n(&network.rx_head, __ATOMIC_ACQUIRE))
+        signal_rx(&network);
     return 0;
 }
 
 static int service_rx(seL4_Word *response)
 {
-    unsigned tail = __atomic_load_n(&network.rx_tail, __ATOMIC_RELAXED);
-    unsigned head = __atomic_load_n(&network.rx_head, __ATOMIC_ACQUIRE);
-    if (tail == head) {
-        __atomic_fetch_add(&network.rx_empty_fetches, 1, __ATOMIC_RELAXED);
+    seL4_Word packets = 0;
+    int result = service_rx_batch(1, &packets);
+    if (result || !packets) {
         *response = 0;
-        return 0;
+        return result;
     }
-    struct luna_rx_packet *packet = &network.rx_queue[tail];
-    if (!packet->length || packet->length > LUNA_NET_PACKET_SIZE)
-        return -1;
-    memcpy((unsigned char *)network.io_mapping + LUNA_NET_RX_OFFSET,
-           packet->data, packet->length);
-    *response = packet->length;
-    packet->length = 0;
-    tail = (tail + 1U) % LUNA_NET_RX_QUEUE_COUNT;
-    __atomic_store_n(&network.rx_tail, tail, __ATOMIC_RELEASE);
-    __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
-    if (tail != __atomic_load_n(&network.rx_head, __ATOMIC_ACQUIRE))
-        signal_rx(&network);
+    struct luna_net_batch_header *header = network.io_mapping;
+    *response = header->rx_lengths[0];
     return 0;
 }
 
@@ -881,8 +1031,12 @@ int luna_network_service(seL4_CPtr command_ep, seL4_Word event,
     if (network.ready) {
         if (event == LUNA_ISOLATION_EVENT_NET_TX)
             error = service_tx((size_t)length_word);
+        else if (event == LUNA_ISOLATION_EVENT_NET_TX_BATCH)
+            error = service_tx_batch((size_t)length_word, &response);
         else if (event == LUNA_ISOLATION_EVENT_NET_RX && !length_word)
             error = service_rx(&response);
+        else if (event == LUNA_ISOLATION_EVENT_NET_RX_BATCH)
+            error = service_rx_batch((size_t)length_word, &response);
         else if (event == LUNA_ISOLATION_EVENT_NET_WAKE && !length_word) {
             seL4_Signal(network.rx_ntfn.cptr);
             error = 0;

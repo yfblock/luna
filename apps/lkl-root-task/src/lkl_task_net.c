@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Child-side LKL virtio-net backend. Ethernet packets cross only two bounded
- * shared pages and a validated manager Endpoint protocol; PCI/DMA stay out of
- * the child CSpace.
+ * Child-side LKL virtio-net backend. Ethernet packets cross a bounded batch
+ * window and a validated manager Endpoint protocol; PCI/DMA stay out of the
+ * child CSpace.
  */
 #include "luna_lkl_task_host.h"
 
@@ -28,15 +28,43 @@
 #define TASK_NET_UDP_PORT 18081U
 #define TASK_NET_TX_UDP_PORT 18082U
 #define TASK_NET_PRESSURE_MIN_RX 24U
+#define TASK_NET_TX_COALESCE_NS 5000000ULL
+#define TASK_NET_THROUGHPUT_SAMPLES 7U
+#define TASK_NET_THROUGHPUT_PACKETS 24U
+
+struct task_net_packet {
+    size_t length;
+    unsigned char data[LUNA_NET_PACKET_SIZE];
+};
 
 struct task_net_backend {
     struct lkl_netdev dev;
-    unsigned char *tx_page;
-    unsigned char *rx_page;
+    struct luna_net_batch_header *header;
+    unsigned char *tx_slots;
+    unsigned char *rx_slots;
+    struct task_net_packet tx_queue[LUNA_NET_CHILD_TX_QUEUE_COUNT];
+    volatile unsigned tx_head;
+    volatile unsigned tx_tail;
+    volatile int tx_lock;
+    volatile int tx_stop;
+    volatile int tx_error;
+    struct lkl_sem *tx_sem;
+    lkl_thread_t tx_thread;
+    unsigned rx_count;
+    unsigned rx_index;
     size_t pending_rx;
     seL4_CPtr rx_ntfn;
     volatile int hup;
     int configured;
+    volatile unsigned long long tx_ipc;
+    volatile unsigned long long tx_batches;
+    volatile unsigned long long tx_packets;
+    volatile unsigned long long tx_copies;
+    volatile unsigned long long tx_backpressure;
+    volatile unsigned long long rx_ipc;
+    volatile unsigned long long rx_batches;
+    volatile unsigned long long rx_packets;
+    volatile unsigned long long rx_copies;
 };
 
 static struct task_net_backend task_net;
@@ -90,6 +118,94 @@ static uint16_t task_checksum(const void *data, size_t length)
     return task_htons((uint16_t)~sum);
 }
 
+static void task_net_tx_lock(struct task_net_backend *backend)
+{
+    while (__atomic_test_and_set(&backend->tx_lock, __ATOMIC_ACQUIRE))
+        seL4_Yield();
+}
+
+static void task_net_tx_unlock(struct task_net_backend *backend)
+{
+    __atomic_clear(&backend->tx_lock, __ATOMIC_RELEASE);
+}
+
+static void task_net_tx_worker(void *argument)
+{
+    struct task_net_backend *backend = argument;
+    for (;;) {
+        lkl_host_ops.sem_down(backend->tx_sem);
+        if (__atomic_load_n(&backend->tx_stop, __ATOMIC_ACQUIRE)) break;
+        unsigned long long coalesce_start = luna_lkl_task_time();
+        for (;;) {
+            task_net_tx_lock(backend);
+            unsigned queued = (backend->tx_head +
+                               LUNA_NET_CHILD_TX_QUEUE_COUNT -
+                               backend->tx_tail) %
+                              LUNA_NET_CHILD_TX_QUEUE_COUNT;
+            task_net_tx_unlock(backend);
+            if (queued >= LUNA_NET_BATCH_SLOTS ||
+                luna_lkl_task_time() - coalesce_start >=
+                    TASK_NET_TX_COALESCE_NS)
+                break;
+            seL4_Yield();
+        }
+        for (;;) {
+            task_net_tx_lock(backend);
+            unsigned tail = backend->tx_tail;
+            unsigned head = backend->tx_head;
+            if (tail == head) {
+                task_net_tx_unlock(backend);
+                break;
+            }
+            unsigned count = 0;
+            while (tail != head && count < LUNA_NET_BATCH_SLOTS) {
+                struct task_net_packet *packet = &backend->tx_queue[tail];
+                backend->header->tx_lengths[count] = packet->length;
+                memcpy(backend->tx_slots +
+                           count * LUNA_NET_PACKET_SIZE,
+                       packet->data, packet->length);
+                tail = (tail + 1U) % LUNA_NET_CHILD_TX_QUEUE_COUNT;
+                count++;
+            }
+            backend->header->tx_count = count;
+            __sync_synchronize();
+            task_net_tx_unlock(backend);
+
+            seL4_Word accepted = 0;
+            luna_lkl_task_manager_lock();
+            int result = luna_lkl_task_manager_request_value(
+                LUNA_ISOLATION_EVENT_NET_TX_BATCH, count, 0, &accepted);
+            luna_lkl_task_manager_unlock();
+            __atomic_fetch_add(&backend->tx_ipc, 1ULL, __ATOMIC_RELAXED);
+            if (result || accepted > count) {
+                __atomic_store_n(&backend->tx_error, 1, __ATOMIC_RELEASE);
+                break;
+            }
+            if (!accepted) {
+                __atomic_fetch_add(&backend->tx_backpressure, 1ULL,
+                                   __ATOMIC_RELAXED);
+                seL4_Yield();
+                continue;
+            }
+            task_net_tx_lock(backend);
+            for (seL4_Word i = 0; i < accepted; i++) {
+                backend->tx_queue[backend->tx_tail].length = 0;
+                backend->tx_tail = (backend->tx_tail + 1U) %
+                                   LUNA_NET_CHILD_TX_QUEUE_COUNT;
+            }
+            task_net_tx_unlock(backend);
+            __atomic_fetch_add(&backend->tx_batches, 1ULL,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&backend->tx_packets,
+                               (unsigned long long)accepted,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&backend->tx_copies,
+                               (unsigned long long)accepted,
+                               __ATOMIC_RELAXED);
+        }
+    }
+}
+
 static int task_net_tx(struct lkl_netdev *nd, struct iovec *iov, int count)
 {
     struct task_net_backend *backend =
@@ -100,19 +216,36 @@ static int task_net_tx(struct lkl_netdev *nd, struct iovec *iov, int count)
         if (!iov[i].iov_base ||
             iov[i].iov_len > LUNA_NET_PACKET_SIZE - total)
             return -1;
-        memcpy(backend->tx_page + total, iov[i].iov_base, iov[i].iov_len);
         total += iov[i].iov_len;
     }
     if (!total) return -1;
-    luna_lkl_task_manager_lock();
-    int result;
-    do {
-        result = luna_lkl_task_manager_request(
-            LUNA_ISOLATION_EVENT_NET_TX, (seL4_Word)total, 0);
-        if (result == LUNA_NET_TX_RETRY) seL4_Yield();
-    } while (result == LUNA_NET_TX_RETRY);
-    luna_lkl_task_manager_unlock();
-    return result ? -1 : (int)total;
+    for (unsigned attempt = 0; attempt < 100000U; attempt++) {
+        task_net_tx_lock(backend);
+        unsigned head = backend->tx_head;
+        unsigned next = (head + 1U) % LUNA_NET_CHILD_TX_QUEUE_COUNT;
+        if (next != backend->tx_tail) {
+            int was_empty = head == backend->tx_tail;
+            struct task_net_packet *packet = &backend->tx_queue[head];
+            size_t offset = 0;
+            for (int i = 0; i < count; i++) {
+                memcpy(packet->data + offset, iov[i].iov_base,
+                       iov[i].iov_len);
+                offset += iov[i].iov_len;
+            }
+            packet->length = total;
+            backend->tx_head = next;
+            task_net_tx_unlock(backend);
+            if (was_empty) lkl_host_ops.sem_up(backend->tx_sem);
+            return (int)total;
+        }
+        task_net_tx_unlock(backend);
+        __atomic_fetch_add(&backend->tx_backpressure, 1ULL,
+                           __ATOMIC_RELAXED);
+        if (__atomic_load_n(&backend->tx_error, __ATOMIC_ACQUIRE)) return -1;
+        lkl_host_ops.sem_up(backend->tx_sem);
+        seL4_Yield();
+    }
+    return -1;
 }
 
 static int task_net_rx(struct lkl_netdev *nd, struct iovec *iov, int count)
@@ -126,11 +259,17 @@ static int task_net_rx(struct lkl_netdev *nd, struct iovec *iov, int count)
         size_t chunk = iov[i].iov_len < remaining ? iov[i].iov_len :
                        remaining;
         if (!iov[i].iov_base) return -1;
-        memcpy(iov[i].iov_base, backend->rx_page + offset, chunk);
+        memcpy(iov[i].iov_base,
+               backend->rx_slots +
+                   backend->rx_index * LUNA_NET_PACKET_SIZE + offset,
+               chunk);
         offset += chunk;
         remaining -= chunk;
     }
     backend->pending_rx = 0;
+    backend->rx_index++;
+    __atomic_fetch_add(&backend->rx_packets, 1ULL, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&backend->rx_copies, 1ULL, __ATOMIC_RELAXED);
     return (int)offset;
 }
 
@@ -141,19 +280,30 @@ static int task_net_poll(struct lkl_netdev *nd)
     for (;;) {
         if (__atomic_load_n(&backend->hup, __ATOMIC_ACQUIRE))
             return LKL_DEV_NET_POLL_HUP;
+        if (backend->rx_index < backend->rx_count) {
+            size_t length = (size_t)backend->header->rx_lengths[
+                backend->rx_index];
+            if (!length || length > LUNA_NET_PACKET_SIZE) return -1;
+            backend->pending_rx = length;
+            return LKL_DEV_NET_POLL_RX;
+        }
         seL4_Word badge = 0;
         seL4_Wait(backend->rx_ntfn, &badge);
         if (__atomic_load_n(&backend->hup, __ATOMIC_ACQUIRE))
             return LKL_DEV_NET_POLL_HUP;
-        seL4_Word length = 0;
+        seL4_Word packets = 0;
         luna_lkl_task_manager_lock();
         int result = luna_lkl_task_manager_request_value(
-            LUNA_ISOLATION_EVENT_NET_RX, 0, 0, &length);
+            LUNA_ISOLATION_EVENT_NET_RX_BATCH, LUNA_NET_BATCH_SLOTS, 0,
+            &packets);
         luna_lkl_task_manager_unlock();
-        if (result || length > LUNA_NET_PACKET_SIZE) return -1;
-        if (length) {
-            backend->pending_rx = (size_t)length;
-            return LKL_DEV_NET_POLL_RX;
+        __atomic_fetch_add(&backend->rx_ipc, 1ULL, __ATOMIC_RELAXED);
+        if (result || packets > LUNA_NET_BATCH_SLOTS) return -1;
+        if (packets) {
+            backend->rx_count = (unsigned)packets;
+            backend->rx_index = 0;
+            __atomic_fetch_add(&backend->rx_batches, 1ULL,
+                               __ATOMIC_RELAXED);
         }
     }
 }
@@ -175,6 +325,8 @@ static void task_net_free(struct lkl_netdev *nd)
         (struct task_net_backend *)nd;
     backend->configured = 0;
     backend->pending_rx = 0;
+    backend->rx_count = 0;
+    backend->rx_index = 0;
 }
 
 static struct lkl_dev_net_ops task_net_ops = {
@@ -203,8 +355,9 @@ int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
     task_net.dev.mac[3] = 0x12;
     task_net.dev.mac[4] = 0x34;
     task_net.dev.mac[5] = 0x56;
-    task_net.tx_page = (unsigned char *)io_base + LUNA_NET_TX_OFFSET;
-    task_net.rx_page = (unsigned char *)io_base + LUNA_NET_RX_OFFSET;
+    task_net.header = io_base;
+    task_net.tx_slots = (unsigned char *)io_base + LUNA_NET_TX_OFFSET;
+    task_net.rx_slots = (unsigned char *)io_base + LUNA_NET_RX_OFFSET;
     task_net.rx_ntfn = rx_ntfn;
     task_net.configured = 1;
     task_net_id = -1;
@@ -215,6 +368,15 @@ int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
 int luna_lkl_task_net_add(void)
 {
     if (!task_net.configured || task_net_id >= 0) return -1;
+    task_net.tx_sem = lkl_host_ops.sem_alloc(0);
+    if (!task_net.tx_sem) return -1;
+    task_net.tx_thread = lkl_host_ops.thread_create(task_net_tx_worker,
+                                                    &task_net);
+    if (!task_net.tx_thread) {
+        lkl_host_ops.sem_free(task_net.tx_sem);
+        task_net.tx_sem = NULL;
+        return -1;
+    }
     struct lkl_netdev_args args = {
         .mac = task_net.dev.mac,
         .offload = 0,
@@ -224,6 +386,12 @@ int luna_lkl_task_net_add(void)
     if (task_net_id < 0) {
         lkl_printf("luna-lkl-task: virtio net add failed: %d\n",
                    task_net_id);
+        __atomic_store_n(&task_net.tx_stop, 1, __ATOMIC_RELEASE);
+        lkl_host_ops.sem_up(task_net.tx_sem);
+        lkl_host_ops.thread_join(task_net.tx_thread);
+        lkl_host_ops.sem_free(task_net.tx_sem);
+        task_net.tx_sem = NULL;
+        task_net.tx_thread = 0;
         return -1;
     }
     return 0;
@@ -390,6 +558,97 @@ static int task_net_tx_stress_control(seL4_Word control)
     return result;
 }
 
+static int task_net_rx_throughput_benchmark(void)
+{
+    static const unsigned char magic[8] = {
+        'L', 'U', 'N', 'A', 'B', 'R', 'S', 'T'
+    };
+    unsigned long long samples[TASK_NET_THROUGHPUT_SAMPLES];
+    unsigned char trigger[12];
+    unsigned char packet[LUNA_NET_STRESS_PAYLOAD];
+    struct lkl_sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = LKL_AF_INET;
+    peer.sin_port = task_htons(TASK_NET_UDP_PORT);
+    peer.sin_addr.lkl_s_addr = task_ipv4(
+        TASK_NET_IPV4_A, TASK_NET_IPV4_B, TASK_NET_IPV4_C,
+        TASK_NET_PEER_D);
+    memcpy(trigger, magic, sizeof(magic));
+    uint16_t burst = task_htons((uint16_t)TASK_NET_THROUGHPUT_PACKETS);
+    uint16_t payload = task_htons((uint16_t)LUNA_NET_STRESS_PAYLOAD);
+    memcpy(trigger + 8, &burst, sizeof(burst));
+    memcpy(trigger + 10, &payload, sizeof(payload));
+
+    long fd = lkl_sys_socket(LKL_AF_INET, LKL_SOCK_DGRAM,
+                             LKL_IPPROTO_UDP);
+    if (fd < 0) return -1;
+    for (unsigned sample = 0; sample < TASK_NET_THROUGHPUT_SAMPLES;
+         sample++) {
+        uint64_t seen = 0;
+        unsigned received = 0;
+        long result = lkl_sys_sendto(
+            (int)fd, trigger, sizeof(trigger), 0,
+            (struct lkl_sockaddr *)&peer, sizeof(peer));
+        if (result != (long)sizeof(trigger)) goto fail;
+        unsigned long long start = luna_lkl_task_time();
+        for (unsigned attempt = 0;
+             attempt < 100 && received < TASK_NET_THROUGHPUT_PACKETS;
+             attempt++) {
+            struct lkl_pollfd pollfd = {
+                .fd = (int)fd,
+                .events = LKL_POLLIN,
+            };
+            result = lkl_sys_poll(&pollfd, 1, 100);
+            if (result < 0) goto fail;
+            if (!result) continue;
+            result = lkl_sys_recv((int)fd, packet, sizeof(packet),
+                                  LKL_MSG_DONTWAIT);
+            if (result != (long)LUNA_NET_STRESS_PAYLOAD) goto fail;
+            uint16_t sequence_word = 0, count_word = 0;
+            memcpy(&sequence_word, packet, sizeof(sequence_word));
+            memcpy(&count_word, packet + 2, sizeof(count_word));
+            unsigned sequence = task_ntohs(sequence_word);
+            unsigned count = task_ntohs(count_word);
+            if (count != TASK_NET_THROUGHPUT_PACKETS ||
+                sequence >= TASK_NET_THROUGHPUT_PACKETS)
+                goto fail;
+            uint64_t bit = 1ULL << sequence;
+            if (!(seen & bit)) {
+                seen |= bit;
+                received++;
+            }
+        }
+        if (received != TASK_NET_THROUGHPUT_PACKETS) goto fail;
+        samples[sample] = luna_lkl_task_time() - start;
+        if (!samples[sample]) goto fail;
+        lkl_printf("LUNA_NET_RX_THROUGHPUT_SAMPLE ns=%llu\n",
+                   samples[sample]);
+    }
+    if (lkl_sys_close((unsigned int)fd)) return -1;
+    for (unsigned i = 1; i < TASK_NET_THROUGHPUT_SAMPLES; i++) {
+        unsigned long long value = samples[i];
+        unsigned j = i;
+        while (j && samples[j - 1] > value) {
+            samples[j] = samples[j - 1];
+            j--;
+        }
+        samples[j] = value;
+    }
+    unsigned long long p50 = samples[(TASK_NET_THROUGHPUT_SAMPLES - 1) / 2];
+    unsigned long long p95 = samples[TASK_NET_THROUGHPUT_SAMPLES - 1];
+    lkl_printf("LUNA_NET_RX_THROUGHPUT_OK packets=%lu bytes=%lu samples=%u "
+               "p50_ns=%llu p95_ns=%llu p99_ns=%llu\n",
+               (unsigned long)TASK_NET_THROUGHPUT_PACKETS,
+               (unsigned long)(TASK_NET_THROUGHPUT_PACKETS *
+                               LUNA_NET_STRESS_PAYLOAD),
+               TASK_NET_THROUGHPUT_SAMPLES, p50, p95, p95);
+    return 0;
+
+fail:
+    lkl_sys_close((unsigned int)fd);
+    return -1;
+}
+
 int luna_lkl_task_net_pressure_smoke(void)
 {
     static const unsigned char magic[8] = {
@@ -492,6 +751,7 @@ int luna_lkl_task_net_pressure_smoke(void)
                "elapsed_ns=%llu\n",
                received, high_water, backpressure, drops, empty_fetches,
                elapsed);
+    if (task_net_rx_throughput_benchmark()) goto out;
     result = 0;
 
 out:
@@ -643,6 +903,31 @@ out:
 int luna_lkl_task_net_finish(void)
 {
     if (task_net_id < 0) return 0;
+    lkl_host_ops.sem_up(task_net.tx_sem);
+    for (unsigned attempt = 0; attempt < 100000U; attempt++) {
+        if (__atomic_load_n(&task_net.tx_head, __ATOMIC_ACQUIRE) ==
+            __atomic_load_n(&task_net.tx_tail, __ATOMIC_ACQUIRE))
+            break;
+        seL4_Yield();
+    }
+    if (__atomic_load_n(&task_net.tx_head, __ATOMIC_ACQUIRE) !=
+        __atomic_load_n(&task_net.tx_tail, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&task_net.tx_error, __ATOMIC_ACQUIRE))
+        return -1;
+    __atomic_store_n(&task_net.tx_stop, 1, __ATOMIC_RELEASE);
+    lkl_host_ops.sem_up(task_net.tx_sem);
+    if (lkl_host_ops.thread_join(task_net.tx_thread)) return -1;
+    lkl_host_ops.sem_free(task_net.tx_sem);
+    task_net.tx_sem = NULL;
+    task_net.tx_thread = 0;
+    lkl_printf("LUNA_NET_BATCH_COUNTERS tx_ipc=%llu tx_batches=%llu "
+               "tx_packets=%llu tx_copies=%llu tx_backpressure=%llu "
+               "rx_ipc=%llu rx_batches=%llu rx_packets=%llu "
+               "rx_copies=%llu\n",
+               task_net.tx_ipc, task_net.tx_batches, task_net.tx_packets,
+               task_net.tx_copies, task_net.tx_backpressure,
+               task_net.rx_ipc, task_net.rx_batches, task_net.rx_packets,
+               task_net.rx_copies);
     lkl_netdev_remove(task_net_id);
     lkl_netdev_free(&task_net.dev);
     task_net_id = -1;

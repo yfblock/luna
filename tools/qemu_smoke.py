@@ -92,8 +92,8 @@ REQUIRED = [
     b"LUNA_RESOURCE_POOL_OK",
     b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
     b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
-    b"LUNA_RESOURCE_PEAK_OK managed_frame_pages=8210 child_tcbs=66 "
-    b"child_notifications=194 heap_pages=8192 disk_pages=16 net_pages=2",
+    b"LUNA_RESOURCE_PEAK_OK managed_frame_pages=8225 child_tcbs=50 "
+    b"child_notifications=146 heap_pages=8192 disk_pages=16 net_pages=17",
     b"LUNA_SYNC_TLS_OK",
     b"LUNA_THREAD_TIMER_OK",
     b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
@@ -103,9 +103,15 @@ REQUIRED = [
     b"LUNA_NETWORK_ASYNC_RX_OK notification=receive-only",
     b"LUNA_ROOT_ALLOCATOR_POOL_OK bytes=8388608",
     b"LUNA_NETWORK_IRQ_OK line=",
+    b"LUNA_NET_MANAGER_COUNTERS tx_ipc=",
+    b"LUNA_NET_BATCH_COUNTERS tx_ipc=",
+    b"LUNA_DISK_BATCH_COUNTERS ipc=",
+    b"LUNA_DISK_MANAGER_COUNTERS ipc=",
+    b"LUNA_CHILD_RESOURCE_HIGH_WATER threads=",
     b"LUNA_NETWORK_ICMP_OK peer=10.0.2.2",
     b"LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080",
     b"LUNA_NET_QUEUE_STATS received=",
+    b"LUNA_NET_RX_THROUGHPUT_OK packets=24",
     b"high_water=31 backpressure=1",
     b"empty_fetches=0",
     b"LUNA_NETWORK_PRESSURE_OK burst=64 payload=1200",
@@ -390,20 +396,86 @@ def main() -> int:
         size, elapsed, rate = map(int, pipeline_bench.groups())
         if size != 1048576 or elapsed <= 0 or rate <= 0:
             errors.append("pipeline benchmark statistics are invalid")
+    pipeline_detail = re.search(
+        rb"LUNA_PIPELINE_BENCHMARK_OK .* samples=(\d+) p50_ns=(\d+) "
+        rb"p95_ns=(\d+) p99_ns=(\d+) read_calls=(\d+) "
+        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+)", data
+    )
+    pipeline_samples = [int(value) for value in re.findall(
+        rb"LUNA_PIPELINE_SAMPLE ns=(\d+)", data
+    )]
+    if not pipeline_detail:
+        errors.append("pipeline benchmark detail was not reported")
+    else:
+        values = list(map(int, pipeline_detail.groups()))
+        samples, p50, p95, p99, read_calls, read_bytes, write_calls, write_bytes = values
+        if samples != 7 or len(pipeline_samples) != samples or any(
+            value <= 0 for value in (p50, p95, p99, read_calls, read_bytes,
+                                     write_calls, write_bytes)
+        ) or not p50 <= p95 <= p99:
+            errors.append("pipeline benchmark detail is invalid")
 
     block_bench = re.search(
         rb"LUNA_BLOCK_BENCHMARK_OK bytes=(\d+) seq_write_ns=(\d+) "
-        rb"seq_read_ns=(\d+) random_ops=(\d+) random_write_ns=(\d+) "
-        rb"random_read_ns=(\d+)", data
+        rb"cold_read_ns=(\d+) hot_read_ns=(\d+) random_ops=(\d+) "
+        rb"random_write_ns=(\d+) random_read_ns=(\d+)", data
     )
     if not block_bench:
         errors.append("block benchmark statistics were not reported")
     else:
         values = list(map(int, block_bench.groups()))
-        if values[0] != 1048576 or values[3] != 256 or any(
-            value <= 0 for value in values[1:3] + values[4:]
+        if values[0] != 1048576 or values[4] != 256 or any(
+            value <= 0 for value in values[1:4] + values[5:]
         ):
             errors.append("block benchmark statistics are invalid")
+
+    rx_throughput = re.search(
+        rb"LUNA_NET_RX_THROUGHPUT_OK packets=(\d+) bytes=(\d+) "
+        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+)", data
+    )
+    rx_samples = [int(value) for value in re.findall(
+        rb"LUNA_NET_RX_THROUGHPUT_SAMPLE ns=(\d+)", data
+    )]
+    if not rx_throughput:
+        errors.append("pure RX throughput benchmark was not reported")
+    else:
+        packets, size, samples, p50, p95, p99 = map(
+            int, rx_throughput.groups()
+        )
+        if packets != 24 or size != 28800 or samples != 7 or \
+                len(rx_samples) != samples or not 0 < p50 <= p95 <= p99:
+            errors.append("pure RX throughput benchmark is invalid")
+
+    net_counters = re.search(
+        rb"LUNA_NET_MANAGER_COUNTERS tx_ipc=(\d+) tx_batches=(\d+) "
+        rb"tx_packets=(\d+) tx_copies=(\d+) tx_kicks=(\d+) "
+        rb"rx_ipc=(\d+) rx_batches=(\d+) rx_packets=(\d+) "
+        rb"rx_copies=(\d+)", data
+    )
+    if not net_counters:
+        errors.append("network data-path counters were not reported")
+    else:
+        values = list(map(int, net_counters.groups()))
+        tx_ipc, tx_batches, tx_packets, tx_copies, tx_kicks = values[:5]
+        rx_ipc, rx_batches, rx_packets, rx_copies = values[5:]
+        if not 0 < tx_batches <= tx_ipc < tx_packets == tx_copies or \
+                tx_kicks >= tx_packets or \
+                not 0 < rx_batches <= rx_ipc < rx_packets == rx_copies:
+            errors.append("network data-path counters are invalid")
+
+    child_pool = re.findall(
+        rb"LUNA_CHILD_RESOURCE_HIGH_WATER threads=(\d+)/(\d+) "
+        rb"sync=(\d+)/(\d+) manager_ipc=(\d+)", data
+    )
+    if not child_pool:
+        errors.append("child resource high-water was not reported")
+    else:
+        threads, thread_slots, sync, sync_slots, manager_ipc = map(
+            int, child_pool[-1]
+        )
+        if not 0 < threads <= thread_slots == 47 or \
+                not 0 < sync <= sync_slots == 96 or manager_ipc <= 0:
+            errors.append("child resource high-water is invalid")
 
     lifecycle = re.search(
         rb"LUNA_LIFECYCLE_BENCHMARK_OK rounds=(\d+)", data

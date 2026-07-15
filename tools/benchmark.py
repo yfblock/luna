@@ -19,6 +19,27 @@ def marker(data: bytes, pattern: bytes, name: str) -> list[int]:
     return [int(value) for value in match.groups()]
 
 
+def marker_last(data: bytes, pattern: bytes, name: str) -> list[int]:
+    import re
+
+    matches = re.findall(pattern, data)
+    if not matches:
+        raise ValueError(f"missing benchmark marker: {name}")
+    values = matches[-1]
+    if not isinstance(values, tuple):
+        values = (values,)
+    return [int(value) for value in values]
+
+
+def percentile(values: list[int], percent: int) -> int:
+    """Return the nearest-rank percentile for a non-empty sample set."""
+    if not values:
+        raise ValueError("cannot calculate a percentile without samples")
+    ordered = sorted(values)
+    rank = (len(ordered) * percent + 99) // 100
+    return ordered[max(1, rank) - 1]
+
+
 def parse(data: bytes) -> dict[str, object]:
     import re
 
@@ -33,11 +54,34 @@ def parse(data: bytes) -> dict[str, object]:
         rb"bytes_per_sec=(\d+)",
         "pipeline",
     )
+    pipeline_detail = marker(
+        data,
+        rb"LUNA_PIPELINE_BENCHMARK_OK .* samples=(\d+) p50_ns=(\d+) "
+        rb"p95_ns=(\d+) p99_ns=(\d+) read_calls=(\d+) "
+        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+)",
+        "pipeline-detail",
+    )
+    pipeline_samples = [int(value) for value in re.findall(
+        rb"LUNA_PIPELINE_SAMPLE ns=(\d+)", data
+    )]
+    if len(pipeline_samples) != pipeline_detail[0]:
+        raise ValueError("incomplete pipeline benchmark samples")
     rx = marker(
         data,
         rb"LUNA_NET_QUEUE_STATS received=(\d+).*elapsed_ns=(\d+)",
         "network-rx",
     )
+    rx_throughput = marker(
+        data,
+        rb"LUNA_NET_RX_THROUGHPUT_OK packets=(\d+) bytes=(\d+) "
+        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+)",
+        "network-rx-throughput",
+    )
+    rx_throughput_samples = [int(value) for value in re.findall(
+        rb"LUNA_NET_RX_THROUGHPUT_SAMPLE ns=(\d+)", data
+    )]
+    if len(rx_throughput_samples) != rx_throughput[2]:
+        raise ValueError("incomplete network RX throughput samples")
     tx = marker(
         data,
         rb"LUNA_NET_TX_QUEUE_STATS sent=(\d+).*elapsed_ns=(\d+)",
@@ -46,9 +90,36 @@ def parse(data: bytes) -> dict[str, object]:
     block = marker(
         data,
         rb"LUNA_BLOCK_BENCHMARK_OK bytes=(\d+) seq_write_ns=(\d+) "
-        rb"seq_read_ns=(\d+) random_ops=(\d+) random_write_ns=(\d+) "
-        rb"random_read_ns=(\d+)",
+        rb"cold_read_ns=(\d+) hot_read_ns=(\d+) random_ops=(\d+) "
+        rb"random_write_ns=(\d+) random_read_ns=(\d+)",
         "block",
+    )
+    net_counters = marker(
+        data,
+        rb"LUNA_NET_MANAGER_COUNTERS tx_ipc=(\d+) tx_batches=(\d+) "
+        rb"tx_packets=(\d+) tx_copies=(\d+) tx_kicks=(\d+) "
+        rb"rx_ipc=(\d+) rx_batches=(\d+) rx_packets=(\d+) "
+        rb"rx_copies=(\d+)",
+        "network-counters",
+    )
+    disk_counters = marker_last(
+        data,
+        rb"LUNA_DISK_BATCH_COUNTERS ipc=(\d+) batches=(\d+) "
+        rb"requests=(\d+) copies=(\d+) backpressure=(\d+) "
+        rb"queue_high_water=(\d+)",
+        "disk-counters",
+    )
+    disk_manager = marker(
+        data,
+        rb"LUNA_DISK_MANAGER_COUNTERS ipc=(\d+) batches=(\d+) "
+        rb"requests=(\d+) copies=(\d+) queue_high_water=(\d+)",
+        "disk-manager-counters",
+    )
+    child_pool = marker_last(
+        data,
+        rb"LUNA_CHILD_RESOURCE_HIGH_WATER threads=(\d+)/(\d+) "
+        rb"sync=(\d+)/(\d+) manager_ipc=(\d+)",
+        "child-resource-high-water",
     )
     lifecycle = marker(
         data, rb"LUNA_LIFECYCLE_BENCHMARK_OK rounds=(\d+)", "lifecycle"
@@ -84,12 +155,37 @@ def parse(data: bytes) -> dict[str, object]:
             "bytes": pipeline[0],
             "elapsed_ns": pipeline[1],
             "bytes_per_sec": pipeline[2],
+            "samples": pipeline_detail[0],
+            "p50_ns": pipeline_detail[1],
+            "p95_ns": pipeline_detail[2],
+            "p99_ns": pipeline_detail[3],
+            "read_calls": pipeline_detail[4],
+            "read_bytes": pipeline_detail[5],
+            "average_read_size": (
+                pipeline_detail[5] // pipeline_detail[4]
+                if pipeline_detail[4] else 0
+            ),
+            "write_calls": pipeline_detail[6],
+            "write_bytes": pipeline_detail[7],
+            "average_write_size": (
+                pipeline_detail[7] // pipeline_detail[6]
+                if pipeline_detail[6] else 0
+            ),
         },
         "network_rx": {
             "packets": rx[0],
             "bytes": rx[0] * 1200,
             "elapsed_ns": rx[1],
             "bytes_per_sec": rate(rx[0] * 1200, rx[1]),
+        },
+        "network_rx_throughput": {
+            "packets": rx_throughput[0],
+            "bytes": rx_throughput[1],
+            "samples": rx_throughput[2],
+            "p50_ns": rx_throughput[3],
+            "p95_ns": rx_throughput[4],
+            "p99_ns": rx_throughput[5],
+            "p50_bytes_per_sec": rate(rx_throughput[1], rx_throughput[3]),
         },
         "network_tx": {
             "packets": tx[0],
@@ -101,22 +197,61 @@ def parse(data: bytes) -> dict[str, object]:
             "bytes": block[0],
             "sequential_write_ns": block[1],
             "sequential_write_bytes_per_sec": rate(block[0], block[1]),
-            "sequential_read_ns": block[2],
-            "sequential_read_bytes_per_sec": rate(block[0], block[2]),
-            "random_ops": block[3],
-            "random_write_ns": block[4],
-            "random_write_iops": rate(block[3], block[4]),
-            "random_read_ns": block[5],
-            "random_read_iops": rate(block[3], block[5]),
+            "cold_read_ns": block[2],
+            "cold_read_bytes_per_sec": rate(block[0], block[2]),
+            "hot_read_ns": block[3],
+            "hot_read_bytes_per_sec": rate(block[0], block[3]),
+            "random_ops": block[4],
+            "random_write_ns": block[5],
+            "random_write_iops": rate(block[4], block[5]),
+            "random_read_ns": block[6],
+            "random_read_iops": rate(block[4], block[6]),
+        },
+        "data_path_counters": {
+            "network": {
+                "tx_ipc": net_counters[0],
+                "tx_batches": net_counters[1],
+                "tx_packets": net_counters[2],
+                "tx_copies": net_counters[3],
+                "tx_kicks": net_counters[4],
+                "rx_ipc": net_counters[5],
+                "rx_batches": net_counters[6],
+                "rx_packets": net_counters[7],
+                "rx_copies": net_counters[8],
+            },
+            "block_child": {
+                "ipc": disk_counters[0],
+                "batches": disk_counters[1],
+                "requests": disk_counters[2],
+                "copies": disk_counters[3],
+                "backpressure": disk_counters[4],
+                "queue_high_water": disk_counters[5],
+            },
+            "block_manager": {
+                "ipc": disk_manager[0],
+                "batches": disk_manager[1],
+                "requests": disk_manager[2],
+                "copies": disk_manager[3],
+                "queue_high_water": disk_manager[4],
+            },
         },
         "lifecycle": {
             "rounds": lifecycle[0],
             "create_avg_ns": sum(lifecycle_samples["CREATE"]) // lifecycle[0],
             "create_max_ns": max(lifecycle_samples["CREATE"]),
+            "create_p50_ns": percentile(lifecycle_samples["CREATE"], 50),
+            "create_p95_ns": percentile(lifecycle_samples["CREATE"], 95),
+            "create_p99_ns": percentile(lifecycle_samples["CREATE"], 99),
             "start_avg_ns": sum(lifecycle_samples["START"]) // lifecycle[0],
             "start_max_ns": max(lifecycle_samples["START"]),
+            "start_p50_ns": percentile(lifecycle_samples["START"], 50),
+            "start_p95_ns": percentile(lifecycle_samples["START"], 95),
+            "start_p99_ns": percentile(lifecycle_samples["START"], 99),
             "destroy_avg_ns": sum(lifecycle_samples["DESTROY"]) // lifecycle[0],
             "destroy_max_ns": max(lifecycle_samples["DESTROY"]),
+            "destroy_p50_ns": percentile(lifecycle_samples["DESTROY"], 50),
+            "destroy_p95_ns": percentile(lifecycle_samples["DESTROY"], 95),
+            "destroy_p99_ns": percentile(lifecycle_samples["DESTROY"], 99),
         },
         "resources": {
             "managed_frame_pages": manager[0],
@@ -127,6 +262,11 @@ def parse(data: bytes) -> dict[str, object]:
             "network_window_pages": manager[5],
             "busybox_heap_peak_bytes": user[0],
             "static_worker_peak": user[1],
+            "child_thread_high_water": child_pool[0],
+            "child_thread_slots": child_pool[1],
+            "child_sync_high_water": child_pool[2],
+            "child_sync_slots": child_pool[3],
+            "child_manager_ipc": child_pool[4],
         },
     }
 

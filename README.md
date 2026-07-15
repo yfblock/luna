@@ -25,6 +25,7 @@ delivery，并保留 kick-driven polling fallback。Phase 2.5.3 又加入 manage
 `2048 × 1200-byte` 持续 UDP 完整性测试。当前扩展又加入 `cmp/sort/grep/tee/dd/find/ls/cp/mv`、
 静态 runtime 负向/并发回归、socket/slirp/passt/TAP 可选后端，以及数据通路和资源 benchmark。
 root manager 不再链接或运行 LKL。详见
+[`PERFORMANCE-RESULTS.md`](PERFORMANCE-RESULTS.md)、
 [`PHASE2.1-RESULTS.md`](PHASE2.1-RESULTS.md) 和
 [`PHASE2.2-RESULTS.md`](PHASE2.2-RESULTS.md)、
 [`PHASE2.3-RESULTS.md`](PHASE2.3-RESULTS.md)、
@@ -66,6 +67,7 @@ luna/
 ├── PHASE2.4.3-RESULTS.md        # nofork applet、LKL syscall 与 ramfs 删除语义
 ├── PHASE2.4.4-RESULTS.md        # 静态 worker、pipeline/background 与任意文件 stdio
 ├── PHASE2.6-RESULTS.md          # 扩展 applet、网络后端与 benchmark
+├── PERFORMANCE-RESULTS.md       # 数据通路批处理、块 I/O 与生命周期优化
 ├── PHASE2.5-RESULTS.md          # virtio-net、IPv4、ICMP/TCP 与回收结果
 ├── PHASE2.5.1-RESULTS.md        # 异步 RX、背压、统计与 burst 压力结果
 ├── PHASE2.5.2-RESULTS.md        # virtio-net INTx/IOAPIC IRQ 与 polling fallback
