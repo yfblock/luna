@@ -32,6 +32,7 @@ REQUIRED = [
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
     b"LUNA_LKL_CHILD_HALT_OK",
+    b"LUNA_LKL_CHILD_SHELL_READY",
     b"LUNA_ISOLATION_RESTART_OK",
     b"LUNA_ISOLATION_OK",
     b"luna: host thread reuse test ok",

@@ -7,6 +7,7 @@
  */
 #include "luna_isolation_protocol.h"
 #include "luna_lkl_task_host.h"
+#include "luna_shell.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
@@ -123,7 +124,14 @@ int main(int argc, char **argv)
         }
         sync[i].ntfn = (seL4_CPtr)seL4_GetMR(3);
     }
-    if (luna_lkl_task_configure_resources(resources, sync))
+    seL4_MessageInfo_t console_tag =
+        receive_command(child_boot.command_ep,
+                        LUNA_COMMAND_CONFIGURE_CONSOLE);
+    if (seL4_MessageInfo_get_length(console_tag) != 2 || !seL4_GetMR(1))
+        for (;;) seL4_Yield();
+    seL4_CPtr console_io_port = (seL4_CPtr)seL4_GetMR(1);
+
+    if (luna_lkl_task_configure_resources(resources, sync, console_io_port))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                child_boot.mode);
@@ -149,6 +157,14 @@ int main(int argc, char **argv)
     }
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_BOOT_OK,
                child_boot.mode);
+    if (child_boot.mode == LUNA_ISOLATION_MODE_CLEAN) {
+        if (luna_shell_prepare(luna_lkl_task_console_ready()))
+            for (;;) seL4_Yield();
+        send_event(child_boot.control_ep,
+                   LUNA_ISOLATION_EVENT_LKL_SHELL_READY, child_boot.mode);
+        luna_shell_run(luna_lkl_task_time);
+    }
+    luna_lkl_task_console_stop();
     if (luna_lkl_task_halt()) {
         for (;;) seL4_Yield();
     }

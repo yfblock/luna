@@ -37,9 +37,17 @@ struct luna_sync_slot {
     int allocated;
 };
 
+struct luna_console_resource {
+    cspacepath_t io_port_path;
+    seL4_CPtr child_io_port;
+    int slot_allocated;
+    int cap_created;
+};
+
 struct luna_child_resources {
     struct luna_resource_slot slots[LUNA_RESOURCE_SLOTS];
     struct luna_sync_slot sync[LUNA_SYNC_SLOTS];
+    struct luna_console_resource console;
 };
 
 static void delete_child_cap(sel4utils_process_t *process, seL4_CPtr cap)
@@ -80,6 +88,11 @@ static void destroy_child(sel4utils_process_t *process,
         if (slot->allocated)
             vka_free_object(vka, &slot->ntfn);
     }
+    delete_child_cap(process, resources->console.child_io_port);
+    if (resources->console.cap_created)
+        vka_cnode_delete(&resources->console.io_port_path);
+    if (resources->console.slot_allocated)
+        vka_cspace_free_path(vka, resources->console.io_port_path);
     if (process->cspace.cptr)
         sel4utils_destroy_process(process, vka);
     memset(resources, 0, sizeof(*resources));
@@ -145,6 +158,26 @@ static int configure_resource_pool(simple_t *simple, vka_t *vka,
             return -1;
         }
     }
+    struct luna_console_resource *console = &resources->console;
+    if (vka_cspace_alloc_path(vka, &console->io_port_path)) {
+        printf("luna: console I/O cap slot allocation failed\n");
+        return -1;
+    }
+    console->slot_allocated = 1;
+    if (simple_get_IOPort_cap(simple, 0x3f8, 0x3ff,
+                              console->io_port_path.root,
+                              console->io_port_path.capPtr,
+                              console->io_port_path.capDepth)) {
+        printf("luna: COM1 I/O cap allocation failed\n");
+        return -1;
+    }
+    console->cap_created = 1;
+    console->child_io_port = sel4utils_copy_cap_to_process(
+        process, vka, console->io_port_path.capPtr);
+    if (!console->child_io_port) {
+        printf("luna: COM1 I/O cap copy failed\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -199,6 +232,14 @@ static void send_sync_slot(seL4_CPtr command_ep,
     seL4_SetMR(2, LUNA_SYNC_SLOTS);
     seL4_SetMR(3, slot->child_ntfn);
     seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 4));
+}
+
+static void send_console_resource(
+    seL4_CPtr command_ep, const struct luna_console_resource *console)
+{
+    seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_CONSOLE);
+    seL4_SetMR(1, console->child_io_port);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
@@ -314,6 +355,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         send_resource_slot(command_ep.cptr, &resources.slots[i], i);
     for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++)
         send_sync_slot(command_ep.cptr, &resources.sync[i], i);
+    send_console_resource(command_ep.cptr, &resources.console);
     if (receive_event(control_ep.cptr, CHILD_BADGE_FAULT,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                       LUNA_ISOLATION_MODE_FAULT))
@@ -374,6 +416,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         send_resource_slot(command_ep.cptr, &resources.slots[i], i);
     for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++)
         send_sync_slot(command_ep.cptr, &resources.sync[i], i);
+    send_console_resource(command_ep.cptr, &resources.console);
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                       LUNA_ISOLATION_MODE_CLEAN))
@@ -388,6 +431,11 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_LKL_BOOT_OK, LUNA_ISOLATION_MODE_CLEAN))
         goto out;
+    if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
+                      LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
+                      LUNA_ISOLATION_MODE_CLEAN))
+        goto out;
+    printf("LUNA_LKL_CHILD_SHELL_READY\n");
     if (receive_event(control_ep.cptr, CHILD_BADGE_CLEAN,
                       LUNA_ISOLATION_EVENT_LKL_HALT_OK, LUNA_ISOLATION_MODE_CLEAN))
         goto out;

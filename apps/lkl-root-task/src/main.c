@@ -31,7 +31,6 @@
 #include <platsupport/io.h>
 #include <utils/util.h>
 #include <lkl.h>
-void luna_shell_run(void);
 
 /* Loading the isolated LKL ELF creates metadata for several thousand frames
  * and mappings.  Keep this pool independent from the physical Untyped budget:
@@ -70,8 +69,8 @@ int main(int argc, char **argv)
     ZF_LOGF_IF(err, "vspace bootstrap failed: %d", err);
     printf("luna: vspace ok\n");
 
-    /* Keep the stable root-hosted shell first while tty/shell migration is
-       incomplete. The isolated child is exercised after this baseline exits. */
+    /* Keep one temporary non-interactive root LKL boot as a comparison path.
+       The interactive tty/shell now runs only in the isolated child. */
     err = sel4_lkl_host_init(&simple, &vka, &vspace, cnode, root_tcb);
     ZF_LOGF_IF(err, "lkl host init failed");
     printf("luna: host backend ok\n");
@@ -93,31 +92,12 @@ int main(int argc, char **argv)
     printf("luna: lkl_start_kernel returned %d\n", err);
     ZF_LOGF_IF(err, "lkl_start_kernel failed: %d", err);
 
-    /* 5. 宿主即 init：先经 printk console 打印 hello；随后创建 ttyLKL 设备节点。 */
+    /* 5. 保留一次非交互 hello 作为旧路径对照。交互 shell 已迁入
+       随后启动的 clean-mode isolated child。 */
     lkl_printf("hello from LKL on seL4\n");
     printf("luna: hello emitted via LKL console\n");
 
-    /* 5b. 虚拟串口 + 交互 shell：mknod /dev/ttyLKL0(240:0)，打开为 fd 0/1/2。
-       LKL 的 lkl_tty 驱动把该 tty 的输入接 seL4 COM1（IRQ 注入）、输出接 seL4_DebugPutChar。
-       shell 经 lkl_sys_read(0)/write(1) 走 tty，ldisc 自动回显+行编辑。 */
-    lkl_sys_mkdir("/dev", 0755);
-    lkl_sys_mknod("/dev/ttyLKL0", LKL_S_IFCHR | 0666, (240 << 8) | 0);
-    lkl_sys_close(0); lkl_sys_close(1); lkl_sys_close(2);   /* 确保空出 */
-    long tfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 0 */
-    printf("luna: /dev/ttyLKL0 first open fd=%ld\n", tfd);
-    if (tfd == 0 && sel4_lkl_host_console_ready()) {
-        long outfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 1 */
-        long errfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);  /* -> fd 2 */
-        ZF_LOGF_IF(outfd != 1 || errfd != 2, "tty fd setup failed: %ld/%ld", outfd, errfd);
-        lkl_sys_mkdir("/proc", 0555);
-        lkl_sys_mkdir("/tmp", 0755);
-        lkl_sys_mount("proc", "/proc", "proc", 0, NULL);
-        luna_shell_run();
-    } else {
-        printf("luna: interactive console unavailable\n");
-    }
-
-    /* 6. 停止外部输入，再让 LKL 完成线程/时钟清理。根 host task 的 join 是 no-op。 */
+    /* 6. 停止旧路径输入服务，再让 LKL 完成线程/时钟清理。 */
     sel4_lkl_host_stop_console();
     long halt_ret = lkl_sys_halt();
     printf("luna: lkl_sys_halt returned %ld\n", halt_ret);

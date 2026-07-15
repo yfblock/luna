@@ -406,6 +406,89 @@ static void task_timer_free(void *timer)
         __atomic_store_n(&task_timer_armed, 0, __ATOMIC_RELEASE);
 }
 
+#define TASK_CONSOLE_TID 0x7ffffffeUL
+#define TASK_CONSOLE_RING 256
+static seL4_CPtr task_console_io_port;
+static unsigned char task_console_ring[TASK_CONSOLE_RING];
+static volatile unsigned task_console_head;
+static volatile unsigned task_console_tail;
+static volatile int task_console_started;
+static volatile int task_console_stop_requested;
+static int task_console_irq;
+
+static void task_console_service(void *arg)
+{
+    (void)arg;
+    while (!__atomic_load_n(&task_console_stop_requested, __ATOMIC_ACQUIRE)) {
+        seL4_X86_IOPort_In8_t lsr =
+            seL4_X86_IOPort_In8(task_console_io_port, 0x3fd);
+        if (lsr.error == seL4_NoError && (lsr.result & 0x01)) {
+            seL4_X86_IOPort_In8_t input =
+                seL4_X86_IOPort_In8(task_console_io_port, 0x3f8);
+            if (input.error == seL4_NoError) {
+                unsigned next =
+                    (task_console_head + 1) % TASK_CONSOLE_RING;
+                if (next != task_console_tail) {
+                    int was_empty = task_console_head == task_console_tail;
+                    task_console_ring[task_console_head] = input.result;
+                    task_console_head = next;
+                    if (was_empty && task_console_irq)
+                        lkl_trigger_irq(task_console_irq);
+                }
+            }
+        }
+        seL4_Yield();
+    }
+}
+
+static void task_console_start(int irq)
+{
+    if (!task_console_io_port || task_console_started || irq <= 0) return;
+    struct task_thread_slot *slot = &task_threads[LUNA_CONSOLE_SLOT];
+    if (slot->used) return;
+    task_console_irq = irq;
+    task_console_head = 0;
+    task_console_tail = 0;
+    __atomic_store_n(&task_console_stop_requested, 0, __ATOMIC_RELEASE);
+    slot->used = 1;
+    slot->tid = TASK_CONSOLE_TID;
+    slot->fn = task_console_service;
+    slot->arg = NULL;
+    if (sel4utils_start_thread(&slot->thread, task_thread_trampoline,
+                               slot, NULL, 1)) {
+        slot->used = 0;
+        slot->tid = 0;
+        slot->fn = NULL;
+        task_console_irq = 0;
+        return;
+    }
+    task_console_started = 1;
+}
+
+static int task_console_take(void)
+{
+    if (task_console_head == task_console_tail) return -1;
+    unsigned char value = task_console_ring[task_console_tail];
+    task_console_tail = (task_console_tail + 1) % TASK_CONSOLE_RING;
+    return value;
+}
+
+int luna_lkl_task_console_ready(void) { return task_console_started; }
+
+void luna_lkl_task_console_stop(void)
+{
+    if (!task_console_started) return;
+    __atomic_store_n(&task_console_stop_requested, 1, __ATOMIC_RELEASE);
+    struct task_thread_slot *slot = &task_threads[LUNA_CONSOLE_SLOT];
+    seL4_TCB_Suspend(slot->self_tcb);
+    slot->used = 0;
+    slot->tid = 0;
+    slot->fn = NULL;
+    slot->arg = NULL;
+    task_console_started = 0;
+    task_console_irq = 0;
+}
+
 static void task_print(const char *str, int length)
 {
     for (int i = 0; i < length; i++) seL4_DebugPutChar(str[i]);
@@ -434,6 +517,8 @@ static void *task_memmove(void *dest, const void *src, unsigned long count)
 static struct lkl_host_operations task_host_ops = {
     .print = task_print,
     .panic = task_panic,
+    .console_start = task_console_start,
+    .console_take = task_console_take,
     .sem_alloc = task_sem_alloc,
     .sem_free = task_sem_free,
     .sem_up = task_sem_up,
@@ -474,7 +559,8 @@ static struct lkl_host_operations task_host_ops = {
 
 int luna_lkl_task_configure_resources(
     const struct luna_task_thread_resource resources[LUNA_RESOURCE_SLOTS],
-    const struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS])
+    const struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS],
+    seL4_CPtr console_io_port)
 {
     memset(task_threads, 0, sizeof(task_threads));
     current_tid = 1;
@@ -497,6 +583,13 @@ int luna_lkl_task_configure_resources(
         if (!task_sync[i].ntfn) return -1;
         task_sync_drain(task_sync[i].ntfn);
     }
+    task_console_io_port = console_io_port;
+    if (!task_console_io_port) return -1;
+    task_console_head = 0;
+    task_console_tail = 0;
+    task_console_started = 0;
+    task_console_stop_requested = 0;
+    task_console_irq = 0;
     return 0;
 }
 
@@ -575,4 +668,9 @@ int luna_lkl_task_start_kernel(unsigned long long tsc_frequency)
 long luna_lkl_task_halt(void)
 {
     return lkl_sys_halt();
+}
+
+unsigned long long luna_lkl_task_time(void)
+{
+    return task_time();
 }

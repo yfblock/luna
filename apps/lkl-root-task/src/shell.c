@@ -6,15 +6,19 @@
  * 输出：lkl_sys_write(1, ...) —— 经 LKL tty write → lkl_ops->print → seL4_DebugPutChar。
  * 命令：经 lkl_sys_* 在 LKL 内核上执行。
  *
- * fd 0/1/2 由 main.c 依次打开 /dev/ttyLKL0 设置。
+ * luna_shell_prepare() 创建设备节点并设置 fd 0/1/2；同一实现可链接到
+ * root comparison path 或 isolated child。
  */
-#include "sel4_lkl_host.h"
+#include "luna_shell.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <sys/types.h>
 #include <lkl.h>
 #include <lkl/asm/syscalls.h>
+
+static luna_shell_time_fn_t shell_time;
 
 static long sh_write(const char *s, long n) { return lkl_sys_write(1, (void *)s, n < 0 ? 0 : n); }
 static void sh_puts(const char *s) { sh_write(s, (long)strlen(s)); }
@@ -114,9 +118,9 @@ static void cmd_sleep(const char *value)
         .tv_sec = ms / 1000,
         .tv_nsec = (ms % 1000) * 1000000UL,
     };
-    unsigned long long before = sel4_lkl_host_time();
+    unsigned long long before = shell_time();
     long r = lkl_sys_nanosleep(&ts, NULL);
-    unsigned long long elapsed = sel4_lkl_host_time() - before;
+    unsigned long long elapsed = shell_time() - before;
     if (r < 0) sh_printf("sleep: %ld\n", r);
     else sh_printf("slept %lu ms (elapsed %llu ns)\n", ms, elapsed);
 }
@@ -128,8 +132,28 @@ static void prompt(void)
     sh_printf("lkl:%s# ", cwd);
 }
 
-void luna_shell_run(void)
+int luna_shell_prepare(int console_ready)
 {
+    lkl_sys_mkdir("/dev", 0755);
+    lkl_sys_mknod("/dev/ttyLKL0", LKL_S_IFCHR | 0666, (240 << 8) | 0);
+    lkl_sys_close(0);
+    lkl_sys_close(1);
+    lkl_sys_close(2);
+    long tfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);
+    printf("luna: /dev/ttyLKL0 first open fd=%ld\n", tfd);
+    if (tfd != 0 || !console_ready) return -1;
+    long outfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);
+    long errfd = lkl_sys_open("/dev/ttyLKL0", LKL_O_RDWR, 0);
+    if (outfd != 1 || errfd != 2) return -1;
+    lkl_sys_mkdir("/proc", 0555);
+    lkl_sys_mkdir("/tmp", 0755);
+    if (lkl_sys_mount("proc", "/proc", "proc", 0, NULL) < 0) return -1;
+    return 0;
+}
+
+void luna_shell_run(luna_shell_time_fn_t time_fn)
+{
+    shell_time = time_fn;
     sh_puts("\nluna LKL shell (via /dev/ttyLKL0) — type 'help'\n");
     char line[256]; char *argv[16];
     for (;;) {
@@ -167,7 +191,7 @@ void luna_shell_run(void)
         }
         else if (!strcmp(cmd, "free")) cmd_cat("/proc/meminfo");
         else if (!strcmp(cmd, "sleep")) { if (argc > 1) cmd_sleep(argv[1]); else sh_puts("sleep: need milliseconds\n"); }
-        else if (!strcmp(cmd, "time")) sh_printf("monotonic_ns=%llu\n", sel4_lkl_host_time());
+        else if (!strcmp(cmd, "time")) sh_printf("monotonic_ns=%llu\n", shell_time());
         else sh_printf("unknown: %s (try help)\n", cmd);
     }
 }

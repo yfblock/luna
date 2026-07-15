@@ -31,6 +31,7 @@ endif()
 add_executable(luna-lkl-task
     src/isolation_child.c
     src/lkl_task_host.c
+    src/shell.c
 )
 target_include_directories(luna-lkl-task PRIVATE include)
 target_include_directories(luna-lkl-task PRIVATE
