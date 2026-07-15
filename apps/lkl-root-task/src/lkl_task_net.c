@@ -403,6 +403,7 @@ int luna_lkl_task_net_pressure_smoke(void)
     int result = -1;
     uint64_t seen = 0;
     unsigned received = 0;
+    unsigned long long start = luna_lkl_task_time();
 
     memset(&peer, 0, sizeof(peer));
     peer.sin_family = LKL_AF_INET;
@@ -484,9 +485,13 @@ int luna_lkl_task_net_pressure_smoke(void)
         high_water < TASK_NET_PRESSURE_MIN_RX || !backpressure ||
         empty_fetches)
         goto out;
+    unsigned long long elapsed = luna_lkl_task_time() - start;
+    if (!elapsed) goto out;
     lkl_printf("LUNA_NET_QUEUE_STATS received=%u high_water=%u "
-               "backpressure=%u drops=%u empty_fetches=%u\n",
-               received, high_water, backpressure, drops, empty_fetches);
+               "backpressure=%u drops=%u empty_fetches=%u "
+               "elapsed_ns=%llu\n",
+               received, high_water, backpressure, drops, empty_fetches,
+               elapsed);
     result = 0;
 
 out:

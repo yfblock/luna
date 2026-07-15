@@ -111,6 +111,15 @@ struct luna_event_context {
     vka_t *vka;
 };
 
+static unsigned long long manager_elapsed_ns(unsigned long long start_cycles,
+                                             unsigned long long frequency)
+{
+    unsigned long long cycles = __builtin_ia32_rdtsc() - start_cycles;
+    if (!frequency) return 0;
+    return (cycles / frequency) * 1000000000ULL +
+           ((cycles % frequency) * 1000000000ULL) / frequency;
+}
+
 static int delete_child_cap(sel4utils_process_t *process, seL4_CPtr cap)
 {
     if (!cap || !process->cspace.cptr) return 0;
@@ -763,9 +772,13 @@ static int boot_child(simple_t *simple, vka_t *vka,
                       int *child_live,
                       struct luna_event_context *event_context)
 {
+    unsigned long long create_begin = __builtin_ia32_rdtsc();
     if (start_child(simple, vka, manager_vspace, control_ep, command_ep,
                     badge, mode, private_addr, process, resources, disk))
         return -1;
+    if (mode == LUNA_ISOLATION_MODE_STRESS)
+        printf("LUNA_LIFECYCLE_CREATE_SAMPLE ns=%llu\n",
+               manager_elapsed_ns(create_begin, tsc_frequency));
     *child_live = 1;
     *event_context = (struct luna_event_context) {
         .control_ep = control_ep,
@@ -791,6 +804,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
     if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode))
         return -1;
+    unsigned long long start_begin = __builtin_ia32_rdtsc();
     send_start(command_ep, tsc_frequency);
 
     if (receive_event(event_context, LUNA_ISOLATION_EVENT_RESOURCE_OK, mode) ||
@@ -810,6 +824,9 @@ static int boot_child(simple_t *simple, vka_t *vka,
     if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_VIRTIO_BLOCK_OK, mode))
         return -1;
+    if (mode == LUNA_ISOLATION_MODE_STRESS)
+        printf("LUNA_LIFECYCLE_START_SAMPLE ns=%llu\n",
+               manager_elapsed_ns(start_begin, tsc_frequency));
     return 0;
 }
 
@@ -901,6 +918,17 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
     printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
     printf("LUNA_NETWORK_ASYNC_RX_OK notification=receive-only\n");
+    printf("LUNA_ROOT_ALLOCATOR_POOL_OK bytes=%lu\n",
+           (unsigned long)LUNA_ROOT_ALLOCATOR_POOL_SIZE);
+    printf("LUNA_RESOURCE_PEAK_OK managed_frame_pages=%zu child_tcbs=%lu "
+           "child_notifications=%lu heap_pages=%zu disk_pages=%zu "
+           "net_pages=%zu\n",
+           resources.heap.peak_pages + resources.disk.mapped_pages +
+               resources.net.mapped_pages,
+           (unsigned long)(LUNA_RESOURCE_SLOTS + 1),
+           (unsigned long)(LUNA_RESOURCE_SLOTS + LUNA_SYNC_SLOTS + 1),
+           resources.heap.peak_pages, resources.disk.mapped_pages,
+           resources.net.mapped_pages);
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_HALT_OK\n");
@@ -936,11 +964,16 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
             receive_event(&event_context, LUNA_ISOLATION_EVENT_DONE,
                           LUNA_ISOLATION_MODE_STRESS))
             goto out;
+        unsigned long long destroy_begin = __builtin_ia32_rdtsc();
         if (release_child(&child, &resources, vka, &child_live)) goto out;
+        printf("LUNA_LIFECYCLE_DESTROY_SAMPLE ns=%llu\n",
+               manager_elapsed_ns(destroy_begin, tsc_frequency));
         if (round % 10 == 0)
             printf("luna: restart stress %d/%d\n", round,
                    LUNA_RESTART_STRESS_ROUNDS);
     }
+    printf("LUNA_LIFECYCLE_BENCHMARK_OK rounds=%d\n",
+           LUNA_RESTART_STRESS_ROUNDS);
     printf("LUNA_RESTART_STRESS_OK rounds=%d\n",
            LUNA_RESTART_STRESS_ROUNDS);
     printf("LUNA_PERSISTENCE_OK rounds=%d\n",

@@ -75,6 +75,18 @@ external network access. `tools/net-peer.py` uses only the Python standard
 library and binds two configurable localhost UDP ports (18081/18082 by
 default).
 
+Optional network backends are selected with `./run.sh --net-backend`:
+
+- `slirp` requires QEMU's `user` netdev compiled with libslirp.
+- `passt` requires QEMU's `passt` netdev and a `passt` executable in `PATH`.
+- `tap` requires a pre-created interface named by `LUNA_TAP_IFNAME`, configured
+  with `10.0.2.2/24`; interface creation and host firewall/NAT policy remain
+  explicit administrator operations.
+
+These optional backends use `tools/net-service.py`, which only requires the
+Python standard library. `tools/benchmark.py` runs the normal QEMU smoke and
+collects pipeline, network, block, lifecycle and peak-resource markers as JSON.
+
 After checkout, follow the build instructions in `README.md` or run
 `./run.sh --build-only`.
 

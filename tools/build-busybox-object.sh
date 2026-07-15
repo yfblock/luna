@@ -42,7 +42,9 @@ make -C "$source_dir" O="$build_dir" oldconfig </dev/null >/dev/null
 make -C "$source_dir" O="$build_dir" -j"$(nproc)" busybox_unstripped >/dev/null
 
 libraries=(
-    coreutils/lib.a libbb/lib.a libpwdgrp/lib.a shell/lib.a
+    coreutils/lib.a coreutils/libcoreutils/lib.a editors/lib.a
+    findutils/lib.a libbb/lib.a
+    libpwdgrp/lib.a shell/lib.a
 )
 library_paths=()
 for library in "${libraries[@]}"; do
@@ -59,6 +61,9 @@ abi_objcopy_args=(
     --redefine-sym __isoc23_strtoll=strtoll \
     --redefine-sym __isoc23_strtoul=strtoul \
     --redefine-sym __isoc23_strtoull=strtoull \
+    --redefine-sym gnu_dev_major=luna_bb_gnu_dev_major \
+    --redefine-sym gnu_dev_minor=luna_bb_gnu_dev_minor \
+    --redefine-sym gnu_dev_makedev=luna_bb_gnu_dev_makedev \
     --redefine-sym __errno_location=luna_bb_errno_location \
     --redefine-sym _exit=luna_bb__exit \
     --redefine-sym exit=luna_bb_exit \
@@ -82,6 +87,10 @@ abi_objcopy_args=(
     --redefine-sym ferror=luna_bb_ferror \
     --redefine-sym ferror_unlocked=luna_bb_ferror_unlocked \
     --redefine-sym clearerr=luna_bb_clearerr \
+    --redefine-sym getchar=luna_bb_getchar \
+    --redefine-sym getchar_unlocked=luna_bb_getchar_unlocked \
+    --redefine-sym setbuf=luna_bb_setbuf \
+    --redefine-sym setvbuf=luna_bb_setvbuf \
     --redefine-sym getopt=luna_bb_getopt \
     --redefine-sym getopt_long=luna_bb_getopt_long \
     --redefine-sym fopen=luna_bb_fopen \
@@ -107,6 +116,18 @@ abi_objcopy_args=(
     --redefine-sym fstat=luna_bb_fstat \
     --redefine-sym stat=luna_bb_stat \
     --redefine-sym lstat=luna_bb_lstat \
+    --redefine-sym access=luna_bb_access \
+    --redefine-sym chown=luna_bb_chown \
+    --redefine-sym lchown=luna_bb_lchown \
+    --redefine-sym mknod=luna_bb_mknod \
+    --redefine-sym utimes=luna_bb_utimes \
+    --redefine-sym gettimeofday=luna_bb_gettimeofday \
+    --redefine-sym opendir=luna_bb_opendir \
+    --redefine-sym fdopendir=luna_bb_fdopendir \
+    --redefine-sym readdir=luna_bb_readdir \
+    --redefine-sym closedir=luna_bb_closedir \
+    --redefine-sym rewinddir=luna_bb_rewinddir \
+    --redefine-sym dirfd=luna_bb_dirfd \
     --redefine-sym chdir=luna_bb_chdir \
     --redefine-sym fchdir=luna_bb_fchdir \
     --redefine-sym chroot=luna_bb_chroot \
@@ -164,8 +185,9 @@ shell_object="$build_dir/luna-busybox.shell.o"
 objcopy "${abi_objcopy_args[@]}" "$raw_object" "$shell_object"
 
 worker_entries=(
-    basename cat cut dirname echo false head ln mkdir printenv printf readlink
-    realpath rmdir touch true truncate uname uniq unlink wc
+    basename cat cmp cp cut dd dirname echo false find grep head ln ls mkdir mv
+    printenv printf readlink realpath rmdir sleep sort tee touch true truncate uname
+    uniq unlink wc
 )
 worker_undefined=()
 for entry in "${worker_entries[@]}"; do
@@ -173,7 +195,9 @@ for entry in "${worker_entries[@]}"; do
 done
 worker_raw="$build_dir/luna-busybox.worker.raw.o"
 ld -r "${worker_undefined[@]}" -o "$worker_raw" \
-    --start-group "$build_dir/coreutils/lib.a" "$build_dir/libbb/lib.a" \
+    --start-group "$build_dir/coreutils/lib.a" "$build_dir/editors/lib.a" \
+    "$build_dir/coreutils/libcoreutils/lib.a" \
+    "$build_dir/findutils/lib.a" "$build_dir/libbb/lib.a" \
     "$build_dir/libpwdgrp/lib.a" --end-group
 worker_mapped="$build_dir/luna-busybox.worker.mapped.o"
 objcopy "${abi_objcopy_args[@]}" "$worker_raw" "$worker_mapped"

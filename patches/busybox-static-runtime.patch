@@ -68,7 +68,7 @@ index 9344e4de1..5b26c6f71 100644
  #if ENABLE_ASH_CMDCMD
  /* Is it "command [-p] PROG ARGS" bltin, no other opts? Return ptr to "PROG" if yes */
  static int
-@@ -9576,6 +9628,19 @@ evalsubshell(union node *n, int flags)
+@@ -9576,6 +9628,21 @@ evalsubshell(union node *n, int flags)
  	int status;
  
  	errlinno = lineno = n->nredir.linno;
@@ -83,12 +83,14 @@ index 9344e4de1..5b26c6f71 100644
 +				INT_ON;
 +				return 0;
 +			}
++			ash_msg("%s: static background applet unavailable", argv[0]);
++			return pid == -ENOENT ? 127 : 126;
 +		}
 +	}
  
  	expredir(n->nredir.redirect);
  	if (!backgnd && (flags & EV_EXIT) && !may_have_traps)
-@@ -9683,6 +9748,12 @@ evalpipe(union node *n, int flags)
+@@ -9683,6 +9750,12 @@ evalpipe(union node *n, int flags)
  	int status = 0;
  
  	TRACE(("evalpipe(0x%lx) called\n", (long)n));
@@ -101,7 +103,7 @@ index 9344e4de1..5b26c6f71 100644
  	pipelen = 0;
  	for (lp = n->npipe.cmdlist; lp; lp = lp->next)
  		pipelen++;
-@@ -10563,6 +10634,11 @@ evalcommand(union node *cmd, int flags)
+@@ -10563,6 +10636,14 @@ evalcommand(union node *cmd, int flags)
  			break;
  		}
  #endif
@@ -110,6 +112,9 @@ index 9344e4de1..5b26c6f71 100644
 +			exitstatus = status;
 +			break;
 +		}
++		ash_msg("%s: static applet unavailable", argv[0]);
++		exitstatus = status == -ENOENT ? 127 : 126;
++		break;
  		/* Can we avoid forking? For example, very last command
  		 * in a script or a subshell does not need forking,
  		 * we can just exec it.

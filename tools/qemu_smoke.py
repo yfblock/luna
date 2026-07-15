@@ -50,6 +50,28 @@ BASE_COMMANDS = [
     "cut -d: -f2 /tmp/cut-data",
     "printf 'same\\nsame\\nnext\\n' > /tmp/uniq-data",
     "uniq /tmp/uniq-data",
+    "printf 'same\\n' > /run/cmp-a",
+    "cp /run/cmp-a /run/cmp-b && cmp /run/cmp-a /run/cmp-b && "
+    "echo busybox-cmp-cp-ok",
+    "printf 'z\\na\\nm\\n' > /run/sort-data",
+    "sort /run/sort-data",
+    "grep '^a$' /run/sort-data && echo busybox-grep-ok",
+    "printf 'tee-ok\\n' | tee /run/tee-data",
+    "cat /run/tee-data",
+    "dd if=/run/cmp-a of=/run/dd-copy bs=5 count=1 2>/dev/null && "
+    "cmp /run/cmp-a /run/dd-copy && echo busybox-dd-ok",
+    "mkdir -p /run/find-root/sub && cp /run/cmp-a /run/find-root/sub/target",
+    "find /run/find-root -name target -print",
+    "ls -1 /run/find-root/sub",
+    "mv /run/cmp-b /run/moved && cmp /run/cmp-a /run/moved && "
+    "echo busybox-mv-ok",
+    "no-such-static-command >/dev/null 2>&1 || echo static-missing-ok",
+    "echo rejected | no-such-static-command >/dev/null 2>&1 || "
+    "echo static-pipeline-reject-ok",
+    "true | true | true | true | true || echo static-pipeline-limit-ok",
+    "sleep 2 & sleep 2 & sleep 2 & sleep 2 & echo overflow & "
+    "test $? -ne 0 && echo static-worker-limit-ok; wait; "
+    "echo concurrent-background-ok",
     "echo background-ok & wait; echo background-wait-ok",
     "unlink /run/runtime-link && unlink /run/runtime-target",
     "mkdir -p /run/bb-remove/nested && "
@@ -70,6 +92,8 @@ REQUIRED = [
     b"LUNA_RESOURCE_POOL_OK",
     b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
     b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
+    b"LUNA_RESOURCE_PEAK_OK managed_frame_pages=8210 child_tcbs=66 "
+    b"child_notifications=194 heap_pages=8192 disk_pages=16 net_pages=2",
     b"LUNA_SYNC_TLS_OK",
     b"LUNA_THREAD_TIMER_OK",
     b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
@@ -77,6 +101,7 @@ REQUIRED = [
     b"LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci",
     b"LUNA_NETWORK_IPV4_OK address=10.0.2.15/24",
     b"LUNA_NETWORK_ASYNC_RX_OK notification=receive-only",
+    b"LUNA_ROOT_ALLOCATOR_POOL_OK bytes=8388608",
     b"LUNA_NETWORK_IRQ_OK line=",
     b"LUNA_NETWORK_ICMP_OK peer=10.0.2.2",
     b"LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080",
@@ -88,14 +113,18 @@ REQUIRED = [
     b"LUNA_NET_PEER_TX_COMPLETE unique=2048 count=2048",
     b"LUNA_NETWORK_TX_PRESSURE_OK packets=2048 payload=1200",
     b"LUNA_NETWORK_RECLAIM_OK rounds=100",
+    b"LUNA_LIFECYCLE_BENCHMARK_OK rounds=100",
     b"LUNA_PERSISTENCE_OK rounds=100",
     b"LUNA_STATIC_USER_OK path=/bin/busybox abi=1",
     b"LUNA_BUSYBOX_HEAP_OK bytes=1048576",
+    b"LUNA_BLOCK_BENCHMARK_OK bytes=1048576",
+    b"LUNA_PIPELINE_BENCHMARK_OK bytes=1048576",
+    b"LUNA_USER_RESOURCE_PEAK_OK heap_bytes=",
     b"LUNA_SPAWN_WAIT_OK pid=",
     b"LUNA_BUSYBOX_OK command=cat /tmp/x",
     b"LUNA_BUSYBOX_INTERACTIVE_READY prompt=luna-ash#",
     b"LUNA_BUSYBOX_INTERACTIVE_OK status=0 forbidden=0",
-    b"LUNA_STATIC_RUNTIME_OK workers=13 pipelines=3 background=1",
+    b"LUNA_STATIC_RUNTIME_OK workers=30 pipelines=4 background=5",
     b"LUNA_PHASE2_4_USER_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
@@ -138,6 +167,21 @@ REQUIRED_LINES = [
     b"right",
     b"same",
     b"next",
+    b"busybox-cmp-cp-ok",
+    b"a",
+    b"m",
+    b"z",
+    b"busybox-grep-ok",
+    b"tee-ok",
+    b"busybox-dd-ok",
+    b"/run/find-root/sub/target",
+    b"target",
+    b"busybox-mv-ok",
+    b"static-missing-ok",
+    b"static-pipeline-reject-ok",
+    b"static-pipeline-limit-ok",
+    b"static-worker-limit-ok",
+    b"concurrent-background-ok",
     b"background-ok",
     b"background-wait-ok",
     b"busybox-applets-ok",
@@ -188,6 +232,8 @@ FORBIDDEN = [
     b"BusyBox heap self-test failed",
     b"BusyBox spawn/wait failed",
     b"interactive BusyBox failed",
+    b"block benchmark failed",
+    b"pipeline benchmark failed",
     b"Error attempting syscall",
 ]
 PROMPT = re.compile(rb"luna-ash# ")
@@ -219,6 +265,11 @@ def main() -> int:
     parser.add_argument("--reset-disk", action="store_true")
     parser.add_argument("--persist-write")
     parser.add_argument("--persist-read")
+    parser.add_argument(
+        "--net-backend",
+        choices=("socket", "slirp", "passt", "tap"),
+        default=os.environ.get("LUNA_NET_BACKEND", "socket"),
+    )
     args = parser.parse_args()
     for value in (args.persist_write, args.persist_read):
         if value and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
@@ -226,6 +277,7 @@ def main() -> int:
 
     commands = list(BASE_COMMANDS)
     required = list(REQUIRED)
+    required.append(f"LUNA_QEMU_NET_BACKEND backend={args.net_backend}".encode())
     if args.persist_write:
         commands.insert(
             -1,
@@ -244,6 +296,7 @@ def main() -> int:
         env["LUNA_DISK_IMAGE"] = str(args.disk_image.resolve())
     if args.reset_disk:
         env["LUNA_DISK_RESET"] = "1"
+    env["LUNA_NET_BACKEND"] = args.net_backend
     proc = subprocess.Popen(
         [str(root / "run.sh"), "--run-only", "--no-timeout"],
         cwd=root,
@@ -326,6 +379,71 @@ def main() -> int:
             errors.append(f"kick-driven poll count unexpectedly high: {kick_polls}")
         if fallback_polls != 0:
             errors.append(f"unexpected continuous polling: {fallback_polls}")
+
+    pipeline_bench = re.search(
+        rb"LUNA_PIPELINE_BENCHMARK_OK bytes=(\d+) elapsed_ns=(\d+) "
+        rb"bytes_per_sec=(\d+)", data
+    )
+    if not pipeline_bench:
+        errors.append("pipeline benchmark statistics were not reported")
+    else:
+        size, elapsed, rate = map(int, pipeline_bench.groups())
+        if size != 1048576 or elapsed <= 0 or rate <= 0:
+            errors.append("pipeline benchmark statistics are invalid")
+
+    block_bench = re.search(
+        rb"LUNA_BLOCK_BENCHMARK_OK bytes=(\d+) seq_write_ns=(\d+) "
+        rb"seq_read_ns=(\d+) random_ops=(\d+) random_write_ns=(\d+) "
+        rb"random_read_ns=(\d+)", data
+    )
+    if not block_bench:
+        errors.append("block benchmark statistics were not reported")
+    else:
+        values = list(map(int, block_bench.groups()))
+        if values[0] != 1048576 or values[3] != 256 or any(
+            value <= 0 for value in values[1:3] + values[4:]
+        ):
+            errors.append("block benchmark statistics are invalid")
+
+    lifecycle = re.search(
+        rb"LUNA_LIFECYCLE_BENCHMARK_OK rounds=(\d+)", data
+    )
+    if not lifecycle:
+        errors.append("lifecycle benchmark statistics were not reported")
+    else:
+        rounds = int(lifecycle.group(1))
+        samples = {
+            name: [int(value) for value in re.findall(
+                rb"LUNA_LIFECYCLE_" + name + rb"_SAMPLE ns=(\d+)", data
+            )]
+            for name in (b"CREATE", b"START", b"DESTROY")
+        }
+        if rounds != 100 or any(
+            len(values) != rounds or any(value <= 0 for value in values)
+            for values in samples.values()
+        ):
+            errors.append("lifecycle benchmark statistics are invalid")
+
+    user_resources = re.search(
+        rb"LUNA_USER_RESOURCE_PEAK_OK heap_bytes=(\d+) workers=(\d+)", data
+    )
+    if not user_resources:
+        errors.append("user resource peak statistics were not reported")
+    else:
+        heap_bytes, workers = map(int, user_resources.groups())
+        if not 0 < heap_bytes <= 1048576 or workers != 4:
+            errors.append("user resource peak statistics are invalid")
+
+    rx_elapsed = re.search(
+        rb"LUNA_NET_QUEUE_STATS .* elapsed_ns=(\d+)", data
+    )
+    tx_elapsed = re.search(
+        rb"LUNA_NET_TX_QUEUE_STATS .* elapsed_ns=(\d+)", data
+    )
+    if not rx_elapsed or int(rx_elapsed.group(1)) <= 0:
+        errors.append("RX benchmark elapsed time is invalid")
+    if not tx_elapsed or int(tx_elapsed.group(1)) <= 0:
+        errors.append("TX benchmark elapsed time is invalid")
 
     if errors:
         print("\nSMOKE TEST FAILED", file=sys.stderr)

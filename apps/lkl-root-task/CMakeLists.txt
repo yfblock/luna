@@ -42,6 +42,11 @@ add_custom_command(
     DEPENDS "${LUNA_BUSYBOX_TOOL}" "${LUNA_BUSYBOX_CONFIG}"
             "${BUSYBOX_DIR}/coreutils/cat.c"
             "${BUSYBOX_DIR}/coreutils/echo.c"
+            "${BUSYBOX_DIR}/coreutils/cp.c"
+            "${BUSYBOX_DIR}/coreutils/ls.c"
+            "${BUSYBOX_DIR}/editors/cmp.c"
+            "${BUSYBOX_DIR}/findutils/find.c"
+            "${BUSYBOX_DIR}/findutils/grep.c"
             "${BUSYBOX_DIR}/shell/ash.c"
     COMMENT "Build BusyBox ash and nofork applet static host-program object"
     VERBATIM

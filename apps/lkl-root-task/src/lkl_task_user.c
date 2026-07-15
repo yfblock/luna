@@ -10,6 +10,7 @@
 #include <lkl.h>
 #include <lkl_host.h>
 #include <lkl/asm/syscalls.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -24,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
@@ -37,6 +39,11 @@
 #define LUNA_STATIC_WORKERS 4
 #define LUNA_STATIC_ARGC_MAX 16
 #define LUNA_STATIC_ARG_BYTES 1024
+#define LUNA_PIPELINE_BENCH_BYTES (1024UL * 1024UL)
+#define LUNA_BLOCK_BENCH_BYTES (1024UL * 1024UL)
+#define LUNA_BLOCK_BENCH_BLOCK 4096UL
+#define LUNA_BLOCK_BENCH_OPS \
+    (LUNA_BLOCK_BENCH_BYTES / LUNA_BLOCK_BENCH_BLOCK)
 
 extern int lbb_main(char **argv);
 void *luna_bb_malloc(size_t size);
@@ -82,6 +89,10 @@ static volatile unsigned task_static_started;
 static volatile unsigned task_static_pipelines;
 static volatile unsigned task_static_backgrounds;
 static volatile int task_static_getopt_lock;
+static volatile size_t task_user_heap_current;
+static volatile size_t task_user_heap_peak;
+static volatile unsigned task_static_current;
+static volatile unsigned task_static_peak;
 
 struct task_static_worker {
     volatile int in_use;
@@ -141,6 +152,24 @@ static struct task_static_worker *bb_current_worker(void)
             return worker;
     }
     return NULL;
+}
+
+static void task_peak_size(volatile size_t *peak, size_t value)
+{
+    size_t observed = __atomic_load_n(peak, __ATOMIC_RELAXED);
+    while (value > observed &&
+           !__atomic_compare_exchange_n(peak, &observed, value, 0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) { }
+}
+
+static void task_peak_unsigned(volatile unsigned *peak, unsigned value)
+{
+    unsigned observed = __atomic_load_n(peak, __ATOMIC_RELAXED);
+    while (value > observed &&
+           !__atomic_compare_exchange_n(peak, &observed, value, 0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) { }
 }
 
 static int *bb_errno_storage(void)
@@ -217,6 +246,30 @@ static long bb_result(long result)
 int *luna_bb_errno_location(void)
 {
     return &task_user_errno;
+}
+
+unsigned int luna_bb_gnu_dev_major(dev_t device)
+{
+    uint64_t value = (uint64_t)device;
+    return (unsigned int)(((value & 0x00000000000fff00ULL) >> 8) |
+                          ((value & 0xfffff00000000000ULL) >> 32));
+}
+
+unsigned int luna_bb_gnu_dev_minor(dev_t device)
+{
+    uint64_t value = (uint64_t)device;
+    return (unsigned int)((value & 0x00000000000000ffULL) |
+                          ((value & 0x00000ffffff00000ULL) >> 12));
+}
+
+dev_t luna_bb_gnu_dev_makedev(unsigned int major_number,
+                              unsigned int minor_number)
+{
+    uint64_t value = ((uint64_t)(major_number & 0x00000fffU) << 8) |
+                     ((uint64_t)(major_number & 0xfffff000U) << 32) |
+                     (uint64_t)(minor_number & 0x000000ffU) |
+                     ((uint64_t)(minor_number & 0xffffff00U) << 12);
+    return (dev_t)value;
 }
 
 static int bb_stat_result(long result, const struct lkl_stat *source,
@@ -350,6 +403,13 @@ struct luna_bb_file {
     int error;
     int eof;
     int ungot;
+};
+
+#define LUNA_BB_DIR_MAGIC 0x4c424244U
+struct luna_bb_dir {
+    uint32_t magic;
+    struct lkl_dir *directory;
+    struct dirent entry;
 };
 
 static struct luna_bb_file *bb_file_object(FILE *stream)
@@ -674,6 +734,33 @@ int luna_bb_ferror_unlocked(FILE *stream)
     return luna_bb_ferror(stream);
 }
 
+int luna_bb_getchar(void)
+{
+    return luna_bb_getc(stdin);
+}
+
+int luna_bb_getchar_unlocked(void)
+{
+    return luna_bb_getc(stdin);
+}
+
+void luna_bb_setbuf(FILE *stream, char *buffer)
+{
+    (void)stream;
+    (void)buffer;
+}
+
+int luna_bb_setvbuf(FILE *stream, char *buffer, int mode, size_t size)
+{
+    (void)buffer;
+    (void)mode;
+    (void)size;
+    if (stream == stdin || stream == stdout || stream == stderr ||
+        bb_file_object(stream)) return 0;
+    task_user_errno = EBADF;
+    return -1;
+}
+
 void luna_bb_clearerr(FILE *stream)
 {
     struct luna_bb_file *file = bb_file_object(stream);
@@ -742,6 +829,145 @@ int luna_bb_lstat(const char *path, struct stat *target)
     struct lkl_stat source;
     long result = lkl_sys_lstat(path, &source);
     return bb_stat_result(result, &source, target);
+}
+
+int luna_bb_access(const char *path, int mode)
+{
+    return (int)bb_result(lkl_sys_access(path, mode));
+}
+
+int luna_bb_chown(const char *path, uid_t user, gid_t group)
+{
+    return (int)bb_result(lkl_sys_chown(path, user, group));
+}
+
+int luna_bb_lchown(const char *path, uid_t user, gid_t group)
+{
+    return (int)bb_result(lkl_sys_fchownat(LKL_AT_FDCWD, path, user, group,
+                                           LKL_AT_SYMLINK_NOFOLLOW));
+}
+
+int luna_bb_mknod(const char *path, mode_t mode, dev_t device)
+{
+    return (int)bb_result(lkl_sys_mknod(path, mode, device));
+}
+
+int luna_bb_utimes(const char *path, const struct timeval times[2])
+{
+    struct __lkl__kernel_timespec converted[2];
+    if (times) {
+        for (int i = 0; i < 2; i++) {
+            converted[i].tv_sec = times[i].tv_sec;
+            converted[i].tv_nsec = times[i].tv_usec * 1000L;
+        }
+    }
+    return (int)bb_result(lkl_sys_utimensat(LKL_AT_FDCWD, path,
+                                            times ? converted : NULL, 0));
+}
+
+int luna_bb_gettimeofday(struct timeval *time_value, void *timezone)
+{
+    (void)timezone;
+    if (!time_value) {
+        task_user_errno = EINVAL;
+        return -1;
+    }
+    unsigned long long now = luna_lkl_task_time();
+    time_value->tv_sec = (time_t)(now / 1000000000ULL);
+    time_value->tv_usec = (suseconds_t)((now % 1000000000ULL) / 1000ULL);
+    return 0;
+}
+
+DIR *luna_bb_opendir(const char *path)
+{
+    int error = 0;
+    struct lkl_dir *directory = lkl_opendir(path, &error);
+    if (!directory) {
+        task_user_errno = error < 0 ? -error : error;
+        return NULL;
+    }
+    struct luna_bb_dir *stream = luna_bb_malloc(sizeof(*stream));
+    if (!stream) {
+        lkl_closedir(directory);
+        return NULL;
+    }
+    memset(stream, 0, sizeof(*stream));
+    stream->magic = LUNA_BB_DIR_MAGIC;
+    stream->directory = directory;
+    return (DIR *)stream;
+}
+
+DIR *luna_bb_fdopendir(int fd)
+{
+    int actual = bb_fd(fd);
+    int error = 0;
+    struct lkl_dir *directory = lkl_fdopendir(actual, &error);
+    if (!directory) {
+        task_user_errno = error < 0 ? -error : error;
+        return NULL;
+    }
+    struct luna_bb_dir *stream = luna_bb_malloc(sizeof(*stream));
+    if (!stream) {
+        lkl_closedir(directory);
+        return NULL;
+    }
+    memset(stream, 0, sizeof(*stream));
+    stream->magic = LUNA_BB_DIR_MAGIC;
+    stream->directory = directory;
+    return (DIR *)stream;
+}
+
+struct dirent *luna_bb_readdir(DIR *directory)
+{
+    struct luna_bb_dir *stream = (void *)directory;
+    if (!stream || stream->magic != LUNA_BB_DIR_MAGIC) {
+        task_user_errno = EBADF;
+        return NULL;
+    }
+    struct lkl_linux_dirent64 *entry = lkl_readdir(stream->directory);
+    if (!entry) {
+        int error = lkl_errdir(stream->directory);
+        if (error < 0) task_user_errno = -error;
+        return NULL;
+    }
+    size_t length = strnlen(entry->d_name, sizeof(stream->entry.d_name) - 1U);
+    stream->entry.d_ino = (ino_t)entry->d_ino;
+    stream->entry.d_off = (off_t)entry->d_off;
+    stream->entry.d_reclen = sizeof(stream->entry);
+    stream->entry.d_type = entry->d_type;
+    memcpy(stream->entry.d_name, entry->d_name, length);
+    stream->entry.d_name[length] = '\0';
+    return &stream->entry;
+}
+
+int luna_bb_closedir(DIR *directory)
+{
+    struct luna_bb_dir *stream = (void *)directory;
+    if (!stream || stream->magic != LUNA_BB_DIR_MAGIC) {
+        task_user_errno = EBADF;
+        return -1;
+    }
+    int result = lkl_closedir(stream->directory);
+    stream->magic = 0;
+    luna_bb_free(stream);
+    return (int)bb_result(result);
+}
+
+void luna_bb_rewinddir(DIR *directory)
+{
+    struct luna_bb_dir *stream = (void *)directory;
+    if (stream && stream->magic == LUNA_BB_DIR_MAGIC)
+        lkl_rewinddir(stream->directory);
+}
+
+int luna_bb_dirfd(DIR *directory)
+{
+    struct luna_bb_dir *stream = (void *)directory;
+    if (!stream || stream->magic != LUNA_BB_DIR_MAGIC) {
+        task_user_errno = EBADF;
+        return -1;
+    }
+    return lkl_dirfd(stream->directory);
 }
 
 int luna_bb_chdir(const char *path)
@@ -1092,6 +1318,10 @@ void *luna_bb_malloc(size_t size)
             block->next = split;
         }
         block->free = 0;
+        size_t current = __atomic_add_fetch(&task_user_heap_current,
+                                            block->size,
+                                            __ATOMIC_RELAXED);
+        task_peak_size(&task_user_heap_peak, current);
         task_user_heap_release();
         return block + 1;
     }
@@ -1114,6 +1344,7 @@ void luna_bb_free(void *pointer)
         task_user_heap_release();
         return;
     }
+    size_t released = block->size;
     block->free = 1;
     if (block->next && block->next->free) {
         block->size += sizeof(*block) + block->next->size;
@@ -1123,6 +1354,7 @@ void luna_bb_free(void *pointer)
         previous->size += sizeof(*previous) + block->size;
         previous->next = block->next;
     }
+    __atomic_sub_fetch(&task_user_heap_current, released, __ATOMIC_RELAXED);
     task_user_heap_release();
 }
 
@@ -1269,9 +1501,10 @@ int luna_bb_execvp(const char *file, char *const argv[])
 static int task_static_command_allowed(const char *name)
 {
     static const char *const commands[] = {
-        "basename", "cat", "cut", "dirname", "echo", "false", "head",
-        "ln", "mkdir", "printenv", "printf", "readlink", "realpath",
-        "rmdir", "touch", "true", "truncate", "uname", "uniq", "unlink",
+        "basename", "cat", "cmp", "cp", "cut", "dd", "dirname", "echo",
+        "false", "find", "grep", "head", "ln", "ls", "mkdir", "mv",
+        "printenv", "printf", "readlink", "realpath", "rmdir", "sleep",
+        "sort", "tee", "touch", "true", "truncate", "uname", "uniq", "unlink",
         "wc",
     };
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
@@ -1296,6 +1529,9 @@ static struct task_static_worker *task_static_allocate(void)
             worker->error_number = 0;
             worker->getopt_locked = 0;
             for (int fd = 0; fd < 3; fd++) worker->fd_map[fd] = -1;
+            unsigned current = __atomic_add_fetch(&task_static_current, 1U,
+                                                  __ATOMIC_RELAXED);
+            task_peak_unsigned(&task_static_peak, current);
             return worker;
         }
     }
@@ -1311,6 +1547,7 @@ static void task_static_release(struct task_static_worker *worker)
             worker->fd_map[fd] = -1;
         }
     }
+    __atomic_sub_fetch(&task_static_current, 1U, __ATOMIC_RELAXED);
     __atomic_store_n(&worker->in_use, 0, __ATOMIC_RELEASE);
 }
 
@@ -1429,7 +1666,11 @@ long luna_bb_spawn_static(char **argv)
 int luna_bb_run_pipeline(int count, char ***commands)
 {
     if (count < 2 || count > LUNA_STATIC_WORKERS) return -EINVAL;
-    __atomic_add_fetch(&task_static_pipelines, 1U, __ATOMIC_RELAXED);
+    for (int i = 0; i < count; i++) {
+        if (!commands[i] || !commands[i][0] ||
+            !task_static_command_allowed(commands[i][0]))
+            return -ENOENT;
+    }
     int pipes[LUNA_STATIC_WORKERS - 1][2];
     memset(pipes, -1, sizeof(pipes));
     for (int i = 0; i < count - 1; i++) {
@@ -1448,6 +1689,7 @@ int luna_bb_run_pipeline(int count, char ***commands)
         int pid = task_static_start(workers[i], commands[i], input, output, 2);
         if (pid < 0) goto fail_workers;
     }
+    __atomic_add_fetch(&task_static_pipelines, 1U, __ATOMIC_RELAXED);
     for (int i = 0; i < count - 1; i++) {
         lkl_sys_close((unsigned int)pipes[i][0]);
         lkl_sys_close((unsigned int)pipes[i][1]);
@@ -1476,28 +1718,34 @@ fail_pipes:
 
 pid_t luna_bb_waitpid(pid_t pid, int *status, int options)
 {
-    struct task_static_worker *selected = NULL;
-    for (int i = 0; i < LUNA_STATIC_WORKERS; i++) {
-        struct task_static_worker *worker = &task_static_workers[i];
-        if (!worker->in_use || worker->reaped) continue;
-        if (pid > 0 && worker->tid != (lkl_thread_t)pid) continue;
-        if (worker->done) {
-            selected = worker;
-            break;
+    for (;;) {
+        struct task_static_worker *selected = NULL;
+        int matching = 0;
+        for (int i = 0; i < LUNA_STATIC_WORKERS; i++) {
+            struct task_static_worker *worker = &task_static_workers[i];
+            if (!worker->in_use || worker->reaped) continue;
+            if (pid > 0 && worker->tid != (lkl_thread_t)pid) continue;
+            matching = 1;
+            if (worker->done) {
+                selected = worker;
+                break;
+            }
         }
-        if (!selected) selected = worker;
+        if (selected) {
+            pid_t result = (pid_t)selected->tid;
+            if (task_static_join(selected, status) < 0) {
+                task_user_errno = ECHILD;
+                return -1;
+            }
+            return result;
+        }
+        if (!matching) {
+            task_user_errno = ECHILD;
+            return -1;
+        }
+        if (options & WNOHANG) return 0;
+        seL4_Yield();
     }
-    if (!selected) {
-        task_user_errno = ECHILD;
-        return -1;
-    }
-    if ((options & WNOHANG) && !selected->done) return 0;
-    pid_t result = (pid_t)selected->tid;
-    if (task_static_join(selected, status) < 0) {
-        task_user_errno = ECHILD;
-        return -1;
-    }
-    return result;
 }
 
 int luna_bb_pipe(int pipefd[2])
@@ -1551,12 +1799,127 @@ static void task_busybox_worker(void *arg)
 static void task_user_heap_reset(void)
 {
     task_user_heap_lock = 0;
+    task_user_heap_current = 0;
+    task_user_heap_peak = 0;
     memset(task_user_heap, 0, sizeof(task_user_heap));
     task_user_heap_head = (void *)task_user_heap;
     task_user_heap_head->size = sizeof(task_user_heap) -
                                sizeof(*task_user_heap_head);
     task_user_heap_head->next = NULL;
     task_user_heap_head->free = 1;
+}
+
+static int task_block_benchmark(void)
+{
+    static const char path[] = "/luna-block-benchmark";
+    char buffer[LUNA_BLOCK_BENCH_BLOCK];
+    long fd = lkl_sys_open(path, LKL_O_RDWR | LKL_O_CREAT | LKL_O_TRUNC,
+                           0644);
+    if (fd < 0) return -1;
+
+    unsigned long long start = luna_lkl_task_time();
+    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
+        memset(buffer, (unsigned char)block, sizeof(buffer));
+        if (lkl_sys_write((unsigned int)fd, buffer, sizeof(buffer)) !=
+            (long)sizeof(buffer)) goto fail;
+    }
+    if (lkl_sys_fsync((unsigned int)fd)) goto fail;
+    unsigned long long sequential_write = luna_lkl_task_time() - start;
+
+    if (lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
+    start = luna_lkl_task_time();
+    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
+        if (lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
+            (long)sizeof(buffer)) goto fail;
+        for (size_t i = 0; i < sizeof(buffer); i++)
+            if ((unsigned char)buffer[i] != (unsigned char)block) goto fail;
+    }
+    unsigned long long sequential_read = luna_lkl_task_time() - start;
+
+    start = luna_lkl_task_time();
+    for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
+         operation++) {
+        unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
+        memset(buffer, (unsigned char)(block ^ 0xa5U), sizeof(buffer));
+        if (lkl_sys_lseek((unsigned int)fd,
+                          (long long)block * LUNA_BLOCK_BENCH_BLOCK,
+                          LKL_SEEK_SET) < 0 ||
+            lkl_sys_write((unsigned int)fd, buffer, sizeof(buffer)) !=
+                (long)sizeof(buffer)) goto fail;
+    }
+    if (lkl_sys_fsync((unsigned int)fd)) goto fail;
+    unsigned long long random_write = luna_lkl_task_time() - start;
+
+    start = luna_lkl_task_time();
+    for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
+         operation++) {
+        unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
+        if (lkl_sys_lseek((unsigned int)fd,
+                          (long long)block * LUNA_BLOCK_BENCH_BLOCK,
+                          LKL_SEEK_SET) < 0 ||
+            lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
+                (long)sizeof(buffer)) goto fail;
+        for (size_t i = 0; i < sizeof(buffer); i++)
+            if ((unsigned char)buffer[i] !=
+                (unsigned char)(block ^ 0xa5U)) goto fail;
+    }
+    unsigned long long random_read = luna_lkl_task_time() - start;
+    if (lkl_sys_close((unsigned int)fd) || !sequential_write ||
+        !sequential_read || !random_write || !random_read) return -1;
+    lkl_printf("LUNA_BLOCK_BENCHMARK_OK bytes=%lu seq_write_ns=%llu "
+               "seq_read_ns=%llu random_ops=%lu random_write_ns=%llu "
+               "random_read_ns=%llu\n",
+               (unsigned long)LUNA_BLOCK_BENCH_BYTES, sequential_write,
+               sequential_read, (unsigned long)LUNA_BLOCK_BENCH_OPS,
+               random_write, random_read);
+    return 0;
+
+fail:
+    lkl_sys_close((unsigned int)fd);
+    return -1;
+}
+
+static int task_pipeline_benchmark(void)
+{
+    static const char path[] = "/run/luna-pipeline-benchmark";
+    static const char output_path[] = "/run/luna-pipeline-output";
+    char buffer[LUNA_BLOCK_BENCH_BLOCK];
+    memset(buffer, 0x5a, sizeof(buffer));
+    long fd = lkl_sys_open(path, LKL_O_WRONLY | LKL_O_CREAT | LKL_O_TRUNC,
+                           0600);
+    if (fd < 0) return -1;
+    for (size_t written = 0; written < LUNA_PIPELINE_BENCH_BYTES;
+         written += sizeof(buffer)) {
+        if (lkl_sys_write((unsigned int)fd, buffer, sizeof(buffer)) !=
+            (long)sizeof(buffer)) {
+            lkl_sys_close((unsigned int)fd);
+            return -1;
+        }
+    }
+    if (lkl_sys_close((unsigned int)fd)) return -1;
+
+    char *cat_argv[] = { "cat", (char *)path, NULL };
+    char dd_output[] = "of=/run/luna-pipeline-output";
+    char *dd_argv[] = { "dd", dd_output, "bs=4096", NULL };
+    char **commands[] = { cat_argv, dd_argv };
+    unsigned long long start = luna_lkl_task_time();
+    int result = luna_bb_run_pipeline(2, commands);
+    unsigned long long elapsed = luna_lkl_task_time() - start;
+    lkl_sys_unlink(path);
+    struct lkl_stat output_stat;
+    if (result || !elapsed || lkl_sys_stat(output_path, &output_stat) ||
+        output_stat.st_size != LUNA_PIPELINE_BENCH_BYTES) {
+        lkl_sys_unlink(output_path);
+        return -1;
+    }
+    lkl_sys_unlink(output_path);
+    unsigned long long bytes_per_second =
+        (LUNA_PIPELINE_BENCH_BYTES * 1000000000ULL) / elapsed;
+    lkl_printf("LUNA_PIPELINE_BENCHMARK_OK bytes=%lu elapsed_ns=%llu "
+               "bytes_per_sec=%llu\n",
+               (unsigned long)LUNA_PIPELINE_BENCH_BYTES, elapsed,
+               bytes_per_second);
+    return 0;
 }
 
 static int task_user_heap_self_test(void)
@@ -1611,6 +1974,10 @@ int luna_lkl_task_user_smoke(void)
     }
     task_user_forbidden_calls = 0;
     task_user_errno = 0;
+    if (task_block_benchmark()) {
+        lkl_printf("luna-lkl-task: block benchmark failed\n");
+        return -1;
+    }
     if (task_user_heap_self_test()) {
         lkl_printf("luna-lkl-task: BusyBox heap self-test failed\n");
         return -1;
@@ -1657,6 +2024,21 @@ int luna_lkl_task_user_shell(void)
     task_static_pipelines = 0;
     task_static_backgrounds = 0;
     task_static_getopt_lock = 0;
+    task_static_current = 0;
+    task_static_peak = 0;
+    task_user_heap_reset();
+    if (task_pipeline_benchmark()) {
+        lkl_printf("luna-lkl-task: pipeline benchmark failed\n");
+        return -1;
+    }
+    memset(task_static_workers, 0, sizeof(task_static_workers));
+    memset(task_user_signal_handlers, 0, sizeof(task_user_signal_handlers));
+    task_static_started = 0;
+    task_static_pipelines = 0;
+    task_static_backgrounds = 0;
+    task_static_getopt_lock = 0;
+    task_static_current = 0;
+    task_static_peak = 0;
     task_user_heap_reset();
     lkl_printf("LUNA_BUSYBOX_INTERACTIVE_READY prompt=luna-ash#\n");
     lkl_thread_t pid = lkl_host_ops.thread_create(task_busybox_shell_worker,
@@ -1680,5 +2062,7 @@ int luna_lkl_task_user_shell(void)
                task_static_backgrounds);
     lkl_printf("LUNA_BUSYBOX_INTERACTIVE_OK status=%d forbidden=%d\n",
                task_user_status, task_user_forbidden_calls);
+    lkl_printf("LUNA_USER_RESOURCE_PEAK_OK heap_bytes=%lu workers=%u\n",
+               (unsigned long)task_user_heap_peak, task_static_peak);
     return 0;
 }

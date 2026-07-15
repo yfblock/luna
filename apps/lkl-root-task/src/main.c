@@ -3,6 +3,7 @@
  * isolated LKL task's capabilities and lifecycle. LKL itself is not linked
  * into this executable. */
 #include "luna_isolation.h"
+#include "luna_isolation_protocol.h"
 #include <sel4/sel4.h>
 #include <sel4runtime.h>
 #include <simple-default/simple-default.h>
@@ -26,7 +27,7 @@
 /* Loading the isolated LKL ELF plus the packed rootfs and repeatedly mapping
  * child resources creates metadata for many thousands of frames and mappings.
  * Keep this pool independent from the physical Untyped budget. */
-#define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 2048)
+#define ALLOCATOR_STATIC_POOL_SIZE LUNA_ROOT_ALLOCATOR_POOL_SIZE
 /* allocman's fixed-pool mspace keeps boundary metadata immediately after the
  * supplied arena. Isolate unrelated root state from that implementation
  * detail instead of relying on linker ordering between translation units. */
