@@ -29,11 +29,14 @@ REQUIRED = [
     b"LUNA_ISOLATION_CHANNEL_OK",
     b"LUNA_LKL_CHILD_LINKED",
     b"LUNA_RESOURCE_POOL_OK",
+    b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
+    b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
     b"LUNA_LKL_CHILD_HALT_OK",
     b"LUNA_LKL_CHILD_SHELL_READY",
     b"LUNA_ISOLATION_RESTART_OK",
+    b"LUNA_RESTART_STRESS_OK rounds=100",
     b"LUNA_ISOLATION_OK",
     b"unknown: " + b"x" * 200,
     b"slept 100 ms",
@@ -42,7 +45,22 @@ REQUIRED = [
     b"LUNA_SHUTDOWN_OK",
 ]
 
-FORBIDDEN = [b"Caught cap fault", b"vm fault", b"LKL host panic", b"Kernel panic"]
+FORBIDDEN = [
+    b"Caught cap fault",
+    b"vm fault",
+    b"LKL host panic",
+    b"Kernel panic",
+    b"host heap exhausted",
+    b"invalid host heap free",
+    b"corrupt host heap free",
+    b"host heap not fully released",
+    b"host page map failed",
+    b"host page unmap failed",
+    b"child heap request failed",
+    b"failed to delete child resource cap",
+    b"Cannot clear reserved entries mid level",
+    b"Untyped Retype",
+]
 PROMPT = re.compile(rb"lkl:[^\r\n]*# ")
 
 
@@ -67,7 +85,7 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drive the luna LKL shell and verify a QEMU boot")
-    parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]

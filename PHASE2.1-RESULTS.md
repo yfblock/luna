@@ -179,5 +179,6 @@ SMOKE TEST PASSED
 
 ## 后续阶段
 
-Phase 2.1 的隔离迁移已经结束。下一阶段是 Phase 2.2：用可回收页分配器替代 child 的 32MiB bump
-heap，补齐可计数 semaphore 与同步语义，并加入重复启动/关机压力测试。详见 `next-plan.md`。
+Phase 2.1 的隔离迁移已经结束。Phase 2.2 已进一步用 manager 受控的按需页映射替代 32MiB bump
+heap，并通过 100 轮完整重启压力测试；详见 `PHASE2.2-RESULTS.md`。同步与 TLS 语义的后续工作见
+`next-plan.md`。

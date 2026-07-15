@@ -23,10 +23,9 @@
 #include <utils/util.h>
 #include <stdlib.h>
 
-/* Loading the isolated LKL ELF creates metadata for several thousand frames
- * and mappings.  Keep this pool independent from the physical Untyped budget:
- * 1 MiB was sufficient for the pre-kernel child, but exhausted allocman after
- * the child gained its 32 MiB host heap. */
+/* Loading the isolated LKL ELF and repeatedly mapping its manager-backed heap
+ * creates metadata for several thousand frames and mappings. Keep this pool
+ * independent from the physical Untyped budget. */
 #define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 1024)
 static char allocator_mem_pool[ALLOCATOR_STATIC_POOL_SIZE];
 

@@ -21,8 +21,11 @@ struct luna_task_sync_resource {
 int luna_lkl_task_configure_resources(
     const struct luna_task_thread_resource threads[LUNA_RESOURCE_SLOTS],
     const struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS],
-    seL4_CPtr console_io_port);
+    seL4_CPtr console_io_port, seL4_CPtr control_ep,
+    seL4_CPtr command_ep);
 int luna_lkl_task_thread_test(void);
+int luna_lkl_task_allocator_test(void);
+int luna_lkl_task_allocator_idle(void);
 int luna_lkl_task_init(void);
 int luna_lkl_task_start_kernel(unsigned long long tsc_frequency);
 long luna_lkl_task_halt(void);

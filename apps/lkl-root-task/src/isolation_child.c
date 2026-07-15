@@ -60,6 +60,8 @@ static __attribute__((noreturn)) void finish_child(void)
 {
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_HALT_OK,
                child_boot.mode);
+    send_event(child_boot.control_ep,
+               LUNA_ISOLATION_EVENT_ALLOCATOR_RELEASED, child_boot.mode);
 
     if (child_boot.mode == LUNA_ISOLATION_MODE_FAULT) {
         /* The manager maps this address only in its own VSpace. Reaching the
@@ -131,7 +133,9 @@ int main(int argc, char **argv)
         for (;;) seL4_Yield();
     seL4_CPtr console_io_port = (seL4_CPtr)seL4_GetMR(1);
 
-    if (luna_lkl_task_configure_resources(resources, sync, console_io_port))
+    if (luna_lkl_task_configure_resources(
+            resources, sync, console_io_port, child_boot.control_ep,
+            child_boot.command_ep))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED,
                child_boot.mode);
@@ -145,6 +149,10 @@ int main(int argc, char **argv)
     if (luna_lkl_task_thread_test())
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK,
+               child_boot.mode);
+    if (luna_lkl_task_allocator_test())
+        for (;;) seL4_Yield();
+    send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_ALLOCATOR_OK,
                child_boot.mode);
 
     if (luna_lkl_task_init()) {
@@ -168,5 +176,7 @@ int main(int argc, char **argv)
     if (luna_lkl_task_halt()) {
         for (;;) seL4_Yield();
     }
+    if (!luna_lkl_task_allocator_idle())
+        for (;;) seL4_Yield();
     finish_child();
 }
