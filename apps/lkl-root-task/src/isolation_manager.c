@@ -566,7 +566,8 @@ static int receive_event(struct luna_event_context *context,
              event == LUNA_ISOLATION_EVENT_NET_WAKE ||
              event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
              event == LUNA_ISOLATION_EVENT_NET_STATS ||
-             event == LUNA_ISOLATION_EVENT_NET_TX_STATS)) {
+             event == LUNA_ISOLATION_EVENT_NET_TX_STATS ||
+             event == LUNA_ISOLATION_EVENT_NET_TX_STRESS)) {
             if (seL4_GetMR(2) ||
                 luna_network_service(context->command_ep, event,
                                      seL4_GetMR(1)))

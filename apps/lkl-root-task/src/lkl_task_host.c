@@ -507,7 +507,8 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
                event == LUNA_ISOLATION_EVENT_NET_WAKE ||
                event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
                event == LUNA_ISOLATION_EVENT_NET_STATS ||
-               event == LUNA_ISOLATION_EVENT_NET_TX_STATS) {
+               event == LUNA_ISOLATION_EVENT_NET_TX_STATS ||
+               event == LUNA_ISOLATION_EVENT_NET_TX_STRESS) {
         expected = LUNA_COMMAND_NET_RESULT;
         expected_length = 3;
     } else {

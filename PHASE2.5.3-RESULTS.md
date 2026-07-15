@@ -8,6 +8,11 @@ kick/IRQ thread 逐项提交到 virtio-net-pci，TX completion 主要由 INTx ha
 后重试，直到成功 enqueue；该路径不会将暂时背压变成 LKL virtqueue I/O error，也不会扩大 child 的
 PCI、DMA 或 Notification capability。
 
+自动回归使用 manager-private 一次性 stress gate：测试开始时暂缓 software queue drain，queue 首次
+填满并返回 retry 后立即自动放行。这使 high-water/backpressure 验收不依赖 IRQ thread 与 child send
+之间的调度竞态。UDP peer 仍需校验并收齐全部 2048 个唯一 sequence；数据包或 ACK 偶发丢失时最多
+进行三轮有界重传。
+
 统计覆盖：
 
 - queue high-water；

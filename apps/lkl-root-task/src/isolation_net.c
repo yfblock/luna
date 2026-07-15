@@ -74,6 +74,7 @@ struct luna_network_state {
     volatile unsigned tx_head;
     volatile unsigned tx_tail;
     volatile int tx_pending;
+    volatile int tx_stress_gate;
     volatile int child_active;
     volatile int poll_in_driver;
     volatile int irq_in_driver;
@@ -269,6 +270,8 @@ static void transmit_complete(void *cookie, void *buffer_cookie)
 
 static void process_tx_queue(struct luna_network_state *state)
 {
+    if (__atomic_load_n(&state->tx_stress_gate, __ATOMIC_ACQUIRE))
+        return;
     if (__atomic_load_n(&state->tx_pending, __ATOMIC_ACQUIRE))
         return;
     unsigned tail = __atomic_load_n(&state->tx_tail, __ATOMIC_RELAXED);
@@ -686,6 +689,7 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.tx_backpressure, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_driver_retries, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_completed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_stress_gate, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_count, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_kick_polls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.fallback_polls, 0, __ATOMIC_RELEASE);
@@ -703,6 +707,7 @@ void luna_network_deactivate_child(void)
         !network.ready)
         return;
     __atomic_store_n(&network.child_active, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.tx_stress_gate, 0, __ATOMIC_RELEASE);
     seL4_Signal(network.poll_kick_ntfn.cptr);
     while (__atomic_load_n(&network.poll_in_driver, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&network.irq_in_driver, __ATOMIC_ACQUIRE) ||
@@ -753,6 +758,9 @@ static int service_tx(size_t length)
     unsigned next = (head + 1U) % LUNA_NET_TX_QUEUE_COUNT;
     if (next == tail) {
         __atomic_fetch_add(&network.tx_backpressure, 1, __ATOMIC_RELAXED);
+        if (__atomic_exchange_n(&network.tx_stress_gate, 0,
+                                __ATOMIC_ACQ_REL))
+            seL4_Signal(network.poll_kick_ntfn.cptr);
         return LUNA_NET_TX_RETRY;
     }
     struct luna_tx_packet *packet = &network.tx_queue[head];
@@ -837,6 +845,34 @@ static int service_control(seL4_Word control)
     return 0;
 }
 
+static int service_tx_stress(seL4_Word control)
+{
+    if (control > 1) return -1;
+    if (control) {
+        for (unsigned attempt = 0;
+             attempt < 100000U &&
+             (!tx_queue_empty(&network) ||
+              __atomic_load_n(&network.tx_pending, __ATOMIC_ACQUIRE));
+             attempt++) {
+            seL4_Signal(network.poll_kick_ntfn.cptr);
+            seL4_Yield();
+        }
+        if (!tx_queue_empty(&network) ||
+            __atomic_load_n(&network.tx_pending, __ATOMIC_ACQUIRE)) {
+            printf("luna: TX stress gate quiesce failed head=%u tail=%u "
+                   "pending=%d\n",
+                   __atomic_load_n(&network.tx_head, __ATOMIC_ACQUIRE),
+                   __atomic_load_n(&network.tx_tail, __ATOMIC_ACQUIRE),
+                   __atomic_load_n(&network.tx_pending, __ATOMIC_ACQUIRE));
+            return -1;
+        }
+    }
+    __atomic_store_n(&network.tx_stress_gate, control != 0,
+                     __ATOMIC_RELEASE);
+    if (!control) seL4_Signal(network.poll_kick_ntfn.cptr);
+    return 0;
+}
+
 int luna_network_service(seL4_CPtr command_ep, seL4_Word event,
                          seL4_Word length_word)
 {
@@ -859,7 +895,8 @@ int luna_network_service(seL4_CPtr command_ep, seL4_Word event,
                    !length_word) {
             response = service_tx_stats();
             error = 0;
-        }
+        } else if (event == LUNA_ISOLATION_EVENT_NET_TX_STRESS)
+            error = service_tx_stress(length_word);
     }
     __sync_synchronize();
     seL4_SetMR(0, LUNA_COMMAND_NET_RESULT);

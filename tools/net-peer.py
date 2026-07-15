@@ -83,6 +83,7 @@ class Peer:
     def __init__(self) -> None:
         self.connections: dict[int, dict[str, int]] = {}
         self.tx_streams: dict[tuple[int, int], set[int]] = {}
+        self.tx_completed: set[tuple[int, int]] = set()
 
     def handle_arp(self, packet: bytes) -> bytes | None:
         if len(packet) < 42:
@@ -161,11 +162,22 @@ class Peer:
         if payload[16:] != bytes([sequence & 0xFF]) * (len(payload) - 16):
             return None
         key = (src_port, count)
+        if key in self.tx_completed:
+            ack = TX_ACK_MAGIC + struct.pack("!II", count,
+                                             count * len(payload))
+            return udp_segment(TX_UDP_PORT, src_port, ack, 0x4000)
         received = self.tx_streams.setdefault(key, set())
         received.add(sequence)
+        if len(received) == count:
+            print(
+                f"LUNA_NET_PEER_TX_COMPLETE unique={len(received)} "
+                f"count={count}",
+                flush=True,
+            )
         if len(received) != count:
             return None
         del self.tx_streams[key]
+        self.tx_completed.add(key)
         ack = TX_ACK_MAGIC + struct.pack("!II", count, count * len(payload))
         return udp_segment(TX_UDP_PORT, src_port, ack, 0x4000)
 

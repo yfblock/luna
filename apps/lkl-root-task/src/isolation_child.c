@@ -246,7 +246,8 @@ int main(int argc, char **argv)
                    LUNA_ISOLATION_EVENT_USER_PROGRAM_OK, child_boot.mode);
         send_event(child_boot.control_ep,
                    LUNA_ISOLATION_EVENT_LKL_SHELL_READY, child_boot.mode);
-        luna_shell_run(luna_lkl_task_time);
+        if (luna_lkl_task_user_shell())
+            for (;;) seL4_Yield();
     }
     if (luna_lkl_task_disk_finish() || luna_lkl_task_net_finish())
         for (;;) seL4_Yield();

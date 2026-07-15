@@ -55,6 +55,7 @@ int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode);
 int luna_lkl_task_disk_finish(void);
 int luna_lkl_task_disk_cleanup_after_halt(void);
 int luna_lkl_task_user_smoke(void);
+int luna_lkl_task_user_shell(void);
 int luna_lkl_task_start_kernel(unsigned long long tsc_frequency);
 long luna_lkl_task_halt(void);
 unsigned long long luna_lkl_task_time(void);

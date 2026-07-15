@@ -11,19 +11,20 @@ import time
 from pathlib import Path
 
 
-LONG_UNKNOWN = "x" * 240
-
 BASE_COMMANDS = [
-    LONG_UNKNOWN,
-    "time",
-    "sleep 100",
+    "echo busybox-interactive-ok",
+    "pwd",
+    "cd /tmp",
+    "pwd",
+    "echo timer-ok > /tmp/ash-msg",
+    "cat /tmp/ash-msg",
+    "test -f /tmp/ash-msg && echo busybox-test-ok",
+    "fsync /tmp/ash-msg; echo busybox-fsync-ok",
+    "sync; echo busybox-sync-ok",
+    "sleep 1; echo busybox-sleep-ok",
     "cat /etc/luna-release",
     "cat /luna-persist",
-    "mkdir /smoke",
-    "write /smoke/msg timer-ok",
-    "cat /smoke/msg",
-    "sync",
-    "free",
+    "cat /proc/meminfo",
     "exit",
 ]
 
@@ -49,12 +50,16 @@ REQUIRED = [
     b"empty_fetches=0",
     b"LUNA_NETWORK_PRESSURE_OK burst=64 payload=1200",
     b"LUNA_NET_TX_QUEUE_STATS sent=2048",
+    b"LUNA_NET_PEER_TX_COMPLETE unique=2048 count=2048",
     b"LUNA_NETWORK_TX_PRESSURE_OK packets=2048 payload=1200",
     b"LUNA_NETWORK_RECLAIM_OK rounds=100",
     b"LUNA_PERSISTENCE_OK rounds=100",
     b"LUNA_STATIC_USER_OK path=/bin/busybox abi=1",
+    b"LUNA_BUSYBOX_HEAP_OK bytes=1048576",
     b"LUNA_SPAWN_WAIT_OK pid=",
-    b"LUNA_BUSYBOX_OK command=echo ok > /tmp/x; cat /tmp/x",
+    b"LUNA_BUSYBOX_OK command=cat /tmp/x",
+    b"LUNA_BUSYBOX_INTERACTIVE_READY prompt=luna-ash#",
+    b"LUNA_BUSYBOX_INTERACTIVE_OK status=0 forbidden=0",
     b"LUNA_PHASE2_4_USER_OK",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
@@ -63,12 +68,15 @@ REQUIRED = [
     b"LUNA_ISOLATION_RESTART_OK",
     b"LUNA_RESTART_STRESS_OK rounds=100",
     b"LUNA_ISOLATION_OK",
-    b"unknown: " + b"x" * 200,
-    b"slept 100 ms",
+    b"busybox-interactive-ok",
+    b"busybox-test-ok",
+    b"busybox-fsync-ok",
+    b"busybox-sync-ok",
+    b"busybox-sleep-ok",
+    b"/tmp",
     b"timer-ok",
     b"luna Phase 2.3 persistent rootfs",
     b"luna-phase-2.3-persistent",
-    b"synced",
     b"MemTotal:",
     b"LUNA_SHUTDOWN_OK",
 ]
@@ -115,10 +123,12 @@ FORBIDDEN = [
     b"I/O error while writing superblock",
     b"persistent rootfs pack metadata invalid",
     b"static BusyBox manifest invalid",
+    b"BusyBox heap self-test failed",
     b"BusyBox spawn/wait failed",
+    b"interactive BusyBox failed",
     b"Error attempting syscall",
 ]
-PROMPT = re.compile(rb"lkl:[^\r\n]*# ")
+PROMPT = re.compile(rb"luna-ash# ")
 
 
 def stop_process(proc: subprocess.Popen[bytes]) -> None:
@@ -155,8 +165,13 @@ def main() -> int:
     commands = list(BASE_COMMANDS)
     required = list(REQUIRED)
     if args.persist_write:
-        commands.insert(-1, f"write /qemu-power-persist {args.persist_write}")
-        commands.insert(-1, "sync")
+        commands.insert(
+            -1,
+            "echo " + args.persist_write +
+            " > /qemu-power-persist; fsync /qemu-power-persist; "
+            "sync; cat /qemu-power-persist",
+        )
+        required.append(args.persist_write.encode())
     if args.persist_read:
         commands.insert(-1, "cat /qemu-power-persist")
         required.append(args.persist_read.encode())
@@ -229,14 +244,6 @@ def main() -> int:
     for marker in FORBIDDEN:
         if marker in data:
             errors.append(f"forbidden output: {marker.decode(errors='replace')}")
-    monotonic = re.search(rb"monotonic_ns=(\d+)", data)
-    if not monotonic or int(monotonic.group(1)) <= 0:
-        errors.append("monotonic clock did not return a positive value")
-    elapsed = re.search(rb"slept 100 ms \(elapsed (\d+) ns\)", data)
-    if not elapsed:
-        errors.append("sleep elapsed time was not reported")
-    elif not 80_000_000 <= int(elapsed.group(1)) <= 5_000_000_000:
-        errors.append(f"100ms sleep elapsed value out of range: {elapsed.group(1).decode()} ns")
     irq = re.search(
         rb"LUNA_NETWORK_IRQ_OK line=(\d+) interrupts=(\d+) "
         rb"kick_polls=(\d+) fallback_polls=(\d+)", data

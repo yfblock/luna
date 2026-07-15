@@ -1,19 +1,20 @@
 # luna — LKL on seL4（独立 task 隔离）
 
 把 **LKL (Linux Kernel Library)** 作为 seL4 的**纯用户态 Task**跑起来，引导 Linux 内核，
-并进入一个**交互式 shell**（操作 LKL 文件系统）。**不涉及 UINTR**。
+并进入真正的 **BusyBox `ash` 交互式 shell**（操作 LKL 文件系统）。当前基线尚未接入 UINTR。
 
 **已验证**：QEMU x86_64 上，seL4 启动 → root manager 创建具有独立 CSpace/VSpace 的
-`luna-lkl-task` → child 独立引导 LKL（Linux 6.12.0+）→ 进入交互 shell。`ls / cat / cd / mkdir /
-write / stat / free` 等命令经 `lkl_sys_*` 跑在 child 内的 LKL 内核上，`free` 读到真实
-`/proc/meminfo`。child 同时通过了真实单调时钟、oneshot timer、100ms `nanosleep`、固定资源池、
+`luna-lkl-task` → child 独立引导 LKL（Linux 6.12.0+）→ 进入 BusyBox `ash -i`。shell builtin、
+重定向和 nofork `cat` 经静态 ABI 跑在 child 内的 LKL 内核上，并可读取真实 `/proc/meminfo`。
+child 同时通过了真实单调时钟、oneshot timer、LKL `nanosleep`、固定资源池、
 故障诊断、销毁重建和无 fault 关机验证。Phase 2.2 又加入 manager 受控的可回收页映射、完整的
 同步/TLS/thread/timer 生命周期语义和连续 100 次 child boot/halt/destroy 压力测试。Phase 2.3 又加入
 manager 私有 backing 的 virtio-block、ext4 持久根文件系统和跨 100 次 child 重建的数据校验。
 当前 backing 已进一步切换为 QEMU `memory-backend-file` 映射的宿主 ext4 文件，可跨整个 QEMU
 进程重启保存数据。
 Phase 2.4 又加入静态 host-program ABI，并从持久 rootfs 启动最小 BusyBox `ash`/`cat`，通过专用
-program thread 执行、退出和 join。Phase 2.5 又加入 manager-owned QEMU virtio-net、固定 IPv4、
+program thread 执行、退出和 join。Phase 2.4.1 让真实交互式 `ash` 直接接管 LKL tty，并加入可回收
+的 bounded heap、termios 与 LKL sleep shim。Phase 2.5 又加入 manager-owned QEMU virtio-net、固定 IPv4、
 外部 ICMP/TCP echo 与网络窗回收。
 Phase 2.5.1 又将 RX 改为 receive-only Notification 异步唤醒，并加入 bounded queue 背压、丢包统计
 和 64×1200-byte UDP burst 回归。Phase 2.5.2 又将 manager 持续 polling 改为 PCI INTx/IOAPIC IRQ
@@ -23,6 +24,7 @@ delivery，并保留 kick-driven polling fallback。Phase 2.5.3 又加入 manage
 [`PHASE2.2-RESULTS.md`](PHASE2.2-RESULTS.md)、
 [`PHASE2.3-RESULTS.md`](PHASE2.3-RESULTS.md)、
 [`PHASE2.4-RESULTS.md`](PHASE2.4-RESULTS.md)、
+[`PHASE2.4.1-RESULTS.md`](PHASE2.4.1-RESULTS.md)、
 [`PHASE2.5-RESULTS.md`](PHASE2.5-RESULTS.md) 和
 [`PHASE2.5.1-RESULTS.md`](PHASE2.5.1-RESULTS.md)、
 [`PHASE2.5.2-RESULTS.md`](PHASE2.5.2-RESULTS.md)、
@@ -50,6 +52,7 @@ luna/
 ├── PHASE2.2-RESULTS.md          # 可回收页映射与 100 轮生命周期压力结果
 ├── PHASE2.3-RESULTS.md          # virtio-block、ext4 根与持久化结果
 ├── PHASE2.4-RESULTS.md          # 静态程序 ABI、BusyBox 与 spawn/wait 结果
+├── PHASE2.4.1-RESULTS.md        # 可交互 ash、可回收 heap 与 tty/time shim
 ├── PHASE2.5-RESULTS.md          # virtio-net、IPv4、ICMP/TCP 与回收结果
 ├── PHASE2.5.1-RESULTS.md        # 异步 RX、背压、统计与 burst 压力结果
 ├── PHASE2.5.2-RESULTS.md        # virtio-net INTx/IOAPIC IRQ 与 polling fallback
@@ -72,7 +75,7 @@ luna/
 │       ├── isolation_net.c      # manager PCI/virtio ethdriver、DMA 与 bounded queue
 │       ├── lkl_task_net.c       # child LKL virtio-net backend、IPv4 与网络 smoke
 │       ├── lkl_task_user.c      # BusyBox 静态 ABI、LKL syscall shim 与 program launcher
-│       └── shell.c              # child 内的 LKL tty shell
+│       └── shell.c              # 为 BusyBox 准备 LKL tty fd 0/1/2 与 /proc
 │   └── rootfs/                  # ext4 seed rootfs
 ├── build-artifacts/lkl-kernel.o # 从 liblkl.a 抽取的干净内核对象
 ├── setup-deps.sh                # 固定版本依赖拉取、补丁应用与环境检查
@@ -96,7 +99,7 @@ luna/
 | jmp_buf | musl setjmp/longjmp |
 | timer/time | PIT 校准 TSC 单调时钟 + generation oneshot；cancel barrier 与 rearm 失效旧 deadline |
 | block | LKL virtio-mmio/blk + 64KiB IPC 传输窗；manager 独占 16MiB host-file ivshmem backing |
-| static program | BusyBox `lbb_main` + LKL fd shim + 1MiB bounded arena + host thread spawn/join |
+| static program | BusyBox `lbb_main` + LKL fd/tty/time shim + 1MiB 可回收 bounded arena + host thread |
 | network | manager INTx IRQ thread + polling fallback + bounded TX/RX queue + 8KiB transfer window |
 | console | 输出走 `seL4_DebugPutChar`；输入只使用 `0x3f8–0x3ff` COM1 capability |
 
@@ -112,7 +115,7 @@ luna/
 ```
 
 `setup-deps.sh --check-only` 可审计已有依赖。固定版本、Python 模块和手工命令见
-[`DEPENDENCIES.md`](DEPENDENCIES.md)。GitHub Actions 也执行同一套构建和 QEMU smoke test。
+[`DEPENDENCIES.md`](DEPENDENCIES.md)。构建和 QEMU 回归均可在本地完整复现。
 
 `run.sh` 默认给 QEMU 配置 512MiB 内存，root allocman metadata pool 为 8MiB，以装载 child ELF、
 重建 ext4 backing 并维护数千个 frame/mapping；QEMU 内存可通过 `LUNA_QEMU_MEM` 覆盖。
@@ -123,29 +126,43 @@ virtio-net-pci；不需要 root/TAP，也不依赖 QEMU slirp。
 ## 交互 shell 用法（经 LKL 虚拟串口 /dev/ttyLKL0）
 
 ```sh
-./run.sh --no-timeout        # 交互模式（不超时），等 "lkl:/# " 提示符后键入命令
+./run.sh --no-timeout        # 交互模式（不超时），等 "luna-ash# " 提示符后键入命令
 ```
 
 LKL 内置一个虚拟串口驱动 `arch/lkl/kernel/lkl_tty.c`（`/dev/ttyLKL0`，major 240）：
 - **输出**：tty write → `lkl_ops->print` → `seL4_DebugPutChar`。
 - **输入**：seL4 侧独立线程轮询 COM1 → 填 SPSC 环 → `lkl_trigger_irq()` 注入 IRQ → LKL IRQ handler
   从环取字符 push 进 tty flip 缓冲；n_tty ldisc 自动**回显 + 行编辑**。
-- shell 经 `lkl_sys_read(0)`/`lkl_sys_write(1)` 走该 tty（fd 0/1/2 由 child 打开 `/dev/ttyLKL0` 设置）。
+- BusyBox `ash -i` 经静态 ABI 的 `read/write/ioctl` 走该 tty（fd 0/1/2 由 child 打开
+  `/dev/ttyLKL0` 设置）。
 
-内置命令（经 `lkl_sys_*` 跑在 LKL 内核上）：`ls [path]`、`cat <f>`、`cd [path]`、`pwd`、
-`mkdir <d>`、`rmdir <d>`、`rm <f>`、`touch <f>`、`write <f> <text…>`、`stat <f>`、`echo`、
-`mount <src> <dir> <fstype>`、`sync`、`free`（读 `/proc/meminfo`）、`sleep <ms>`、`time`、`help`、
-`exit`。clean child 的 shell 已 chroot 到 ext4，提示符中的 `/` 是持久根文件系统。
+当前可用核心功能包括变量、条件、循环、函数、重定向，以及 `cd`、`pwd`、`echo`、
+`test`、`sleep`、`help`、`exit` 等 ash builtin 和 nofork `cat`/`fsync`/`sync`。例如：
+
+```sh
+echo hello > /tmp/x
+test -f /tmp/x && cat /tmp/x
+fsync /tmp/x
+sync
+for x in one two three; do echo "$x"; done
+cat /proc/meminfo
+```
+
+clean child 已 chroot 到持久 ext4 根。作业控制暂时关闭；pipeline、后台任务和需要 native
+`fork/exec` 的外部 applet 尚未实现。依赖 libc stdio 的 `printf` 也暂未启用，避免其绕过 LKL fd
+重定向；后续需加入 LKL-aware stdio shim。
 
 > 注：`run.sh` 先生成 LKL 构建配置，再只构建 `tools/lkl/liblkl.a`（含 lkl_tty 驱动）并重新
-> 抽取 lkl.o，不链接 luna 不需要的 LKL 测试程序和 hijack 库。BusyBox 只构建 `ash/echo/cat` 的
+> 抽取 lkl.o，不链接 luna 不需要的 LKL 测试程序和 hijack 库。BusyBox 构建 `ash`、相关 builtin
+> 与 nofork `cat` 的
 > relocatable host-program 对象，不使用 LD_PRELOAD hijack。
 > `exit` 会停止 child 控制台输入并执行 `lkl_sys_halt()`；manager 随后删除 child CSpace 中的派生
 > capability、销毁 child 资源，打印
 > `LUNA_SHUTDOWN_OK`。交互模式下用 Ctrl-A X 退出 QEMU。
 
-clean child 在开放交互 shell 前自动执行 BusyBox 验收命令：
-`sh -c 'echo ok > /tmp/x; cat /tmp/x'`。其 fd 0/1/2 与文件重定向均进入 LKL。
+clean child 在开放交互 shell 前用独立 program thread 执行 `busybox cat /tmp/x` 验证 applet
+spawn/join；随后 `ash -i +m` 成为该 child 唯一的 ash 实例。自动回归再通过交互输入验证重定向、
+条件执行、sleep、持久 rootfs 和 `/proc`。
 
 ## 状态
 
@@ -178,6 +195,10 @@ Phase 2.4 已完成。持久 rootfs 中的 `/bin/busybox` 选择静态 ABI v1，
 运行最小 `ash`、builtin `echo` 与 nofork `cat`。program thread 使用固定 TCB pool，退出后完成 join、
 TLS cleanup 和 slot reuse；自动测试验证 `/tmp/x` 内容为 `ok\n`。native `fork/exec` 在 LKL NOMMU
 arch 中不可用并被 shim 显式拒绝，完整边界见 `PHASE2.4-RESULTS.md`。
+
+Phase 2.4.1 已完成。BusyBox `ash -i` 直接接管 `/dev/ttyLKL0`；静态 ABI 的 tty、termios 与 sleep
+调用进入 LKL。1MiB arena 支持 free/coalesce/realloc 并在启动前自测，旧 Luna 命令解释器已经删除。
+完整结果见 `PHASE2.4.1-RESULTS.md`。
 
 Phase 2.5 已完成。manager 独占 QEMU virtio-net-pci 的 PCI I/O 与 DMA，child 只映射独立 TX/RX
 两页网络窗并通过受控 Endpoint 收发。LKL 配置 `10.0.2.15/24`，自动测试跨 QEMU socket backend

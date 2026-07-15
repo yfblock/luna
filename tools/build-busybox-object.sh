@@ -78,6 +78,10 @@ objcopy \
     --redefine-sym ioctl=luna_bb_ioctl \
     --redefine-sym tcgetattr=luna_bb_tcgetattr \
     --redefine-sym tcsetattr=luna_bb_tcsetattr \
+    --redefine-sym sleep=luna_bb_sleep \
+    --redefine-sym sync=luna_bb_sync \
+    --redefine-sym fsync=luna_bb_fsync \
+    --redefine-sym fdatasync=luna_bb_fdatasync \
     --redefine-sym umask=luna_bb_umask \
     --redefine-sym unlink=luna_bb_unlink \
     --redefine-sym rename=luna_bb_rename \
