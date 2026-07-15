@@ -13,8 +13,10 @@
 #include <sel4utils/thread.h>
 #include <vka/object.h>
 #include <vka/capops.h>
+#include <cpio/cpio.h>
 #include <utils/util.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #define CHILD_PRIORITY 100
@@ -22,6 +24,20 @@
 #define CHILD_BADGE_CLEAN 0x42
 #define CHILD_BADGE_STRESS 0x43
 #define MANAGER_PRIVATE_ADDR ((void *)(uintptr_t)0x40000000UL)
+#define MANAGER_DISK_ADDR    ((void *)(uintptr_t)0x50000000UL)
+#define MANAGER_DISK_IO_ADDR ((void *)(uintptr_t)0x52000000UL)
+#define LUNA_ROOTFS_PACK "luna-rootfs.pack"
+#define LUNA_ROOTFS_PACK_BLOCK_SIZE 4096UL
+
+struct luna_rootfs_pack_header {
+    char magic[8];
+    uint64_t disk_size;
+    uint32_t block_size;
+    uint32_t block_count;
+};
+
+extern char _cpio_archive[];
+extern char _cpio_archive_end[];
 
 struct luna_resource_slot {
     sel4utils_thread_t thread;
@@ -53,11 +69,32 @@ struct luna_heap_resource {
     int reserved;
 };
 
+struct luna_disk_mapping {
+    reservation_t reservation;
+    cspacepath_t frame_caps[LUNA_DISK_IO_PAGES];
+    unsigned char cap_allocated[LUNA_DISK_IO_PAGES];
+    size_t mapped_pages;
+    int reserved;
+};
+
+struct luna_persistent_disk {
+    void *mapping;
+    size_t bytes;
+    reservation_t reservation;
+    int reserved;
+    int allocated;
+    void *io_mapping;
+    reservation_t io_reservation;
+    int io_reserved;
+    int io_allocated;
+};
+
 struct luna_child_resources {
     struct luna_resource_slot slots[LUNA_RESOURCE_SLOTS];
     struct luna_sync_slot sync[LUNA_SYNC_SLOTS];
     struct luna_console_resource console;
     struct luna_heap_resource heap;
+    struct luna_disk_mapping disk;
 };
 
 struct luna_event_context {
@@ -66,6 +103,7 @@ struct luna_event_context {
     seL4_Word badge;
     sel4utils_process_t *process;
     struct luna_child_resources *resources;
+    struct luna_persistent_disk *disk;
     vka_t *vka;
 };
 
@@ -83,10 +121,142 @@ static int delete_child_cap(sel4utils_process_t *process, seL4_CPtr cap)
     return error;
 }
 
+static int init_persistent_disk(struct luna_persistent_disk *disk,
+                                vspace_t *manager_vspace)
+{
+    unsigned long pack_size = 0;
+    const unsigned char *pack = cpio_get_file(
+        _cpio_archive, (unsigned long)(_cpio_archive_end - _cpio_archive),
+        LUNA_ROOTFS_PACK, &pack_size);
+    struct luna_rootfs_pack_header header = {0};
+    if (!pack || pack_size < sizeof(header)) {
+        printf("luna: persistent rootfs pack missing or truncated\n");
+        return -1;
+    }
+    memcpy(&header, pack, sizeof(header));
+    size_t record_size = sizeof(uint32_t) + LUNA_ROOTFS_PACK_BLOCK_SIZE;
+    if (memcmp(header.magic, "LUNAFS23", sizeof(header.magic)) ||
+        header.disk_size != LUNA_PERSISTENT_DISK_SIZE ||
+        header.block_size != LUNA_ROOTFS_PACK_BLOCK_SIZE ||
+        header.block_count > LUNA_PERSISTENT_DISK_SIZE /
+                             LUNA_ROOTFS_PACK_BLOCK_SIZE ||
+        pack_size != sizeof(header) + header.block_count * record_size) {
+        printf("luna: persistent rootfs pack metadata invalid\n");
+        return -1;
+    }
+    disk->reservation = vspace_reserve_range_at(
+        manager_vspace, MANAGER_DISK_ADDR, LUNA_PERSISTENT_DISK_SIZE,
+        seL4_AllRights, 1);
+    if (!disk->reservation.res) {
+        printf("luna: persistent disk manager reservation failed\n");
+        return -1;
+    }
+    disk->reserved = 1;
+    if (vspace_new_pages_at_vaddr(
+            manager_vspace, MANAGER_DISK_ADDR,
+            LUNA_PERSISTENT_DISK_PAGES,
+            LUNA_PERSISTENT_DISK_PAGE_BITS,
+            disk->reservation)) {
+        printf("luna: persistent disk backing allocation failed\n");
+        return -1;
+    }
+    disk->mapping = MANAGER_DISK_ADDR;
+    disk->allocated = 1;
+    disk->bytes = header.disk_size;
+    memset(disk->mapping, 0, disk->bytes);
+    const unsigned char *record = pack + sizeof(header);
+    for (uint32_t i = 0; i < header.block_count; i++) {
+        uint32_t block_index = 0;
+        memcpy(&block_index, record, sizeof(block_index));
+        if (block_index >= disk->bytes /
+                           LUNA_ROOTFS_PACK_BLOCK_SIZE) {
+            printf("luna: persistent rootfs block index invalid\n");
+            return -1;
+        }
+        memcpy((unsigned char *)disk->mapping +
+                   block_index * LUNA_ROOTFS_PACK_BLOCK_SIZE,
+               record + sizeof(block_index),
+               LUNA_ROOTFS_PACK_BLOCK_SIZE);
+        record += record_size;
+    }
+    disk->io_reservation = vspace_reserve_range_at(
+        manager_vspace, MANAGER_DISK_IO_ADDR, LUNA_DISK_IO_SIZE,
+        seL4_AllRights, 1);
+    if (!disk->io_reservation.res) {
+        printf("luna: persistent disk I/O reservation failed\n");
+        return -1;
+    }
+    disk->io_reserved = 1;
+    if (vspace_new_pages_at_vaddr(
+            manager_vspace, MANAGER_DISK_IO_ADDR, LUNA_DISK_IO_PAGES,
+            seL4_PageBits, disk->io_reservation)) {
+        printf("luna: persistent disk I/O window allocation failed\n");
+        return -1;
+    }
+    disk->io_mapping = MANAGER_DISK_IO_ADDR;
+    disk->io_allocated = 1;
+    memset(disk->io_mapping, 0, LUNA_DISK_IO_SIZE);
+    return 0;
+}
+
+static int map_persistent_disk(struct luna_persistent_disk *disk,
+                               vka_t *vka, vspace_t *manager_vspace,
+                               sel4utils_process_t *process,
+                               struct luna_child_resources *resources)
+{
+    struct luna_disk_mapping *mapping = &resources->disk;
+    if (!disk->allocated || !disk->io_allocated ||
+        disk->bytes != LUNA_PERSISTENT_DISK_SIZE)
+        return -1;
+
+    mapping->reservation = vspace_reserve_range_at(
+        &process->vspace, (void *)(uintptr_t)LUNA_DISK_IO_BASE,
+        LUNA_DISK_IO_SIZE, seL4_AllRights, 1);
+    if (!mapping->reservation.res) {
+        printf("luna: child persistent disk reservation failed\n");
+        return -1;
+    }
+    mapping->reserved = 1;
+
+    for (size_t i = 0; i < LUNA_DISK_IO_PAGES; i++) {
+        void *source_address = (void *)((uintptr_t)disk->io_mapping +
+            i * BIT(seL4_PageBits));
+        seL4_CPtr source_cap = vspace_get_cap(manager_vspace,
+                                               source_address);
+        if (!source_cap ||
+            vka_cspace_alloc_path(vka, &mapping->frame_caps[i])) {
+            printf("luna: persistent disk frame slot %zu allocation failed\n",
+                   i);
+            return -1;
+        }
+        cspacepath_t source_path;
+        vka_cspace_make_path(vka, source_cap, &source_path);
+        if (vka_cnode_copy(&mapping->frame_caps[i], &source_path,
+                           seL4_AllRights)) {
+            printf("luna: persistent disk frame %zu copy failed\n", i);
+            vka_cspace_free_path(vka, mapping->frame_caps[i]);
+            return -1;
+        }
+        mapping->cap_allocated[i] = 1;
+        void *child_address = (void *)(uintptr_t)(
+            LUNA_DISK_IO_BASE + i * BIT(seL4_PageBits));
+        seL4_CPtr cap = mapping->frame_caps[i].capPtr;
+        if (vspace_map_pages_at_vaddr(
+                &process->vspace, &cap, NULL, child_address, 1,
+                seL4_PageBits, mapping->reservation)) {
+            printf("luna: persistent disk frame %zu map failed\n", i);
+            return -1;
+        }
+        mapping->mapped_pages++;
+    }
+    return 0;
+}
+
 static int destroy_child(sel4utils_process_t *process,
                          struct luna_child_resources *resources, vka_t *vka)
 {
     int result = 0;
+    size_t disk_mapped_pages = resources->disk.mapped_pages;
     if (process->thread.tcb.cptr)
         seL4_TCB_Suspend(process->thread.tcb.cptr);
     for (int i = 0; i < LUNA_RESOURCE_SLOTS; i++) {
@@ -138,6 +308,15 @@ static int destroy_child(sel4utils_process_t *process,
     }
     if (process->cspace.cptr)
         sel4utils_destroy_process(process, vka);
+    /* Mapped duplicate frame caps are owned by the child VSpace teardown.
+     * Only a cap copied immediately before a failed map is absent from that
+     * bookkeeping and must be deleted explicitly here. */
+    for (size_t i = disk_mapped_pages;
+         i < LUNA_DISK_IO_PAGES; i++) {
+        if (!resources->disk.cap_allocated[i]) continue;
+        if (vka_cnode_delete(&resources->disk.frame_caps[i])) result = -1;
+        vka_cspace_free_path(vka, resources->disk.frame_caps[i]);
+    }
     memset(resources, 0, sizeof(*resources));
     memset(process, 0, sizeof(*process));
     return result;
@@ -282,6 +461,44 @@ static int service_memory_request(struct luna_event_context *context,
     return error;
 }
 
+static int service_disk_request(struct luna_event_context *context,
+                                seL4_Word event, seL4_Word offset_word,
+                                seL4_Word length_word)
+{
+    struct luna_persistent_disk *disk = context->disk;
+    size_t offset = (size_t)offset_word;
+    size_t length = (size_t)length_word;
+    int error = 0;
+    if (!disk || !disk->allocated || !disk->io_allocated ||
+        offset > disk->bytes ||
+        length > disk->bytes - offset ||
+        length > LUNA_DISK_IO_SIZE) {
+        error = -1;
+    } else if (event == LUNA_ISOLATION_EVENT_DISK_READ) {
+        if (!length) error = -1;
+        else memcpy(disk->io_mapping,
+                    (unsigned char *)disk->mapping + offset,
+                    length);
+    } else if (event == LUNA_ISOLATION_EVENT_DISK_WRITE) {
+        if (!length) error = -1;
+        else memcpy((unsigned char *)disk->mapping + offset,
+                    disk->io_mapping, length);
+    } else if (event != LUNA_ISOLATION_EVENT_DISK_FLUSH || length) {
+        error = -1;
+    }
+    __sync_synchronize();
+    seL4_SetMR(0, LUNA_COMMAND_DISK_RESULT);
+    seL4_SetMR(1, (seL4_Word)error);
+    seL4_Send(context->command_ep, seL4_MessageInfo_new(0, 0, 0, 2));
+    if (error)
+        printf("luna: child disk request failed event=%lu offset=%lu "
+               "length=%lu allocated=%d io=%d bytes=%zu window=%lu\n",
+               event, offset_word, length_word, disk ? disk->allocated : 0,
+               disk ? disk->io_allocated : 0, disk ? disk->bytes : 0,
+               (unsigned long)LUNA_DISK_IO_SIZE);
+    return error;
+}
+
 static int receive_event(struct luna_event_context *context,
                          seL4_Word expected_event,
                          seL4_Word expected_detail)
@@ -299,6 +516,16 @@ static int receive_event(struct luna_event_context *context,
              event == LUNA_ISOLATION_EVENT_MEMORY_UNMAP)) {
             if (service_memory_request(context, event, seL4_GetMR(1),
                                        seL4_GetMR(2)))
+                return -1;
+            continue;
+        }
+
+        if (label == 0 && length == 3 && badge == context->badge &&
+            (event == LUNA_ISOLATION_EVENT_DISK_READ ||
+             event == LUNA_ISOLATION_EVENT_DISK_WRITE ||
+             event == LUNA_ISOLATION_EVENT_DISK_FLUSH)) {
+            if (service_disk_request(context, event, seL4_GetMR(1),
+                                     seL4_GetMR(2)))
                 return -1;
             continue;
         }
@@ -370,12 +597,22 @@ static void send_console_resource(
     seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 2));
 }
 
+static void send_disk_resource(seL4_CPtr command_ep)
+{
+    seL4_SetMR(0, LUNA_COMMAND_CONFIGURE_DISK);
+    seL4_SetMR(1, LUNA_DISK_IO_BASE);
+    seL4_SetMR(2, LUNA_DISK_IO_SIZE);
+    seL4_SetMR(3, LUNA_PERSISTENT_DISK_SIZE);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 4));
+}
+
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
                        seL4_CPtr control_ep, seL4_CPtr command_ep,
                        seL4_Word badge,
                        enum luna_isolation_mode mode, seL4_Word private_addr,
                        sel4utils_process_t *process,
-                       struct luna_child_resources *resources)
+                       struct luna_child_resources *resources,
+                       struct luna_persistent_disk *disk)
 {
     sel4utils_process_config_t config =
         process_config_default_simple(simple, LUNA_ISOLATION_CHILD_IMAGE, CHILD_PRIORITY);
@@ -405,6 +642,11 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         return -1;
     }
     resources->heap.reserved = 1;
+
+    if (map_persistent_disk(disk, vka, manager_vspace, process, resources)) {
+        (void)destroy_child(process, resources, vka);
+        return -1;
+    }
 
     if (configure_resource_pool(simple, vka, manager_vspace, process, resources)) {
         (void)destroy_child(process, resources, vka);
@@ -453,11 +695,12 @@ static int boot_child(simple_t *simple, vka_t *vka,
                       unsigned long long tsc_frequency,
                       sel4utils_process_t *process,
                       struct luna_child_resources *resources,
+                      struct luna_persistent_disk *disk,
                       int *child_live,
                       struct luna_event_context *event_context)
 {
     if (start_child(simple, vka, manager_vspace, control_ep, command_ep,
-                    badge, mode, private_addr, process, resources))
+                    badge, mode, private_addr, process, resources, disk))
         return -1;
     *child_live = 1;
     *event_context = (struct luna_event_context) {
@@ -466,6 +709,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
         .badge = badge,
         .process = process,
         .resources = resources,
+        .disk = disk,
         .vka = vka,
     };
 
@@ -478,6 +722,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
     for (seL4_Word i = 0; i < LUNA_SYNC_SLOTS; i++)
         send_sync_slot(command_ep, &resources->sync[i], i);
     send_console_resource(command_ep, &resources->console);
+    send_disk_resource(command_ep);
     if (receive_event(event_context,
                       LUNA_ISOLATION_EVENT_RESOURCE_CONFIGURED, mode))
         return -1;
@@ -489,7 +734,9 @@ static int boot_child(simple_t *simple, vka_t *vka,
         receive_event(event_context, LUNA_ISOLATION_EVENT_THREAD_TIMER_OK,
                       mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode) ||
-        receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode))
+        receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode) ||
+        receive_event(event_context,
+                      LUNA_ISOLATION_EVENT_VIRTIO_BLOCK_OK, mode))
         return -1;
     return 0;
 }
@@ -537,6 +784,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     vka_object_t command_ep = {0};
     sel4utils_process_t child = {0};
     struct luna_child_resources resources = {0};
+    struct luna_persistent_disk disk = {0};
     struct luna_event_context event_context = {0};
     int control_allocated = 0;
     int command_allocated = 0;
@@ -544,6 +792,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     int result = -1;
 
     manager_private_page[0] = LUNA_ISOLATION_SECRET;
+
+    if (init_persistent_disk(&disk, manager_vspace)) goto out;
 
     if (vka_alloc_endpoint(vka, &control_ep)) {
         printf("luna: isolation control endpoint allocation failed\n");
@@ -560,7 +810,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     if (boot_child(simple, vka, manager_vspace, control_ep.cptr,
                    command_ep.cptr, CHILD_BADGE_FAULT,
                    LUNA_ISOLATION_MODE_FAULT, private_addr, tsc_frequency,
-                   &child, &resources, &child_live, &event_context))
+                   &child, &resources, &disk, &child_live, &event_context))
         goto out;
     printf("luna: isolation child created with private CSpace/VSpace\n");
     printf("LUNA_LKL_CHILD_LINKED\n");
@@ -571,6 +821,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     printf("LUNA_THREAD_TIMER_OK\n");
     printf("LUNA_LKL_CHILD_INIT_OK\n");
     printf("LUNA_LKL_CHILD_BOOT_OK\n");
+    printf("LUNA_VIRTIO_BLOCK_OK bytes=%lu\n",
+           (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
         goto out;
     printf("LUNA_LKL_CHILD_HALT_OK\n");
@@ -599,8 +851,8 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         if (boot_child(simple, vka, manager_vspace, control_ep.cptr,
                        command_ep.cptr, CHILD_BADGE_STRESS,
                        LUNA_ISOLATION_MODE_STRESS, private_addr,
-                       tsc_frequency, &child, &resources, &child_live,
-                       &event_context))
+                       tsc_frequency, &child, &resources, &disk,
+                       &child_live, &event_context))
             goto out;
         if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_STRESS) ||
             receive_event(&event_context, LUNA_ISOLATION_EVENT_DONE,
@@ -613,11 +865,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     }
     printf("LUNA_RESTART_STRESS_OK rounds=%d\n",
            LUNA_RESTART_STRESS_ROUNDS);
+    printf("LUNA_PERSISTENCE_OK rounds=%d\n",
+           LUNA_RESTART_STRESS_ROUNDS);
 
     if (boot_child(simple, vka, manager_vspace, control_ep.cptr,
                    command_ep.cptr, CHILD_BADGE_CLEAN,
                    LUNA_ISOLATION_MODE_CLEAN, private_addr, tsc_frequency,
-                   &child, &resources, &child_live, &event_context))
+                   &child, &resources, &disk, &child_live, &event_context))
         goto out;
     if (receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
                       LUNA_ISOLATION_MODE_CLEAN))
@@ -637,6 +891,8 @@ out:
     if (child_live) (void)destroy_child(&child, &resources, vka);
     if (command_allocated) vka_free_object(vka, &command_ep);
     if (control_allocated) vka_free_object(vka, &control_ep);
+    /* The persistent disk is manager-owned state and intentionally remains
+     * allocated until this root task's terminal quiescent state. */
     vspace_unmap_pages(manager_vspace, MANAGER_PRIVATE_ADDR, 1,
                        seL4_PageBits, vka);
     vspace_free_reservation(manager_vspace, private_reservation);

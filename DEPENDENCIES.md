@@ -51,4 +51,6 @@ After checkout, follow the build instructions in `README.md` or run
 `./run.sh --build-only`.
 
 The current build also expects the Python packages and `xmllint` setup noted
-in `README.md`.
+in `README.md`. Phase 2.3 additionally requires `mke2fs` and `e2fsck`
+(normally provided by the `e2fsprogs` package); the build refuses to continue
+without them and validates the generated rootfs with `e2fsck -fn`.

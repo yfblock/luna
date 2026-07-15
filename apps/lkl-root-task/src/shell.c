@@ -166,7 +166,7 @@ void luna_shell_run(luna_shell_time_fn_t time_fn)
         else if (!strcmp(cmd, "help"))
             sh_puts("ls [path] cat <f> cd [path] pwd mkdir <d> rmdir <d> rm <f>\n"
                     "touch <f> write <f> <text...> stat <f> echo <text...>\n"
-                    "mount <src> <dir> <fstype> free sleep <ms> time exit\n");
+                    "mount <src> <dir> <fstype> sync free sleep <ms> time exit\n");
         else if (!strcmp(cmd, "ls")) cmd_ls(argc > 1 ? argv[1] : ".");
         else if (!strcmp(cmd, "cat")) { if (argc > 1) cmd_cat(argv[1]); else sh_puts("cat: need file\n"); }
         else if (!strcmp(cmd, "cd")) { long r = lkl_sys_chdir(argc > 1 ? argv[1] : "/"); if (r<0) sh_printf("cd: %ld\n", r); }
@@ -188,6 +188,7 @@ void luna_shell_run(luna_shell_time_fn_t time_fn)
             if (argc>3){long r=lkl_sys_mount(argv[1],argv[2],argv[3],0,NULL); if(r<0) sh_printf("mount: %ld\n",r); else sh_puts("mounted\n");}
             else sh_puts("mount <src> <dir> <fstype>\n");
         }
+        else if (!strcmp(cmd, "sync")) { lkl_sys_sync(); sh_puts("synced\n"); }
         else if (!strcmp(cmd, "free")) cmd_cat("/proc/meminfo");
         else if (!strcmp(cmd, "sleep")) { if (argc > 1) cmd_sleep(argv[1]); else sh_puts("sleep: need milliseconds\n"); }
         else if (!strcmp(cmd, "time")) sh_printf("monotonic_ns=%llu\n", shell_time());

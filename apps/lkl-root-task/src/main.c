@@ -23,10 +23,15 @@
 #include <utils/util.h>
 #include <stdlib.h>
 
-/* Loading the isolated LKL ELF and repeatedly mapping its manager-backed heap
- * creates metadata for several thousand frames and mappings. Keep this pool
- * independent from the physical Untyped budget. */
-#define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 1024)
+/* Loading the isolated LKL ELF plus the packed rootfs and repeatedly mapping
+ * child resources creates metadata for many thousands of frames and mappings.
+ * Keep this pool independent from the physical Untyped budget. */
+#define ALLOCATOR_STATIC_POOL_SIZE (BIT(seL4_PageBits) * 2048)
+/* allocman's fixed-pool mspace keeps boundary metadata immediately after the
+ * supplied arena. Isolate unrelated root state from that implementation
+ * detail instead of relying on linker ordering between translation units. */
+static char allocator_mem_guard[BIT(seL4_PageBits) * 16]
+    __attribute__((used));
 static char allocator_mem_pool[ALLOCATOR_STATIC_POOL_SIZE];
 
 static simple_t             simple;

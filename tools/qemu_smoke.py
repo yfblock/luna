@@ -17,9 +17,12 @@ COMMANDS = [
     LONG_UNKNOWN,
     "time",
     "sleep 100",
+    "cat /etc/luna-release",
+    "cat /luna-persist",
     "mkdir /smoke",
     "write /smoke/msg timer-ok",
     "cat /smoke/msg",
+    "sync",
     "free",
     "exit",
 ]
@@ -33,6 +36,8 @@ REQUIRED = [
     b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
     b"LUNA_SYNC_TLS_OK",
     b"LUNA_THREAD_TIMER_OK",
+    b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
+    b"LUNA_PERSISTENCE_OK rounds=100",
     b"LUNA_LKL_CHILD_INIT_OK",
     b"LUNA_LKL_CHILD_BOOT_OK",
     b"LUNA_LKL_CHILD_HALT_OK",
@@ -43,6 +48,9 @@ REQUIRED = [
     b"unknown: " + b"x" * 200,
     b"slept 100 ms",
     b"timer-ok",
+    b"luna Phase 2.3 persistent rootfs",
+    b"luna-phase-2.3-persistent",
+    b"synced",
     b"MemTotal:",
     b"LUNA_SHUTDOWN_OK",
 ]
@@ -67,6 +75,12 @@ FORBIDDEN = [
     b"freeing owned mutex",
     b"mutex unlock by non-owner",
     b"mutex owner errors during LKL runtime",
+    b"persistent disk prepare failed",
+    b"persistent disk finish failed",
+    b"failed to leave persistent root",
+    b"post-halt disk cleanup failed",
+    b"child disk request failed",
+    b"persistent rootfs pack metadata invalid",
 ]
 PROMPT = re.compile(rb"lkl:[^\r\n]*# ")
 
@@ -92,7 +106,7 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drive the luna LKL shell and verify a QEMU boot")
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--timeout", type=float, default=480.0)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]

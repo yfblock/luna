@@ -23,6 +23,12 @@ int luna_lkl_task_configure_resources(
     const struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS],
     seL4_CPtr console_io_port, seL4_CPtr control_ep,
     seL4_CPtr command_ep);
+int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
+                                 unsigned long disk_size);
+void luna_lkl_task_manager_lock(void);
+void luna_lkl_task_manager_unlock(void);
+int luna_lkl_task_manager_request(enum luna_isolation_event event,
+                                  seL4_Word value1, seL4_Word value2);
 int luna_lkl_task_thread_test(void);
 int luna_lkl_task_sync_tls_test(void);
 int luna_lkl_task_sync_tls_runtime_ok(void);
@@ -31,6 +37,10 @@ int luna_lkl_task_thread_timer_test(void);
 int luna_lkl_task_allocator_test(void);
 int luna_lkl_task_allocator_idle(void);
 int luna_lkl_task_init(void);
+int luna_lkl_task_disk_add(void);
+int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode);
+int luna_lkl_task_disk_finish(void);
+int luna_lkl_task_disk_cleanup_after_halt(void);
 int luna_lkl_task_start_kernel(unsigned long long tsc_frequency);
 long luna_lkl_task_halt(void);
 unsigned long long luna_lkl_task_time(void);

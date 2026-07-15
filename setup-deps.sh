@@ -44,7 +44,8 @@ PY
 
 check_tools() {
     local failed=0
-    for cmd in git repo cmake ninja make ar python3 xmllint qemu-system-x86_64; do
+    for cmd in git repo cmake ninja make ar python3 xmllint qemu-system-x86_64 \
+               mke2fs e2fsck; do
         require_cmd "$cmd" || failed=1
     done
     check_python_modules || failed=1

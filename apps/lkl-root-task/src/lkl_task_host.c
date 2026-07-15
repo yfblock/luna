@@ -17,6 +17,10 @@
 #include <string.h>
 #include <limits.h>
 
+void *lkl_ioremap(long addr, int size);
+int lkl_iomem_access(const volatile void *addr, void *res, int size,
+                     int write);
+
 struct task_thread_slot {
     sel4utils_thread_t thread;
     seL4_CPtr self_tcb;
@@ -451,27 +455,27 @@ struct task_heap_allocation {
 static unsigned char task_heap_pages[LUNA_CHILD_HEAP_PAGES];
 static struct task_heap_allocation
     task_heap_allocations[TASK_HEAP_MAX_ALLOCATIONS];
-static seL4_CPtr task_heap_control_ep;
-static seL4_CPtr task_heap_command_ep;
-static volatile int task_heap_lock_word;
+static seL4_CPtr task_manager_control_ep;
+static seL4_CPtr task_manager_command_ep;
+static volatile int task_manager_lock_word;
 static size_t task_heap_active_allocations;
 static size_t task_heap_active_bytes;
 static size_t task_heap_peak_bytes;
 
-static void task_heap_lock(void)
+void luna_lkl_task_manager_lock(void)
 {
-    while (__atomic_test_and_set(&task_heap_lock_word, __ATOMIC_ACQUIRE))
+    while (__atomic_test_and_set(&task_manager_lock_word, __ATOMIC_ACQUIRE))
         seL4_Yield();
 }
 
-static void task_heap_unlock(void)
+void luna_lkl_task_manager_unlock(void)
 {
-    __atomic_clear(&task_heap_lock_word, __ATOMIC_RELEASE);
+    __atomic_clear(&task_manager_lock_word, __ATOMIC_RELEASE);
 }
 
 static void task_heap_init(void)
 {
-    task_heap_lock_word = 0;
+    task_manager_lock_word = 0;
     memset(task_heap_pages, 0, sizeof(task_heap_pages));
     memset(task_heap_allocations, 0, sizeof(task_heap_allocations));
     task_heap_active_allocations = 0;
@@ -479,22 +483,35 @@ static void task_heap_init(void)
     task_heap_peak_bytes = 0;
 }
 
+int luna_lkl_task_manager_request(enum luna_isolation_event event,
+                                  seL4_Word value1, seL4_Word value2)
+{
+    if (!task_manager_control_ep || !task_manager_command_ep) return -1;
+    seL4_SetMR(0, event);
+    seL4_SetMR(1, value1);
+    seL4_SetMR(2, value2);
+    seL4_Send(task_manager_control_ep,
+              seL4_MessageInfo_new(0, 0, 0, 3));
+
+    seL4_Word badge = 0;
+    seL4_MessageInfo_t tag = seL4_Recv(task_manager_command_ep, &badge);
+    seL4_Word expected =
+        event == LUNA_ISOLATION_EVENT_MEMORY_MAP ||
+        event == LUNA_ISOLATION_EVENT_MEMORY_UNMAP ?
+        LUNA_COMMAND_MEMORY_RESULT : LUNA_COMMAND_DISK_RESULT;
+    if (badge || seL4_MessageInfo_get_label(tag) != 0 ||
+        seL4_MessageInfo_get_length(tag) != 2 ||
+        seL4_GetMR(0) != expected)
+        return -1;
+    return (int)seL4_GetMR(1);
+}
+
 static int task_heap_request(enum luna_isolation_event event, void *address,
                              size_t pages)
 {
-    if (!task_heap_control_ep || !task_heap_command_ep || !pages) return -1;
-    seL4_SetMR(0, event);
-    seL4_SetMR(1, (seL4_Word)(uintptr_t)address);
-    seL4_SetMR(2, pages);
-    seL4_Send(task_heap_control_ep, seL4_MessageInfo_new(0, 0, 0, 3));
-
-    seL4_Word badge = 0;
-    seL4_MessageInfo_t tag = seL4_Recv(task_heap_command_ep, &badge);
-    if (badge || seL4_MessageInfo_get_label(tag) != 0 ||
-        seL4_MessageInfo_get_length(tag) != 2 ||
-        seL4_GetMR(0) != LUNA_COMMAND_MEMORY_RESULT)
-        return -1;
-    return (int)seL4_GetMR(1);
+    if (!pages) return -1;
+    return luna_lkl_task_manager_request(
+        event, (seL4_Word)(uintptr_t)address, pages);
 }
 
 static void *task_heap_alloc(unsigned long size, unsigned long align, int zero)
@@ -506,7 +523,7 @@ static void *task_heap_alloc(unsigned long size, unsigned long align, int zero)
     size_t pages = (requested + TASK_PAGE_SIZE - 1) / TASK_PAGE_SIZE;
     if (!pages || pages > LUNA_CHILD_HEAP_PAGES) return NULL;
 
-    task_heap_lock();
+    luna_lkl_task_manager_lock();
     int record_index = -1;
     for (int i = 0; i < TASK_HEAP_MAX_ALLOCATIONS; i++) {
         if (!task_heap_allocations[i].used) {
@@ -527,7 +544,7 @@ static void *task_heap_alloc(unsigned long size, unsigned long align, int zero)
         }
     }
     if (record_index < 0 || first_page == LUNA_CHILD_HEAP_PAGES) {
-        task_heap_unlock();
+        luna_lkl_task_manager_unlock();
         task_debug("luna-lkl-task: host heap exhausted\n");
         return NULL;
     }
@@ -535,7 +552,7 @@ static void *task_heap_alloc(unsigned long size, unsigned long align, int zero)
     void *address = (void *)(uintptr_t)(LUNA_CHILD_HEAP_BASE +
                                         first_page * TASK_PAGE_SIZE);
     if (task_heap_request(LUNA_ISOLATION_EVENT_MEMORY_MAP, address, pages)) {
-        task_heap_unlock();
+        luna_lkl_task_manager_unlock();
         task_debug("luna-lkl-task: host page map failed\n");
         return NULL;
     }
@@ -551,7 +568,7 @@ static void *task_heap_alloc(unsigned long size, unsigned long align, int zero)
     task_heap_active_bytes += requested;
     if (task_heap_active_bytes > task_heap_peak_bytes)
         task_heap_peak_bytes = task_heap_active_bytes;
-    task_heap_unlock();
+    luna_lkl_task_manager_unlock();
     if (zero) memset(address, 0, requested);
     return address;
 }
@@ -568,7 +585,7 @@ static int task_heap_free(void *ptr)
         return -1;
     }
 
-    task_heap_lock();
+    luna_lkl_task_manager_lock();
     struct task_heap_allocation *record = NULL;
     for (int i = 0; i < TASK_HEAP_MAX_ALLOCATIONS; i++) {
         if (task_heap_allocations[i].used &&
@@ -578,14 +595,14 @@ static int task_heap_free(void *ptr)
         }
     }
     if (!record) {
-        task_heap_unlock();
+        luna_lkl_task_manager_unlock();
         task_debug("luna-lkl-task: corrupt host heap free\n");
         return -1;
     }
 
     if (task_heap_request(LUNA_ISOLATION_EVENT_MEMORY_UNMAP, ptr,
                           record->pages)) {
-        task_heap_unlock();
+        luna_lkl_task_manager_unlock();
         task_debug("luna-lkl-task: host page unmap failed\n");
         return -1;
     }
@@ -594,14 +611,14 @@ static int task_heap_free(void *ptr)
     task_heap_active_allocations--;
     task_heap_active_bytes -= record->requested;
     memset(record, 0, sizeof(*record));
-    task_heap_unlock();
+    luna_lkl_task_manager_unlock();
     return 0;
 }
 
 static int task_heap_is_idle(void)
 {
     int idle;
-    task_heap_lock();
+    luna_lkl_task_manager_lock();
     idle = task_heap_active_allocations == 0 && task_heap_active_bytes == 0;
     if (idle) {
         for (size_t i = 0; i < LUNA_CHILD_HEAP_PAGES; i++) {
@@ -611,7 +628,7 @@ static int task_heap_is_idle(void)
             }
         }
     }
-    task_heap_unlock();
+    luna_lkl_task_manager_unlock();
     return idle;
 }
 
@@ -929,7 +946,8 @@ static void *task_memmove(void *dest, const void *src, unsigned long count)
     return memmove(dest, src, count);
 }
 
-static struct lkl_host_operations task_host_ops = {
+struct lkl_host_operations lkl_host_ops = {
+    .virtio_devices = lkl_virtio_devs,
     .print = task_print,
     .panic = task_panic,
     .console_start = task_console_start,
@@ -961,6 +979,8 @@ static struct lkl_host_operations task_host_ops = {
     .timer_alloc = task_timer_alloc,
     .timer_set_oneshot = task_timer_set_oneshot,
     .timer_free = task_timer_free,
+    .ioremap = lkl_ioremap,
+    .iomem_access = lkl_iomem_access,
     .jmp_buf_set = task_jmp_buf_set,
     .jmp_buf_longjmp = task_jmp_buf_longjmp,
     .memcpy = task_memcpy,
@@ -1004,10 +1024,10 @@ int luna_lkl_task_configure_resources(
         task_sync_drain(task_sync[i].ntfn);
     }
     task_console_io_port = console_io_port;
-    task_heap_control_ep = control_ep;
-    task_heap_command_ep = command_ep;
-    if (!task_console_io_port || !task_heap_control_ep ||
-        !task_heap_command_ep)
+    task_manager_control_ep = control_ep;
+    task_manager_command_ep = command_ep;
+    if (!task_console_io_port || !task_manager_control_ep ||
+        !task_manager_command_ep)
         return -1;
     task_console_head = 0;
     task_console_tail = 0;
@@ -1449,6 +1469,11 @@ void lkl_bug(const char *fmt, ...)
     task_panic();
 }
 
+void lkl_perror(char *message, int error)
+{
+    lkl_printf("%s: %d\n", message ? message : "LKL error", error);
+}
+
 int luna_lkl_task_init(void)
 {
     task_heap_init();
@@ -1460,7 +1485,7 @@ int luna_lkl_task_init(void)
         task_sync[i].kind = TASK_SYNC_FREE;
     }
     task_time_epoch = __builtin_ia32_rdtsc();
-    return lkl_init(&task_host_ops);
+    return lkl_init(&lkl_host_ops);
 }
 
 int luna_lkl_task_prepare_time(unsigned long long tsc_frequency)
