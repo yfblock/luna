@@ -961,8 +961,13 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context,
                       LUNA_ISOLATION_EVENT_NETWORK_TX_PRESSURE_OK,
-                      LUNA_ISOLATION_MODE_CLEAN) ||
-        receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
+                      LUNA_ISOLATION_MODE_CLEAN))
+        goto out;
+    if (luna_network_verify_irq()) {
+        printf("luna: virtio-net IRQ verification failed\n");
+        goto out;
+    }
+    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_USER_PROGRAM_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
                       LUNA_ISOLATION_MODE_CLEAN))

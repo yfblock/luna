@@ -93,6 +93,6 @@ SMOKE TEST PASSED
 
 ## 后续
 
-Phase 2.5.3 已增加 TX bounded queue、可重试背压和 2048×1200-byte 持续发送完整性回归。下一步可将
-manager 的物理设备 polling 替换为真正的 IRQ delivery，同时保留当前 Notification ABI；也可以增加
+Phase 2.5.2 已将 manager 的持续 polling 替换为真实 INTx/IOAPIC IRQ，并保留 polling fallback；
+Phase 2.5.3 已增加 TX bounded queue、可重试背压和 2048×1200-byte 持续发送完整性回归。后续可增加
 多队列和更长时间的吞吐/尾延迟 benchmark。

@@ -9,8 +9,10 @@
 #include <ethdrivers/raw.h>
 #include <ethdrivers/virtio_pci.h>
 #include <platsupport/io.h>
+#include <platsupport/irq.h>
 #include <sel4platsupport/arch/io.h>
 #include <sel4platsupport/io.h>
+#include <sel4platsupport/irq.h>
 #include <sel4utils/page_dma.h>
 #include <sel4utils/thread.h>
 #include <utils/util.h>
@@ -33,10 +35,14 @@
 #define LUNA_NET_TX_QUEUE_COUNT 16U
 #define LUNA_NET_POLL_PRIORITY 100U
 #define LUNA_NET_POLL_STACK_PAGES 8U
+#define LUNA_NET_IRQ_PRIORITY 100U
+#define LUNA_NET_IRQ_STACK_PAGES 8U
 #define PCI_CONFIG_ADDRESS 0x0cf8U
 #define PCI_CONFIG_DATA 0x0cfcU
 #define PCI_COMMAND 0x04U
 #define PCI_BAR0 0x10U
+#define PCI_INTERRUPT_LINE 0x3cU
+#define PCI_INTERRUPT_PIN 0x3dU
 #define PCI_COMMAND_IO 0x1U
 #define PCI_COMMAND_MASTER 0x4U
 
@@ -70,6 +76,8 @@ struct luna_network_state {
     volatile int tx_pending;
     volatile int child_active;
     volatile int poll_in_driver;
+    volatile int irq_in_driver;
+    volatile int driver_lock;
     volatile int notification_masked;
     volatile int backpressure_active;
     volatile uint64_t rx_drops;
@@ -80,9 +88,20 @@ struct luna_network_state {
     volatile uint64_t tx_backpressure;
     volatile uint64_t tx_driver_retries;
     volatile uint64_t tx_completed;
+    volatile uint64_t irq_count;
+    volatile uint64_t irq_kick_polls;
+    volatile uint64_t fallback_polls;
+    volatile uint64_t irq_errors;
     vka_object_t rx_ntfn;
     vka_object_t poll_kick_ntfn;
+    vka_object_t irq_ntfn;
     sel4utils_thread_t poll_thread;
+    sel4utils_thread_t irq_thread;
+    ntfn_id_t irq_ntfn_id;
+    irq_id_t irq_id;
+    seL4_Word irq_badge;
+    unsigned irq_line;
+    int irq_mode;
     unsigned char mac[6];
     void *io_mapping;
     reservation_t io_reservation;
@@ -107,6 +126,28 @@ static int tx_queue_empty(const struct luna_network_state *state)
     unsigned head = __atomic_load_n(&state->tx_head, __ATOMIC_ACQUIRE);
     unsigned tail = __atomic_load_n(&state->tx_tail, __ATOMIC_ACQUIRE);
     return head == tail;
+}
+
+static void lock_driver(struct luna_network_state *state)
+{
+    while (__atomic_test_and_set(&state->driver_lock, __ATOMIC_ACQUIRE))
+        seL4_Yield();
+}
+
+static void unlock_driver(struct luna_network_state *state)
+{
+    __atomic_clear(&state->driver_lock, __ATOMIC_RELEASE);
+}
+
+static void record_rx_backpressure(struct luna_network_state *state)
+{
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&state->backpressure_active,
+                                    &expected, 1, false,
+                                    __ATOMIC_ACQ_REL,
+                                    __ATOMIC_RELAXED))
+        __atomic_fetch_add(&state->rx_backpressure, 1,
+                           __ATOMIC_RELAXED);
 }
 
 static void signal_rx(struct luna_network_state *state)
@@ -204,6 +245,7 @@ static void receive_complete(void *cookie, unsigned int num_buffers,
         if (was_empty) signal_rx(state);
     } else if (total && total <= LUNA_NET_PACKET_SIZE &&
                __atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE)) {
+        record_rx_backpressure(state);
         __atomic_fetch_add(&state->rx_drops, 1, __ATOMIC_RELAXED);
     }
     for (unsigned i = 0; i < num_buffers; i++) {
@@ -251,12 +293,81 @@ static void process_tx_queue(struct luna_network_state *state)
     }
 }
 
+static void network_irq_callback(void *data,
+                                 ps_irq_acknowledge_fn_t acknowledge_fn,
+                                 void *ack_data)
+{
+    struct luna_network_state *state = data;
+    lock_driver(state);
+    __atomic_store_n(&state->irq_in_driver, 1, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE) &&
+        rx_queue_full(state))
+        record_rx_backpressure(state);
+    state->driver.i_fn.raw_handleIRQ(&state->driver,
+                                     (int)state->irq_line);
+    __atomic_fetch_add(&state->irq_count, 1, __ATOMIC_RELAXED);
+    process_tx_queue(state);
+    __atomic_store_n(&state->irq_in_driver, 0, __ATOMIC_RELEASE);
+    unlock_driver(state);
+    if (!acknowledge_fn || acknowledge_fn(ack_data)) {
+        __atomic_fetch_add(&state->irq_errors, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&state->irq_mode, 0, __ATOMIC_RELEASE);
+        seL4_Signal(state->poll_kick_ntfn.cptr);
+    }
+}
+
+static void network_irq_thread(void *arg0, void *arg1, void *ipc_buffer)
+{
+    (void)arg1;
+    (void)ipc_buffer;
+    struct luna_network_state *state = arg0;
+    for (;;) {
+        if (sel4platsupport_irq_wait(&state->io_ops.irq_ops,
+                                     state->irq_ntfn_id,
+                                     state->irq_badge, NULL)) {
+            __atomic_fetch_add(&state->irq_errors, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&state->irq_mode, 0, __ATOMIC_RELEASE);
+            seL4_Signal(state->poll_kick_ntfn.cptr);
+            seL4_TCB_Suspend(state->irq_thread.tcb.cptr);
+            for (;;) seL4_Yield();
+        }
+    }
+}
+
 static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
 {
     (void)arg1;
     (void)ipc_buffer;
     struct luna_network_state *state = arg0;
     for (;;) {
+        if (__atomic_load_n(&state->irq_mode, __ATOMIC_ACQUIRE)) {
+            seL4_Word badge = 0;
+            seL4_Wait(state->poll_kick_ntfn.cptr, &badge);
+            do {
+                lock_driver(state);
+                __atomic_store_n(&state->poll_in_driver, 1,
+                                 __ATOMIC_RELEASE);
+                if (__atomic_load_n(&state->child_active,
+                                    __ATOMIC_ACQUIRE) &&
+                    rx_queue_full(state))
+                    record_rx_backpressure(state);
+                state->driver.i_fn.raw_poll(&state->driver);
+                __atomic_fetch_add(&state->irq_kick_polls, 1,
+                                   __ATOMIC_RELAXED);
+                process_tx_queue(state);
+                __atomic_store_n(&state->poll_in_driver, 0,
+                                 __ATOMIC_RELEASE);
+                unlock_driver(state);
+                if (__atomic_load_n(&state->child_active,
+                                    __ATOMIC_ACQUIRE) ||
+                    (!__atomic_load_n(&state->tx_pending,
+                                      __ATOMIC_ACQUIRE) &&
+                     tx_queue_empty(state)))
+                    break;
+                seL4_Yield();
+            } while (1);
+            continue;
+        }
         if (!__atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE) &&
             !__atomic_load_n(&state->tx_pending, __ATOMIC_ACQUIRE) &&
             tx_queue_empty(state)) {
@@ -264,6 +375,8 @@ static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
             seL4_Wait(state->poll_kick_ntfn.cptr, &badge);
             continue;
         }
+        lock_driver(state);
+        __atomic_store_n(&state->poll_in_driver, 1, __ATOMIC_RELEASE);
         process_tx_queue(state);
         int child_active = __atomic_load_n(&state->child_active,
                                             __ATOMIC_ACQUIRE);
@@ -271,13 +384,10 @@ static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
                                           __ATOMIC_ACQUIRE);
         int queue_full = child_active && rx_queue_full(state);
         if (queue_full && !tx_pending) {
-            int expected = 0;
-            if (__atomic_compare_exchange_n(&state->backpressure_active,
-                                            &expected, 1, false,
-                                            __ATOMIC_ACQ_REL,
-                                            __ATOMIC_RELAXED))
-                __atomic_fetch_add(&state->rx_backpressure, 1,
-                                   __ATOMIC_RELAXED);
+            record_rx_backpressure(state);
+            __atomic_store_n(&state->poll_in_driver, 0,
+                             __ATOMIC_RELEASE);
+            unlock_driver(state);
             seL4_Yield();
             continue;
         }
@@ -285,16 +395,21 @@ static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
             __atomic_store_n(&state->backpressure_active, 0,
                              __ATOMIC_RELEASE);
         if (!child_active && !tx_pending && tx_queue_empty(state)) {
+            __atomic_store_n(&state->poll_in_driver, 0,
+                             __ATOMIC_RELEASE);
+            unlock_driver(state);
             continue;
         }
-        __atomic_store_n(&state->poll_in_driver, 1, __ATOMIC_RELEASE);
         if (!__atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE) &&
             !__atomic_load_n(&state->tx_pending, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&state->poll_in_driver, 0, __ATOMIC_RELEASE);
+            unlock_driver(state);
             continue;
         }
         state->driver.i_fn.raw_poll(&state->driver);
+        __atomic_fetch_add(&state->fallback_polls, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&state->poll_in_driver, 0, __ATOMIC_RELEASE);
+        unlock_driver(state);
         seL4_Yield();
     }
 }
@@ -315,6 +430,109 @@ static int init_shared_window(vspace_t *manager_vspace)
     return 0;
 }
 
+static void cleanup_network_irq(vka_t *vka, vspace_t *manager_vspace)
+{
+    __atomic_store_n(&network.irq_mode, 0, __ATOMIC_RELEASE);
+    if (network.irq_thread.tcb.cptr) {
+        sel4utils_clean_up_thread(vka, manager_vspace,
+                                  &network.irq_thread);
+        memset(&network.irq_thread, 0, sizeof(network.irq_thread));
+    }
+    if (network.irq_id >= 0) {
+        if (ps_irq_unregister(&network.io_ops.irq_ops,
+                              network.irq_id))
+            printf("luna: virtio-net IRQ unregister failed\n");
+        network.irq_id = -1;
+    }
+    if (network.irq_ntfn_id >= 0) {
+        if (sel4platsupport_irq_return_ntfn(&network.io_ops.irq_ops,
+                                            network.irq_ntfn_id,
+                                            NULL))
+            printf("luna: virtio-net IRQ notification return failed\n");
+        network.irq_ntfn_id = -1;
+    }
+    if (network.irq_ntfn.cptr) {
+        vka_free_object(vka, &network.irq_ntfn);
+        memset(&network.irq_ntfn, 0, sizeof(network.irq_ntfn));
+    }
+}
+
+static int init_network_irq(simple_t *simple, vka_t *vka,
+                            vspace_t *manager_vspace)
+{
+    uint32_t line = 0, pin = 0;
+    if (!network.driver.i_fn.raw_handleIRQ ||
+        pci_read(PCI_INTERRUPT_LINE, 1, &line) ||
+        pci_read(PCI_INTERRUPT_PIN, 1, &pin) ||
+        !line || line >= 24U || pin != 1U) {
+        printf("luna: virtio-net IRQ unavailable, using polling "
+               "line=%u pin=%u\n", line, pin);
+        return 0;
+    }
+    if (vka_alloc_notification(vka, &network.irq_ntfn)) {
+        printf("luna: virtio-net IRQ notification unavailable, "
+               "using polling\n");
+        return 0;
+    }
+    network.irq_ntfn_id = sel4platsupport_irq_provide_ntfn(
+        &network.io_ops.irq_ops, network.irq_ntfn.cptr, 1UL);
+    if (network.irq_ntfn_id < 0) {
+        printf("luna: virtio-net IRQ notification registration failed, "
+               "using polling\n");
+        cleanup_network_irq(vka, manager_vspace);
+        return 0;
+    }
+    ps_irq_t irq = {
+        .type = PS_IOAPIC,
+        .ioapic = {
+            .ioapic = 0,
+            .pin = (long)line,
+            .level = 1,
+            .polarity = 1,
+            .vector = (long)line,
+        },
+    };
+    network.irq_id = ps_irq_register(&network.io_ops.irq_ops, irq,
+                                     network_irq_callback, &network);
+    if (network.irq_id < 0) {
+        printf("luna: virtio-net IOAPIC registration failed line=%u, "
+               "using polling\n", line);
+        cleanup_network_irq(vka, manager_vspace);
+        return 0;
+    }
+    sel4utils_thread_config_t config = thread_config_new(simple);
+    config = thread_config_priority(config, LUNA_NET_IRQ_PRIORITY);
+    config = thread_config_stack_size(config, LUNA_NET_IRQ_STACK_PAGES);
+    config = thread_config_create_reply(config);
+    if (sel4utils_configure_thread_config(vka, manager_vspace,
+                                          manager_vspace, config,
+                                          &network.irq_thread)) {
+        printf("luna: virtio-net IRQ thread unavailable, using polling\n");
+        cleanup_network_irq(vka, manager_vspace);
+        return 0;
+    }
+    if (sel4platsupport_irq_set_ntfn(&network.io_ops.irq_ops,
+                                     network.irq_ntfn_id,
+                                     network.irq_id,
+                                     &network.irq_badge)) {
+        printf("luna: virtio-net IRQ binding failed, using polling\n");
+        cleanup_network_irq(vka, manager_vspace);
+        return 0;
+    }
+    network.irq_line = line;
+    __atomic_store_n(&network.irq_mode, 1, __ATOMIC_RELEASE);
+    if (sel4utils_start_thread(&network.irq_thread, network_irq_thread,
+                               &network, NULL, 1)) {
+        printf("luna: virtio-net IRQ thread start failed, using polling\n");
+        cleanup_network_irq(vka, manager_vspace);
+        return 0;
+    }
+    NAME_THREAD(network.irq_thread.tcb.cptr, "luna-net-irq");
+    printf("luna: manager virtio-net IRQ ready line=%u mode=intx\n",
+           network.irq_line);
+    return 0;
+}
+
 int luna_network_manager_init(simple_t *simple, vka_t *vka,
                               vspace_t *manager_vspace)
 {
@@ -324,6 +542,8 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
         printf("luna: manager network state allocation failed\n");
         return -1;
     }
+    network.irq_ntfn_id = -1;
+    network.irq_id = -1;
     if (sel4platsupport_new_io_ops(manager_vspace, vka, simple,
                                    &network.io_ops) ||
         sel4platsupport_new_arch_ops(&network.io_ops, simple, vka) ||
@@ -384,6 +604,7 @@ int luna_network_manager_init(simple_t *simple, vka_t *vka,
         printf("luna: manager network notification allocation failed\n");
         return -1;
     }
+    if (init_network_irq(simple, vka, manager_vspace)) return -1;
     sel4utils_thread_config_t thread_config = thread_config_new(simple);
     thread_config = thread_config_priority(thread_config,
                                            LUNA_NET_POLL_PRIORITY);
@@ -465,6 +686,10 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.tx_backpressure, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_driver_retries, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_completed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_count, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_kick_polls, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.fallback_polls, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_errors, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.child_active, activate != 0,
                      __ATOMIC_RELEASE);
@@ -480,6 +705,7 @@ void luna_network_deactivate_child(void)
     __atomic_store_n(&network.child_active, 0, __ATOMIC_RELEASE);
     seL4_Signal(network.poll_kick_ntfn.cptr);
     while (__atomic_load_n(&network.poll_in_driver, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&network.irq_in_driver, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&network.tx_pending, __ATOMIC_ACQUIRE) ||
            !tx_queue_empty(&network))
         seL4_Yield();
@@ -489,6 +715,32 @@ void luna_network_deactivate_child(void)
     __atomic_store_n(&network.backpressure_active, 0, __ATOMIC_RELEASE);
     seL4_Word badge = 0;
     seL4_Poll(network.rx_ntfn.cptr, &badge);
+}
+
+int luna_network_verify_irq(void)
+{
+    uint64_t interrupts = __atomic_load_n(&network.irq_count,
+                                           __ATOMIC_ACQUIRE);
+    uint64_t kick_polls = __atomic_load_n(&network.irq_kick_polls,
+                                           __ATOMIC_ACQUIRE);
+    uint64_t fallback_polls = __atomic_load_n(&network.fallback_polls,
+                                               __ATOMIC_ACQUIRE);
+    uint64_t errors = __atomic_load_n(&network.irq_errors,
+                                       __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&network.irq_mode, __ATOMIC_ACQUIRE)) {
+        if (!interrupts || fallback_polls || errors) return -1;
+        printf("LUNA_NETWORK_IRQ_OK line=%u interrupts=%llu "
+               "kick_polls=%llu fallback_polls=%llu\n",
+               network.irq_line, (unsigned long long)interrupts,
+               (unsigned long long)kick_polls,
+               (unsigned long long)fallback_polls);
+        return 0;
+    }
+    if (!fallback_polls) return -1;
+    printf("LUNA_NETWORK_IRQ_FALLBACK_OK polls=%llu errors=%llu\n",
+           (unsigned long long)fallback_polls,
+           (unsigned long long)errors);
+    return 0;
 }
 
 static int service_tx(size_t length)

@@ -16,7 +16,8 @@ Phase 2.4 又加入静态 host-program ABI，并从持久 rootfs 启动最小 Bu
 program thread 执行、退出和 join。Phase 2.5 又加入 manager-owned QEMU virtio-net、固定 IPv4、
 外部 ICMP/TCP echo 与网络窗回收。
 Phase 2.5.1 又将 RX 改为 receive-only Notification 异步唤醒，并加入 bounded queue 背压、丢包统计
-和 64×1200-byte UDP burst 回归。Phase 2.5.3 又加入 manager 私有 TX bounded queue、可重试背压和
+和 64×1200-byte UDP burst 回归。Phase 2.5.2 又将 manager 持续 polling 改为 PCI INTx/IOAPIC IRQ
+delivery，并保留 kick-driven polling fallback。Phase 2.5.3 又加入 manager 私有 TX bounded queue、可重试背压和
 `2048 × 1200-byte` 持续 UDP 完整性测试。root manager 不再链接或运行 LKL。详见
 [`PHASE2.1-RESULTS.md`](PHASE2.1-RESULTS.md) 和
 [`PHASE2.2-RESULTS.md`](PHASE2.2-RESULTS.md)、
@@ -24,6 +25,7 @@ Phase 2.5.1 又将 RX 改为 receive-only Notification 异步唤醒，并加入 
 [`PHASE2.4-RESULTS.md`](PHASE2.4-RESULTS.md)、
 [`PHASE2.5-RESULTS.md`](PHASE2.5-RESULTS.md) 和
 [`PHASE2.5.1-RESULTS.md`](PHASE2.5.1-RESULTS.md)、
+[`PHASE2.5.2-RESULTS.md`](PHASE2.5.2-RESULTS.md)、
 [`PHASE2.5.3-RESULTS.md`](PHASE2.5.3-RESULTS.md) 和
 [`PHASE2.3.1-RESULTS.md`](PHASE2.3.1-RESULTS.md)。
 
@@ -50,6 +52,7 @@ luna/
 ├── PHASE2.4-RESULTS.md          # 静态程序 ABI、BusyBox 与 spawn/wait 结果
 ├── PHASE2.5-RESULTS.md          # virtio-net、IPv4、ICMP/TCP 与回收结果
 ├── PHASE2.5.1-RESULTS.md        # 异步 RX、背压、统计与 burst 压力结果
+├── PHASE2.5.2-RESULTS.md        # virtio-net INTx/IOAPIC IRQ 与 polling fallback
 ├── PHASE2.5.3-RESULTS.md        # TX bounded queue、背压与持续吞吐结果
 ├── PHASE2.3.1-RESULTS.md        # 宿主文件 backing 与跨 QEMU 重启结果
 ├── next-plan.md                 # 下一阶段规划与验收门槛
@@ -94,7 +97,7 @@ luna/
 | timer/time | PIT 校准 TSC 单调时钟 + generation oneshot；cancel barrier 与 rearm 失效旧 deadline |
 | block | LKL virtio-mmio/blk + 64KiB IPC 传输窗；manager 独占 16MiB host-file ivshmem backing |
 | static program | BusyBox `lbb_main` + LKL fd shim + 1MiB bounded arena + host thread spawn/join |
-| network | manager poll thread + receive-only Notification + 32-entry RX queue + 8KiB transfer window |
+| network | manager INTx IRQ thread + polling fallback + bounded TX/RX queue + 8KiB transfer window |
 | console | 输出走 `seL4_DebugPutChar`；输入只使用 `0x3f8–0x3ff` COM1 capability |
 
 ## 复现
@@ -186,11 +189,16 @@ poll thread 无包时阻塞在 receive-only Notification，不再循环发送 En
 queue 记录 high-water、backpressure、drop 和 empty-fetch，自动测试通过 64 个 1200-byte UDP packet
 制造慢消费者并验证队列恢复。完整结果见 `PHASE2.5.1-RESULTS.md`。
 
+Phase 2.5.2 已完成。manager 从 PCI 配置空间读取 legacy interrupt line，注册 level-triggered、
+active-low IOAPIC capability，并由独立 IRQ thread 调用 ethdriver `raw_handleIRQ()`。QEMU 回归观察到
+真实 RX/TX interrupt，连续 fallback poll 计数为 0；IRQ 不可用或 wait/ack 失败时切换到 polling。
+完整结果见 `PHASE2.5.2-RESULTS.md`。
+
 Phase 2.5.3 已完成。manager 在单页 TX window 与私有 DMA 之间增加 16-entry SPSC queue；队列满时
 返回可重试背压而不丢包。自动测试发送 2048 个 1200-byte UDP packet，验证队列达到 15 的满水位、
 出现背压且对端收到全部数据。完整结果见 `PHASE2.5.3-RESULTS.md`。
 
 当前限制包括：小于一页的 host allocation 仍按页计费、host-file backing 固定为 16MiB 且依赖 QEMU
-ivshmem、静态 ABI 尚不支持 pipeline/native fork/exec，manager 物理网卡侧仍使用 polling thread 而非 IRQ，且默认测试对端
+ivshmem、静态 ABI 尚不支持 pipeline/native fork/exec，当前网络仅支持单队列 legacy INTx，且默认测试对端
 是确定性的 localhost 二层 peer，不是互联网出口。
 后续工作见 [`next-plan.md`](next-plan.md)。

@@ -2,7 +2,7 @@
 
 Phase 2.5.3 将 child 的单页 TX window 与 manager 私有 virtio DMA 生命周期解耦。manager 在收到
 `NET_TX` 请求后先复制 Ethernet frame 到 16-entry SPSC queue，再立即允许 child 复用共享页；独立
-poll thread 逐项提交到 virtio-net-pci。
+kick/IRQ thread 逐项提交到 virtio-net-pci，TX completion 主要由 INTx handler 回收。
 
 队列实际容量为 15。queue full 时 manager 返回 `LUNA_NET_TX_RETRY`，child 保持共享页内容并在 yield
 后重试，直到成功 enqueue；该路径不会将暂时背压变成 LKL virtqueue I/O error，也不会扩大 child 的

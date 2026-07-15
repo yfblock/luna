@@ -41,6 +41,7 @@ REQUIRED = [
     b"LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci",
     b"LUNA_NETWORK_IPV4_OK address=10.0.2.15/24",
     b"LUNA_NETWORK_ASYNC_RX_OK notification=receive-only",
+    b"LUNA_NETWORK_IRQ_OK line=",
     b"LUNA_NETWORK_ICMP_OK peer=10.0.2.2",
     b"LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080",
     b"LUNA_NET_QUEUE_STATS received=",
@@ -104,6 +105,8 @@ FORBIDDEN = [
     b"TCP smoke failed",
     b"network pressure smoke failed",
     b"network TX pressure smoke failed",
+    b"virtio-net IRQ verification failed",
+    b"LUNA_NETWORK_IRQ_FALLBACK_OK",
     b"host-file disk I/O setup failed",
     b"ivshmem disk missing",
     b"ivshmem disk PCI configuration invalid",
@@ -234,6 +237,22 @@ def main() -> int:
         errors.append("sleep elapsed time was not reported")
     elif not 80_000_000 <= int(elapsed.group(1)) <= 5_000_000_000:
         errors.append(f"100ms sleep elapsed value out of range: {elapsed.group(1).decode()} ns")
+    irq = re.search(
+        rb"LUNA_NETWORK_IRQ_OK line=(\d+) interrupts=(\d+) "
+        rb"kick_polls=(\d+) fallback_polls=(\d+)", data
+    )
+    if not irq:
+        errors.append("virtio-net IRQ statistics were not reported")
+    else:
+        line, interrupts, kick_polls, fallback_polls = map(int, irq.groups())
+        if not 1 <= line < 24:
+            errors.append(f"virtio-net IRQ line out of range: {line}")
+        if interrupts <= 0:
+            errors.append("virtio-net did not deliver any interrupts")
+        if kick_polls > 4096:
+            errors.append(f"kick-driven poll count unexpectedly high: {kick_polls}")
+        if fallback_polls != 0:
+            errors.append(f"unexpected continuous polling: {fallback_polls}")
 
     if errors:
         print("\nSMOKE TEST FAILED", file=sys.stderr)

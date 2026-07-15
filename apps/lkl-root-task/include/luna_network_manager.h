@@ -25,6 +25,7 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
                            struct luna_net_mapping *mapping,
                            int activate);
 void luna_network_deactivate_child(void);
+int luna_network_verify_irq(void);
 int luna_network_service(seL4_CPtr command_ep, seL4_Word event,
                          seL4_Word length_word);
 
