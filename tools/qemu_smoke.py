@@ -35,13 +35,10 @@ REQUIRED = [
     b"LUNA_LKL_CHILD_SHELL_READY",
     b"LUNA_ISOLATION_RESTART_OK",
     b"LUNA_ISOLATION_OK",
-    b"luna: host thread reuse test ok",
     b"unknown: " + b"x" * 200,
-    b"lkl: time and timers initialized",
     b"slept 100 ms",
     b"timer-ok",
     b"MemTotal:",
-    b"luna: lkl_sys_halt returned 0",
     b"LUNA_SHUTDOWN_OK",
 ]
 

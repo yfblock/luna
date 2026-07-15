@@ -9,7 +9,7 @@
 #   ./run.sh --run-only      # 只启动（假定已构建）
 #   ./run.sh --timeout 30    # 自定义 QEMU 超时秒数
 #   ./run.sh --no-timeout    # 不超时（手动 Ctrl-A X 退出）
-#   LUNA_QEMU_MEM=2G ./run.sh # 覆盖迁移期 QEMU 内存（默认 1G）
+#   LUNA_QEMU_MEM=1G ./run.sh # 覆盖 QEMU 内存（默认 512M）
 #
 # 前置：deps/ 已就绪（seL4 manifest 源树 + lkl-linux）；~/bin/xmllint stub 与 python 依赖已装。
 # 详见 README.md / PHASE1-RESULTS.md。
@@ -22,7 +22,7 @@ LKL_LINUX="$DEPS/lkl-linux"
 LKL_LIBA="$LKL_LINUX/tools/lkl/liblkl.a"
 KERNEL_OBJ="$ROOT/build-artifacts/lkl-kernel.o"
 QEMU="$(command -v qemu-system-x86_64 || true)"
-QEMU_MEM="${LUNA_QEMU_MEM:-1G}"
+QEMU_MEM="${LUNA_QEMU_MEM:-512M}"
 
 DO_BUILD=1
 DO_RUN=1
@@ -67,7 +67,7 @@ if [[ $DO_BUILD == 1 ]]; then
     mkdir -p "$ROOT/build-artifacts"
     ( cd "$ROOT/build-artifacts" && ar x "$LKL_LIBA" lkl.o && mv lkl.o lkl-kernel.o )
 
-    step "configure seL4 root task (with LKL)"
+    step "configure root manager and isolated LKL task"
     export LUNA_SETTINGS="$DEPS/lkl_settings.cmake"
     export LKL_LINUX_DIR="$LKL_LINUX"
     export LKL_KERNEL_OBJ="$KERNEL_OBJ"

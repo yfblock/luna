@@ -1,5 +1,9 @@
 # Phase 1.1 — LKL on seL4：基础移植设计
 
+> 本文是 Phase 1.1 的历史设计记录，描述的 root-hosted LKL 已被 Phase 2.1 独立 task 架构取代。
+> 当前结构、能力边界和验证结果以 [`README.md`](README.md) 与
+> [`PHASE2.1-RESULTS.md`](PHASE2.1-RESULTS.md) 为准。
+
 目标：把 **LKL (Linux Kernel Library)** 作为 seL4 的一个**纯用户态 Task**跑起来，引导 LKL 内核，
 并在其内启动一个**静态链接的 HelloWorld**。**不涉及 UINTR**，仅验证 LKL 能在 seL4 用户态正常初始化与运行。
 

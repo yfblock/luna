@@ -6,8 +6,7 @@
  * 输出：lkl_sys_write(1, ...) —— 经 LKL tty write → lkl_ops->print → seL4_DebugPutChar。
  * 命令：经 lkl_sys_* 在 LKL 内核上执行。
  *
- * luna_shell_prepare() 创建设备节点并设置 fd 0/1/2；同一实现可链接到
- * root comparison path 或 isolated child。
+ * luna_shell_prepare() 在 isolated child 内创建设备节点并设置 fd 0/1/2。
  */
 #include "luna_shell.h"
 #include <stdio.h>

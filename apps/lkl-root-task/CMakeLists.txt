@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
-# apps/lkl-root-task/CMakeLists.txt — seL4 root task hosting LKL.
+# apps/lkl-root-task/CMakeLists.txt — root manager plus isolated LKL task.
 #
 # settings 文件须以 include() 在最开头加载（与 sel4-tutorials 一致），
 # 这样 CMAKE_MODULE_PATH / kernel 配置在 find_package 前生效。
@@ -64,14 +64,10 @@ add_executable(luna-lkl
     isolation-child-archive.o
     src/main.c
     src/isolation_manager.c
-    src/lkl_host_ops.c
-    src/shell.c
-    src/manager_private.c
 )
 
 target_include_directories(luna-lkl PRIVATE
     include
-    ${LKL_LINUX_DIR}/tools/lkl/include
 )
 
 target_compile_definitions(luna-lkl PRIVATE
@@ -80,13 +76,11 @@ target_compile_definitions(luna-lkl PRIVATE
 )
 target_compile_options(luna-lkl PRIVATE -O2 -g -Wall)
 
-# 链接 LKL 内核对象（.o 直接进链接）+ seL4 用户态库
+# Root manager does not link LKL; the kernel object is owned by luna-lkl-task.
 target_link_libraries(luna-lkl
-    ${LKL_KERNEL_OBJ}
     sel4runtime sel4 muslc utils
     sel4muslcsys sel4platsupport sel4utils sel4debug
     sel4allocman sel4simple sel4simple-default sel4vka sel4vspace
-    sel4vka sel4utils
 )
 
 # 作为 root task

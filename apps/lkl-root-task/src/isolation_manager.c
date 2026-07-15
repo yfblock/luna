@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * First migration milestone: exercise a child with its own CSpace/VSpace,
- * diagnose an intentional fault, destroy it, and start a replacement.  The
- * existing in-root LKL boot runs only after this boundary has been verified.
+ * Own an LKL child with its own CSpace/VSpace, diagnose an intentional fault,
+ * destroy it, and start a clean replacement without exposing manager
+ * allocation authority to the child.
  */
 #include "luna_isolation.h"
 #include "luna_isolation_protocol.h"
-#include "luna_manager_private.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
@@ -21,6 +20,7 @@
 #define CHILD_PRIORITY 100
 #define CHILD_BADGE_FAULT 0x41
 #define CHILD_BADGE_CLEAN 0x42
+#define MANAGER_PRIVATE_ADDR ((void *)(uintptr_t)0x40000000UL)
 
 struct luna_resource_slot {
     sel4utils_thread_t thread;
@@ -312,8 +312,22 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
                          vspace_t *manager_vspace,
                          unsigned long long tsc_frequency)
 {
+    reservation_t private_reservation = vspace_reserve_range_at(
+        manager_vspace, MANAGER_PRIVATE_ADDR, BIT(seL4_PageBits),
+        seL4_AllRights, 1);
+    if (!private_reservation.res) {
+        printf("luna: manager-private reservation failed\n");
+        return -1;
+    }
+    if (vspace_new_pages_at_vaddr(manager_vspace, MANAGER_PRIVATE_ADDR, 1,
+                                  seL4_PageBits, private_reservation)) {
+        printf("luna: manager-private page allocation failed\n");
+        vspace_free_reservation(manager_vspace, private_reservation);
+        return -1;
+    }
+    volatile seL4_Word *manager_private_page = MANAGER_PRIVATE_ADDR;
     const seL4_Word private_addr =
-        (seL4_Word)(uintptr_t)luna_manager_private_page;
+        (seL4_Word)(uintptr_t)manager_private_page;
     vka_object_t control_ep = {0};
     vka_object_t command_ep = {0};
     sel4utils_process_t child = {0};
@@ -323,7 +337,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     int child_live = 0;
     int result = -1;
 
-    luna_manager_private_page[0] = LUNA_ISOLATION_SECRET;
+    manager_private_page[0] = LUNA_ISOLATION_SECRET;
 
     if (vka_alloc_endpoint(vka, &control_ep)) {
         printf("luna: isolation control endpoint allocation failed\n");
@@ -390,8 +404,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         goto out;
     }
     sel4utils_print_fault_message(fault_tag, LUNA_ISOLATION_CHILD_IMAGE);
-    if (*(volatile seL4_Word *)(uintptr_t)private_addr !=
-        LUNA_ISOLATION_SECRET) {
+    if (manager_private_page[0] != LUNA_ISOLATION_SECRET) {
         printf("luna: manager-private page was modified\n");
         goto out;
     }
@@ -452,5 +465,8 @@ out:
     if (child_live) destroy_child(&child, &resources, vka);
     if (command_allocated) vka_free_object(vka, &command_ep);
     if (control_allocated) vka_free_object(vka, &control_ep);
+    vspace_unmap_pages(manager_vspace, MANAGER_PRIVATE_ADDR, 1,
+                       seL4_PageBits, vka);
+    vspace_free_reservation(manager_vspace, private_reservation);
     return result;
 }
