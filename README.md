@@ -108,6 +108,7 @@ luna/
 ├── tools/stability.py           # 多 QEMU 持久化、FSCK、基线和资源漂移回归
 ├── tools/network-backends.py    # QEMU/helper/TAP 后端能力探测
 ├── tools/quality-gate.sh        # 依赖、语法、单元测试及可选完整验收
+├── tools/gcc-analyzer.py        # 对 Luna C translation units 运行 GCC -fanalyzer
 └── deps/                        # seL4 manifest、lkl-linux 与 BusyBox
     └── lkl_settings.cmake       # 非-tutorial 的 seL4 构建设置（x86_64 pc99, debug putchar）
 ```
@@ -140,6 +141,7 @@ luna/
 ./tools/benchmark.py --check-baseline
 ./tools/stability.py --rounds 3 --timeout 600
 ./tools/quality-gate.sh               # 快速静态门槛
+./tools/quality-gate.sh --analyze     # 构建并运行 GCC -fanalyzer
 ./tools/quality-gate.sh --smoke       # 跨 QEMU + benchmark 完整门槛
 ```
 

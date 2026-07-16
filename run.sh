@@ -138,7 +138,8 @@ if [[ $DO_BUILD == 1 ]]; then
     export LKL_LINUX_DIR="$LKL_LINUX"
     export LKL_KERNEL_OBJ="$KERNEL_OBJ"
     export BUSYBOX_DIR="$BUSYBOX"
-    cmake -G Ninja -B "$BUILD" -S "$ROOT/apps/lkl-root-task" >/dev/null
+    cmake -G Ninja -B "$BUILD" -S "$ROOT/apps/lkl-root-task" \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
 
     step "ninja build"
     ninja -C "$BUILD"
