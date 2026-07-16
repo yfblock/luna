@@ -209,7 +209,7 @@ int main(int argc, char **argv)
     }
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_LKL_BOOT_OK,
                child_boot.mode);
-    if (child_boot.mode != LUNA_ISOLATION_MODE_STRESS) {
+    if (child_boot.mode == LUNA_ISOLATION_MODE_CLEAN) {
         if (luna_lkl_task_net_prepare())
             for (;;) seL4_Yield();
         send_event(child_boot.control_ep,
@@ -222,10 +222,14 @@ int main(int argc, char **argv)
     send_event(child_boot.control_ep,
                LUNA_ISOLATION_EVENT_VIRTIO_BLOCK_OK, child_boot.mode);
     if (child_boot.mode == LUNA_ISOLATION_MODE_CLEAN) {
-        if (luna_lkl_task_net_smoke())
+        int net_smoke = luna_lkl_task_net_smoke();
+        if (net_smoke < 0)
             for (;;) seL4_Yield();
         send_event(child_boot.control_ep,
-                   LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK, child_boot.mode);
+                   net_smoke ?
+                       LUNA_ISOLATION_EVENT_NETWORK_ICMP_UNAVAILABLE :
+                       LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK,
+                   child_boot.mode);
         send_event(child_boot.control_ep,
                    LUNA_ISOLATION_EVENT_NETWORK_TCP_OK, child_boot.mode);
         if (luna_lkl_task_net_pressure_smoke())

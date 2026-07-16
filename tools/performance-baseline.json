@@ -1,0 +1,42 @@
+{
+  "description": "Phase 2.7 socket-backend regression floor; update only with a reviewed benchmark result.",
+  "network_backend": "socket",
+  "reference": {
+    "pipeline.bytes_per_sec": 5151620,
+    "network_rx_throughput.p50_bytes_per_sec": 3565565,
+    "network_tx.bytes_per_sec": 8556420,
+    "block.sequential_write_bytes_per_sec": 40001181,
+    "block.random_write_iops": 13004,
+    "block.random_read_iops": 15733
+  },
+  "minimums": {
+    "pipeline.bytes_per_sec": 3500000,
+    "network_rx_throughput.p50_bytes_per_sec": 2200000,
+    "network_tx.bytes_per_sec": 2500000,
+    "block.sequential_write_bytes_per_sec": 8000000,
+    "block.cold_read_bytes_per_sec": 5000000,
+    "block.hot_read_bytes_per_sec": 12000000,
+    "block.random_write_iops": 1500,
+    "block.random_read_iops": 1500,
+    "lifecycle.rounds": 100
+  },
+  "maximums": {
+    "pipeline.p99_ns": 350000000,
+    "network_rx_throughput.p99_ns": 30000000,
+    "lifecycle.create_p99_ns": 800000000,
+    "lifecycle.start_p99_ns": 1700000000,
+    "lifecycle.destroy_p99_ns": 600000000,
+    "resources.busybox_heap_peak_bytes": 1048576
+  },
+  "equals": {
+    "resources.managed_frame_pages": 8225,
+    "resources.child_tcbs": 50,
+    "resources.child_notifications": 146,
+    "resources.child_heap_pages": 8192,
+    "resources.disk_window_pages": 16,
+    "resources.network_window_pages": 17,
+    "resources.static_worker_peak": 4,
+    "resources.child_thread_slots": 47,
+    "resources.child_sync_slots": 96
+  }
+}

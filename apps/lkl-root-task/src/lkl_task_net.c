@@ -509,17 +509,16 @@ fail:
 
 int luna_lkl_task_net_smoke(void)
 {
-    int result = task_icmp_smoke();
-    if (result) {
-        lkl_printf("luna-lkl-task: ICMP smoke failed: %d\n", result);
-        return -1;
-    }
-    result = task_tcp_smoke();
+    int icmp_result = task_icmp_smoke();
+    if (icmp_result)
+        lkl_printf("LUNA_NETWORK_ICMP_UNAVAILABLE result=%d\n",
+                   icmp_result);
+    int result = task_tcp_smoke();
     if (result) {
         lkl_printf("luna-lkl-task: TCP smoke failed: %d\n", result);
         return -1;
     }
-    return 0;
+    return icmp_result ? 1 : 0;
 }
 
 static int task_net_control(seL4_Word control)

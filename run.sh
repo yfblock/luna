@@ -23,13 +23,14 @@ LKL_LINUX="$DEPS/lkl-linux"
 BUSYBOX="$DEPS/busybox"
 LKL_LIBA="$LKL_LINUX/tools/lkl/liblkl.a"
 KERNEL_OBJ="$ROOT/build-artifacts/lkl-kernel.o"
-QEMU="$(command -v qemu-system-x86_64 || true)"
+QEMU="${LUNA_QEMU:-$(command -v qemu-system-x86_64 || true)}"
 QEMU_MEM="${LUNA_QEMU_MEM:-512M}"
 NET_PEER_PORT="${LUNA_NET_PEER_PORT:-18081}"
 NET_QEMU_PORT="${LUNA_NET_QEMU_PORT:-18082}"
 NET_BACKEND="${LUNA_NET_BACKEND:-socket}"
 NET_SERVICE_BIND="${LUNA_NET_SERVICE_BIND:-0.0.0.0}"
 TAP_IFNAME="${LUNA_TAP_IFNAME:-luna-tap0}"
+PASST_RUNAS="${LUNA_PASST_RUNAS:-}"
 DISK_IMAGE="${LUNA_DISK_IMAGE:-$BUILD/luna-rootfs-state.ext4}"
 DISK_RESET="${LUNA_DISK_RESET:-0}"
 DISK_SIZE=16777216
@@ -68,6 +69,10 @@ esac
     echo "无效 TAP 接口名：$TAP_IFNAME" >&2
     exit 2
 }
+[[ -z "$PASST_RUNAS" || "$PASST_RUNAS" =~ ^[0-9]+(:[0-9]+)?$ ]] || {
+    echo "无效 passt UID[:GID]：$PASST_RUNAS" >&2
+    exit 2
+}
 
 compose_net_args() {
     case "$NET_BACKEND" in
@@ -78,7 +83,11 @@ compose_net_args() {
             QEMU_NET_ARGS="-nic none -netdev user,id=lunanet,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15 -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
             ;;
         passt)
-            QEMU_NET_ARGS="-nic none -netdev passt,id=lunanet,param=--ipv4-only,param=--address,param=10.0.2.15,param=--netmask,param=255.255.255.0,param=--gateway,param=10.0.2.2 -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
+            PASST_RUNAS_ARGS=""
+            if [[ -n "$PASST_RUNAS" ]]; then
+                PASST_RUNAS_ARGS=",param=--runas,param=$PASST_RUNAS"
+            fi
+            QEMU_NET_ARGS="-nic none -netdev passt,id=lunanet,param=--ipv4-only,param=--address,param=10.0.2.15,param=--netmask,param=255.255.255.0,param=--gateway,param=10.0.2.2${PASST_RUNAS_ARGS} -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
             ;;
         tap)
             QEMU_NET_ARGS="-nic none -netdev tap,id=lunanet,ifname=${TAP_IFNAME},script=no,downscript=no -device virtio-net-pci,disable-modern=on,netdev=lunanet,mac=52:54:00:12:34:56,addr=05.0"
@@ -194,12 +203,21 @@ if [[ $DO_RUN == 1 ]]; then
                 echo "QEMU 缺少 TAP netdev backend" >&2
                 exit 1
             }
-            [[ -e "/sys/class/net/$TAP_IFNAME" ]] || {
+            ip link show dev "$TAP_IFNAME" >/dev/null 2>&1 || {
                 echo "TAP 接口不存在：$TAP_IFNAME" >&2
                 exit 1
             }
             ip -4 addr show dev "$TAP_IFNAME" | grep -q '10\.0\.2\.2/24' || {
                 echo "TAP 接口必须配置 10.0.2.2/24：$TAP_IFNAME" >&2
+                exit 1
+            }
+            [[ -r "/proc/sys/net/ipv6/conf/$TAP_IFNAME/disable_ipv6" &&
+               "$(cat "/proc/sys/net/ipv6/conf/$TAP_IFNAME/disable_ipv6")" == 1 ]] || {
+                echo "TAP 接口必须禁用 IPv6，避免 legacy INTx 中断风暴：$TAP_IFNAME" >&2
+                exit 1
+            }
+            ip link show dev "$TAP_IFNAME" | head -1 | grep -qv 'MULTICAST' || {
+                echo "TAP 接口必须关闭 multicast：ip link set dev $TAP_IFNAME multicast off" >&2
                 exit 1
             }
             PEER_COMMAND=(python3 "$ROOT/tools/net-service.py"

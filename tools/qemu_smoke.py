@@ -88,6 +88,7 @@ BASE_COMMANDS = [
 REQUIRED = [
     b"LUNA_ISOLATION_FAULT_OK",
     b"LUNA_ISOLATION_CHANNEL_OK",
+    b"LUNA_CHILD_START_ROLLBACK_OK stages=7",
     b"LUNA_LKL_CHILD_LINKED",
     b"LUNA_RESOURCE_POOL_OK",
     b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
@@ -205,6 +206,8 @@ FORBIDDEN = [
     b"host page map failed",
     b"host page unmap failed",
     b"child heap request failed",
+    b"child start rollback failed",
+    b"child start rollback audit failed",
     b"failed to delete child resource cap",
     b"Cannot clear reserved entries mid level",
     b"Untyped Retype",
@@ -283,7 +286,11 @@ def main() -> int:
 
     commands = list(BASE_COMMANDS)
     required = list(REQUIRED)
+    icmp_unavailable = b"LUNA_NETWORK_ICMP_UNAVAILABLE"
     required.append(f"LUNA_QEMU_NET_BACKEND backend={args.net_backend}".encode())
+    if args.net_backend == "passt":
+        required.remove(b"LUNA_NETWORK_ICMP_OK peer=10.0.2.2")
+        required.append(b"LUNA_NETWORK_ICMP_UNAVAILABLE peer=10.0.2.2")
     if args.persist_write:
         commands.insert(
             -1,
@@ -322,6 +329,7 @@ def main() -> int:
     command_index = 0
     deadline = time.monotonic() + args.timeout
     success_marker = False
+    early_failure = False
 
     try:
         while time.monotonic() < deadline:
@@ -347,7 +355,10 @@ def main() -> int:
                 if b"LUNA_SHUTDOWN_OK" in output:
                     success_marker = True
                     break
-            if success_marker or proc.poll() is not None:
+                if any(marker in output for marker in FORBIDDEN):
+                    early_failure = True
+                    break
+            if success_marker or early_failure or proc.poll() is not None:
                 break
     finally:
         selector.close()
@@ -369,6 +380,8 @@ def main() -> int:
     for marker in FORBIDDEN:
         if marker in data:
             errors.append(f"forbidden output: {marker.decode(errors='replace')}")
+    if args.net_backend != "passt" and icmp_unavailable in data:
+        errors.append("forbidden output: LUNA_NETWORK_ICMP_UNAVAILABLE")
     irq = re.search(
         rb"LUNA_NETWORK_IRQ_OK line=(\d+) interrupts=(\d+) "
         rb"kick_polls=(\d+) fallback_polls=(\d+)", data

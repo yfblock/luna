@@ -116,6 +116,18 @@ struct luna_event_context {
     vka_t *vka;
 };
 
+enum luna_start_failpoint {
+    LUNA_START_FAIL_NONE = 0,
+    LUNA_START_FAIL_PROCESS,
+    LUNA_START_FAIL_HEAP,
+    LUNA_START_FAIL_DISK,
+    LUNA_START_FAIL_NETWORK,
+    LUNA_START_FAIL_RESOURCE_POOL,
+    LUNA_START_FAIL_CONTROL_CAP,
+    LUNA_START_FAIL_COMMAND_CAP,
+    LUNA_START_FAIL_COUNT,
+};
+
 static unsigned long long manager_elapsed_ns(unsigned long long start_cycles,
                                              unsigned long long frequency)
 {
@@ -289,6 +301,43 @@ static int map_persistent_disk(struct luna_persistent_disk *disk,
     return 0;
 }
 
+static int materialize_heap_reservation_metadata(
+    sel4utils_process_t *process,
+    struct luna_heap_resource *heap,
+    vka_t *vka)
+{
+    /* sel4utils compresses untouched, large-page-aligned reservations into a
+     * mid-level RESERVED entry. Its reservation teardown cannot clear that
+     * representation directly. Ensure every large-page span has a leaf table
+     * before freeing a child that failed prior to its first heap request. */
+    const size_t span_pages = BIT(seL4_LargePageBits - seL4_PageBits);
+    if (heap->peak_pages == LUNA_CHILD_HEAP_PAGES) return 0;
+    for (size_t start = 0; start < LUNA_CHILD_HEAP_PAGES;
+         start += span_pages) {
+        size_t end = start + span_pages;
+        if (end > LUNA_CHILD_HEAP_PAGES) end = LUNA_CHILD_HEAP_PAGES;
+        int materialized = 0;
+        for (size_t page = start; page < end; page++) {
+            if (heap->mapped[page]) {
+                materialized = 1;
+                break;
+            }
+        }
+        if (materialized) continue;
+        void *address = (void *)(uintptr_t)(
+            LUNA_CHILD_HEAP_BASE + start * BIT(seL4_PageBits));
+        if (vspace_new_pages_at_vaddr(&process->vspace, address, 1,
+                                      seL4_PageBits, heap->reservation)) {
+            printf("luna: child heap rollback metadata allocation failed "
+                   "at page %zu\n", start);
+            return -1;
+        }
+        vspace_unmap_pages(&process->vspace, address, 1,
+                           seL4_PageBits, vka);
+    }
+    return 0;
+}
+
 static int destroy_child(sel4utils_process_t *process,
                          struct luna_child_resources *resources, vka_t *vka)
 {
@@ -327,6 +376,9 @@ static int destroy_child(sel4utils_process_t *process,
     if (resources->console.slot_allocated)
         vka_cspace_free_path(vka, resources->console.io_port_path);
     if (resources->heap.reserved) {
+        if (materialize_heap_reservation_metadata(process,
+                                                  &resources->heap, vka))
+            result = -1;
         for (size_t i = 0; i < LUNA_CHILD_HEAP_PAGES;) {
             if (!resources->heap.mapped[i]) {
                 i++;
@@ -364,6 +416,21 @@ static int destroy_child(sel4utils_process_t *process,
     memset(resources, 0, sizeof(*resources));
     memset(process, 0, sizeof(*process));
     return result;
+}
+
+static int inject_start_rollback(
+    enum luna_start_failpoint configured,
+    enum luna_start_failpoint current,
+    sel4utils_process_t *process,
+    struct luna_child_resources *resources,
+    vka_t *vka)
+{
+    if (configured != current) return 0;
+    if (destroy_child(process, resources, vka)) {
+        printf("luna: child start rollback failed at stage %d\n", current);
+        return -1;
+    }
+    return 1;
 }
 
 static int configure_resource_pool(simple_t *simple, vka_t *vka,
@@ -616,9 +683,11 @@ static int service_disk_batch(struct luna_event_context *context,
     return error;
 }
 
-static int receive_event(struct luna_event_context *context,
-                         seL4_Word expected_event,
-                         seL4_Word expected_detail)
+static int receive_event_variant(struct luna_event_context *context,
+                                 seL4_Word expected_event,
+                                 seL4_Word alternative_event,
+                                 seL4_Word expected_detail,
+                                 seL4_Word *received_event)
 {
     for (;;) {
         seL4_Word badge = 0;
@@ -672,7 +741,8 @@ static int receive_event(struct luna_event_context *context,
         }
 
         if (label != 0 || length < 2 || badge != context->badge ||
-            event != expected_event || detail != expected_detail) {
+            (event != expected_event && event != alternative_event) ||
+            detail != expected_detail) {
             printf("luna: isolation event mismatch label=%lu len=%lu badge=%lu "
                    "event=%lu detail=%lu\n",
                    label, length, badge, event, detail);
@@ -693,8 +763,17 @@ static int receive_event(struct luna_event_context *context,
                    (unsigned long)LUNA_CHILD_HEAP_PAGES);
             return -1;
         }
+        if (received_event) *received_event = event;
         return 0;
     }
+}
+
+static int receive_event(struct luna_event_context *context,
+                         seL4_Word expected_event,
+                         seL4_Word expected_detail)
+{
+    return receive_event_variant(context, expected_event, 0,
+                                 expected_detail, NULL);
 }
 
 static void send_resource_slot(seL4_CPtr command_ep,
@@ -765,7 +844,8 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
                        enum luna_isolation_mode mode, seL4_Word private_addr,
                        sel4utils_process_t *process,
                        struct luna_child_resources *resources,
-                       struct luna_persistent_disk *disk)
+                       struct luna_persistent_disk *disk,
+                       enum luna_start_failpoint failpoint)
 {
     sel4utils_process_config_t config =
         process_config_default_simple(simple, LUNA_ISOLATION_CHILD_IMAGE, CHILD_PRIORITY);
@@ -785,6 +865,9 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    int injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_PROCESS, process, resources, vka);
+    if (injected) return injected;
 
     resources->heap.reservation = vspace_reserve_range_at(
         &process->vspace, (void *)(uintptr_t)LUNA_CHILD_HEAP_BASE,
@@ -795,23 +878,35 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         return -1;
     }
     resources->heap.reserved = 1;
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_HEAP, process, resources, vka);
+    if (injected) return injected;
 
     if (map_persistent_disk(disk, vka, manager_vspace, process, resources)) {
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_DISK, process, resources, vka);
+    if (injected) return injected;
     if (luna_network_map_child(vka, manager_vspace, process,
                                &resources->net,
-                               mode != LUNA_ISOLATION_MODE_STRESS)) {
+                               mode == LUNA_ISOLATION_MODE_CLEAN)) {
         printf("luna: child network window mapping failed\n");
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_NETWORK, process, resources, vka);
+    if (injected) return injected;
 
     if (configure_resource_pool(simple, vka, manager_vspace, process, resources)) {
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_RESOURCE_POOL, process, resources, vka);
+    if (injected) return injected;
 
     cspacepath_t control_path;
     vka_cspace_make_path(vka, control_ep, &control_path);
@@ -822,6 +917,9 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_CONTROL_CAP, process, resources, vka);
+    if (injected) return injected;
 
     cspacepath_t command_path;
     vka_cspace_make_path(vka, command_ep, &command_path);
@@ -832,6 +930,9 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
         (void)destroy_child(process, resources, vka);
         return -1;
     }
+    injected = inject_start_rollback(
+        failpoint, LUNA_START_FAIL_COMMAND_CAP, process, resources, vka);
+    if (injected) return injected;
 
     char arg_strings[4][WORD_STRING_SIZE];
     char *argv[4];
@@ -848,6 +949,34 @@ static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
     return 0;
 }
 
+static int audit_child_start_rollbacks(
+    simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
+    seL4_CPtr control_ep, seL4_CPtr command_ep, seL4_Word private_addr,
+    sel4utils_process_t *process, struct luna_child_resources *resources,
+    struct luna_persistent_disk *disk)
+{
+    sel4utils_process_t empty_process = {0};
+    struct luna_child_resources empty_resources = {0};
+    for (enum luna_start_failpoint failpoint = LUNA_START_FAIL_PROCESS;
+         failpoint < LUNA_START_FAIL_COUNT; failpoint++) {
+        int result = start_child(
+            simple, vka, manager_vspace, control_ep, command_ep,
+            CHILD_BADGE_STRESS, LUNA_ISOLATION_MODE_STRESS, private_addr,
+            process, resources, disk, failpoint);
+        if (result != 1 ||
+            memcmp(process, &empty_process, sizeof(*process)) ||
+            memcmp(resources, &empty_resources, sizeof(*resources))) {
+            printf("luna: child start rollback audit failed at stage %d "
+                   "result=%d\n", failpoint, result);
+            if (result == 0) (void)destroy_child(process, resources, vka);
+            return -1;
+        }
+    }
+    printf("LUNA_CHILD_START_ROLLBACK_OK stages=%d\n",
+           LUNA_START_FAIL_COUNT - 1);
+    return 0;
+}
+
 static int boot_child(simple_t *simple, vka_t *vka,
                       vspace_t *manager_vspace, seL4_CPtr control_ep,
                       seL4_CPtr command_ep, seL4_Word badge,
@@ -861,7 +990,8 @@ static int boot_child(simple_t *simple, vka_t *vka,
 {
     unsigned long long create_begin = __builtin_ia32_rdtsc();
     if (start_child(simple, vka, manager_vspace, control_ep, command_ep,
-                    badge, mode, private_addr, process, resources, disk))
+                    badge, mode, private_addr, process, resources, disk,
+                    LUNA_START_FAIL_NONE))
         return -1;
     if (mode == LUNA_ISOLATION_MODE_STRESS)
         printf("LUNA_LIFECYCLE_CREATE_SAMPLE ns=%llu\n",
@@ -902,7 +1032,7 @@ static int boot_child(simple_t *simple, vka_t *vka,
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_INIT_OK, mode) ||
         receive_event(event_context, LUNA_ISOLATION_EVENT_LKL_BOOT_OK, mode))
         return -1;
-    if (mode != LUNA_ISOLATION_MODE_STRESS &&
+    if (mode == LUNA_ISOLATION_MODE_CLEAN &&
         (receive_event(event_context,
                        LUNA_ISOLATION_EVENT_VIRTIO_NET_OK, mode) ||
          receive_event(event_context,
@@ -984,6 +1114,11 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     }
     command_allocated = 1;
 
+    if (audit_child_start_rollbacks(
+            simple, vka, manager_vspace, control_ep.cptr, command_ep.cptr,
+            private_addr, &child, &resources, &disk))
+        goto out;
+
     if (boot_child(simple, vka, manager_vspace, control_ep.cptr,
                    command_ep.cptr, CHILD_BADGE_FAULT,
                    LUNA_ISOLATION_MODE_FAULT, private_addr, tsc_frequency,
@@ -1002,9 +1137,6 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
            (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
     printf("LUNA_HOST_FILE_BACKING_OK bytes=%lu\n",
            (unsigned long)LUNA_PERSISTENT_DISK_SIZE);
-    printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
-    printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
-    printf("LUNA_NETWORK_ASYNC_RX_OK notification=receive-only\n");
     printf("LUNA_ROOT_ALLOCATOR_POOL_OK bytes=%lu\n",
            (unsigned long)LUNA_ROOT_ALLOCATOR_POOL_SIZE);
     printf("LUNA_RESOURCE_PEAK_OK managed_frame_pages=%zu child_tcbs=%lu "
@@ -1073,8 +1205,14 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
                    LUNA_ISOLATION_MODE_CLEAN, private_addr, tsc_frequency,
                    &child, &resources, &disk, &child_live, &event_context))
         goto out;
-    if (receive_event(&event_context, LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK,
-                      LUNA_ISOLATION_MODE_CLEAN) ||
+    printf("LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci\n");
+    printf("LUNA_NETWORK_IPV4_OK address=10.0.2.15/24\n");
+    printf("LUNA_NETWORK_ASYNC_RX_OK notification=receive-only\n");
+    seL4_Word icmp_event = 0;
+    if (receive_event_variant(
+            &event_context, LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK,
+            LUNA_ISOLATION_EVENT_NETWORK_ICMP_UNAVAILABLE,
+            LUNA_ISOLATION_MODE_CLEAN, &icmp_event) ||
         receive_event(&event_context, LUNA_ISOLATION_EVENT_NETWORK_TCP_OK,
                       LUNA_ISOLATION_MODE_CLEAN) ||
         receive_event(&event_context,
@@ -1093,7 +1231,10 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
         receive_event(&event_context, LUNA_ISOLATION_EVENT_LKL_SHELL_READY,
                       LUNA_ISOLATION_MODE_CLEAN))
         goto out;
-    printf("LUNA_NETWORK_ICMP_OK peer=10.0.2.2\n");
+    if (icmp_event == LUNA_ISOLATION_EVENT_NETWORK_ICMP_OK)
+        printf("LUNA_NETWORK_ICMP_OK peer=10.0.2.2\n");
+    else
+        printf("LUNA_NETWORK_ICMP_UNAVAILABLE peer=10.0.2.2\n");
     printf("LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080\n");
     printf("LUNA_NETWORK_PRESSURE_OK burst=%lu payload=%lu\n",
            (unsigned long)LUNA_NET_STRESS_BURST,

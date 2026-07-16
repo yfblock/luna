@@ -379,7 +379,7 @@ ssize_t luna_bb_read(int fd, void *buffer, size_t count)
         if (buffered == count) return (ssize_t)buffered;
     }
     ssize_t result = (ssize_t)bb_result(lkl_sys_read(
-        (unsigned int)actual, (unsigned char *)buffer + buffered,
+        (unsigned int)actual, (char *)buffer + buffered,
         count - buffered));
     task_stdio_record(&task_stdio_read_calls, &task_stdio_read_bytes, result);
     return result < 0 ? (buffered ? (ssize_t)buffered : result) :

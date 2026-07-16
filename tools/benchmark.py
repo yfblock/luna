@@ -10,6 +10,9 @@ import tempfile
 from pathlib import Path
 
 
+DEFAULT_BASELINE = Path(__file__).with_name("performance-baseline.json")
+
+
 def marker(data: bytes, pattern: bytes, name: str) -> list[int]:
     import re
 
@@ -38,6 +41,50 @@ def percentile(values: list[int], percent: int) -> int:
     ordered = sorted(values)
     rank = (len(ordered) * percent + 99) // 100
     return ordered[max(1, rank) - 1]
+
+
+def report_value(report: dict[str, object], path: str) -> object:
+    value: object = report
+    for component in path.split("."):
+        if not isinstance(value, dict) or component not in value:
+            raise ValueError(f"baseline references missing metric: {path}")
+        value = value[component]
+    return value
+
+
+def check_baseline(
+    report: dict[str, object], baseline: dict[str, object]
+) -> list[str]:
+    """Return human-readable regressions against an explicit baseline."""
+    if not isinstance(report, dict) or not isinstance(baseline, dict):
+        raise ValueError("report and baseline must be JSON objects")
+    errors: list[str] = []
+    required_backend = baseline.get("network_backend")
+    if required_backend is not None and report.get("network_backend") != required_backend:
+        errors.append(
+            "network_backend: expected "
+            f"{required_backend}, got {report.get('network_backend')}"
+        )
+    comparisons = (
+        ("minimums", lambda actual, limit: actual >= limit, "below minimum"),
+        ("maximums", lambda actual, limit: actual <= limit, "above maximum"),
+        ("equals", lambda actual, limit: actual == limit, "changed"),
+    )
+    for section, accepted, description in comparisons:
+        limits = baseline.get(section, {})
+        if not isinstance(limits, dict):
+            raise ValueError(f"baseline section must be an object: {section}")
+        for path, limit in limits.items():
+            actual = report_value(report, path)
+            if not isinstance(actual, (int, float)) or not isinstance(
+                limit, (int, float)
+            ):
+                raise ValueError(f"baseline metric must be numeric: {path}")
+            if not accepted(actual, limit):
+                errors.append(
+                    f"{path}: {actual} {description} {limit}"
+                )
+    return errors
 
 
 def parse(data: bytes) -> dict[str, object]:
@@ -280,6 +327,17 @@ def main() -> int:
         default="socket",
     )
     parser.add_argument("--show-log", action="store_true")
+    parser.add_argument(
+        "--check-baseline",
+        nargs="?",
+        const=DEFAULT_BASELINE,
+        type=Path,
+        metavar="JSON",
+        help="fail when the report violates performance/resource thresholds",
+    )
+    parser.add_argument(
+        "--output", type=Path, help="also write the JSON report to this file"
+    )
     args = parser.parse_args()
 
     if args.input:
@@ -309,7 +367,26 @@ def main() -> int:
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 1
-    print(json.dumps(report, indent=2, sort_keys=True))
+    encoded = json.dumps(report, indent=2, sort_keys=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
+    if args.check_baseline:
+        try:
+            baseline = json.loads(args.check_baseline.read_text(encoding="utf-8"))
+            if not isinstance(baseline, dict):
+                raise ValueError("baseline must be a JSON object")
+            errors = check_baseline(report, baseline)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            print(f"invalid performance baseline: {error}", file=sys.stderr)
+            return 1
+        if errors:
+            print("PERFORMANCE BASELINE FAILED", file=sys.stderr)
+            for error in errors:
+                print(f"- {error}", file=sys.stderr)
+            return 1
+        print("PERFORMANCE BASELINE PASSED", file=sys.stderr)
     return 0
 
 
