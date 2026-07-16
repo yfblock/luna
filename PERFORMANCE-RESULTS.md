@@ -69,3 +69,11 @@ git diff --check
 
 最终结果：单 QEMU 100 轮通过；两个独立 QEMU 各 100 轮通过；跨 QEMU 文件持久化通过；
 宿主 `e2fsck` 通过；网络 RX/TX 压力、BusyBox/pipeline、`forbidden=0` 和资源回收均通过。
+
+## Phase 2.8 稳态口径
+
+上面的 Block 数字来自旧的一次性样本，容易采到首次 cache/journal/worker 瞬态。Phase 2.8 已用一次
+完整 warm-up 加 7 个正式样本取代该口径；详细结果见 `PHASE2.8-RESULTS.md`。当前 reviewed
+socket 稳定性 reference 为：pipeline 约 49.2 MB/s，Block 64KiB 顺序写约 113.9 MB/s，随机写/读约
+2.47k/2.57k IOPS，child start p50 约 0.54 s。随机 IOPS reference 的下降是统计口径修正，不是把
+首次快样本继续当成稳态吞吐。

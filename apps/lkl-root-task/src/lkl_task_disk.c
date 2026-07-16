@@ -35,6 +35,7 @@ enum task_disk_batch_state {
 struct task_disk_local_batch {
     volatile int state;
     unsigned long long sequence;
+    unsigned long long ready_ns;
     unsigned count;
     enum luna_isolation_event event[LUNA_DISK_BATCH_SLOTS];
     unsigned long long offset[LUNA_DISK_BATCH_SLOTS];
@@ -44,11 +45,15 @@ struct task_disk_local_batch {
     size_t length[LUNA_DISK_BATCH_SLOTS];
     int result;
     int auto_release;
+    struct lkl_sem *completion_sem;
 };
 
 static struct task_disk_local_batch
     task_disk_batches[LUNA_DISK_LOCAL_QUEUE_COUNT];
 static struct lkl_sem *task_disk_worker_sem;
+static struct lkl_sem *task_disk_queue_free_sem;
+static struct lkl_sem *task_disk_async_completion_sem;
+static struct lkl_sem *task_disk_flush_gate_sem;
 static lkl_thread_t task_disk_worker_tid;
 static volatile int task_disk_worker_stop;
 static volatile unsigned long long task_disk_sequence;
@@ -62,6 +67,22 @@ static struct task_disk_local_batch *task_disk_pending_write;
 static volatile int task_disk_write_lock_word;
 static volatile unsigned task_disk_async_pending;
 static volatile int task_disk_async_error;
+static volatile unsigned long long task_disk_queue_wait_ns;
+static volatile unsigned long long task_disk_worker_wait_ns;
+static volatile unsigned long long task_disk_ipc_ns;
+static volatile unsigned long long task_disk_copy_ns;
+static volatile unsigned long long task_disk_flush_wait_ns;
+static volatile unsigned long long task_disk_completion_wait_ns;
+static volatile unsigned long long task_disk_queue_waits;
+static volatile unsigned long long task_disk_completion_signals;
+
+static void task_disk_record_time(volatile unsigned long long *counter,
+                                  unsigned long long start)
+{
+    unsigned long long end = luna_lkl_task_time();
+    if (end >= start)
+        __atomic_fetch_add(counter, end - start, __ATOMIC_RELAXED);
+}
 
 static void task_disk_write_lock(void)
 {
@@ -91,12 +112,17 @@ static int task_disk_read_direct(unsigned long long offset,
     while (length) {
         size_t chunk = length < window ? length : window;
         luna_lkl_task_manager_lock();
+        unsigned long long ipc_start = luna_lkl_task_time();
         int result = luna_lkl_task_manager_request(
             LUNA_ISOLATION_EVENT_DISK_READ, (seL4_Word)offset,
             (seL4_Word)chunk);
-        if (!result)
+        task_disk_record_time(&task_disk_ipc_ns, ipc_start);
+        if (!result) {
+            unsigned long long copy_start = luna_lkl_task_time();
             memcpy(buffer, task_disk_io + LUNA_DISK_BATCH_DATA_OFFSET,
                    chunk);
+            task_disk_record_time(&task_disk_copy_ns, copy_start);
+        }
         luna_lkl_task_manager_unlock();
         __atomic_fetch_add(&task_disk_ipc, 1ULL, __ATOMIC_RELAXED);
         if (result) return -1;
@@ -134,9 +160,11 @@ static int task_disk_process_batch(struct task_disk_local_batch *batch)
         header->descriptors[i].length = (seL4_Word)batch->length[i];
         header->descriptors[i].status = (seL4_Word)-1;
         if (batch->event[i] == LUNA_ISOLATION_EVENT_DISK_WRITE) {
+            unsigned long long copy_start = luna_lkl_task_time();
             memcpy(task_disk_io + LUNA_DISK_BATCH_DATA_OFFSET +
                        i * LUNA_DISK_BATCH_SLOT_SIZE,
                    batch->buffer[i], batch->length[i]);
+            task_disk_record_time(&task_disk_copy_ns, copy_start);
             __atomic_fetch_add(&task_disk_copies, 1ULL, __ATOMIC_RELAXED);
         }
     }
@@ -144,18 +172,22 @@ static int task_disk_process_batch(struct task_disk_local_batch *batch)
     header->count = batch->count;
     __sync_synchronize();
     luna_lkl_task_manager_lock();
+    unsigned long long ipc_start = luna_lkl_task_time();
     int result = luna_lkl_task_manager_request(
         LUNA_ISOLATION_EVENT_DISK_SUBMIT_BATCH, batch->count, 0);
+    task_disk_record_time(&task_disk_ipc_ns, ipc_start);
     luna_lkl_task_manager_unlock();
     __atomic_fetch_add(&task_disk_ipc, 1ULL, __ATOMIC_RELAXED);
     if (result || header->completed != batch->count) return -1;
     for (unsigned i = 0; i < batch->count; i++) {
         if ((int)header->descriptors[i].status) return -1;
         if (batch->event[i] == LUNA_ISOLATION_EVENT_DISK_READ) {
+            unsigned long long copy_start = luna_lkl_task_time();
             memcpy(batch->buffer[i],
                    task_disk_io + LUNA_DISK_BATCH_DATA_OFFSET +
                        i * LUNA_DISK_BATCH_SLOT_SIZE,
                    batch->length[i]);
+            task_disk_record_time(&task_disk_copy_ns, copy_start);
             __atomic_fetch_add(&task_disk_copies, 1ULL, __ATOMIC_RELAXED);
         }
     }
@@ -192,6 +224,9 @@ static void task_disk_worker(void *argument)
                                          __ATOMIC_ACQ_REL,
                                          __ATOMIC_ACQUIRE))
             continue;
+        if (selected->ready_ns)
+            task_disk_record_time(&task_disk_worker_wait_ns,
+                                  selected->ready_ns);
         selected->result = task_disk_process_batch(selected);
         if (selected->auto_release) {
             if (selected->result)
@@ -201,33 +236,52 @@ static void task_disk_worker(void *argument)
             selected->auto_release = 0;
             __atomic_store_n(&selected->state, TASK_DISK_BATCH_FREE,
                              __ATOMIC_RELEASE);
-            __atomic_fetch_sub(&task_disk_async_pending, 1U,
-                               __ATOMIC_ACQ_REL);
+            lkl_host_ops.sem_up(task_disk_queue_free_sem);
+            lkl_host_ops.sem_up(task_disk_async_completion_sem);
+            __atomic_fetch_add(&task_disk_completion_signals, 1ULL,
+                               __ATOMIC_RELAXED);
         } else {
             __atomic_store_n(&selected->state, TASK_DISK_BATCH_DONE,
                              __ATOMIC_RELEASE);
+            lkl_host_ops.sem_up(selected->completion_sem);
+            __atomic_fetch_add(&task_disk_completion_signals, 1ULL,
+                               __ATOMIC_RELAXED);
         }
     }
 }
 
 static struct task_disk_local_batch *task_disk_claim_batch(void)
 {
-    for (unsigned attempt = 0; attempt < 100000U; attempt++) {
-        for (unsigned i = 0; i < LUNA_DISK_LOCAL_QUEUE_COUNT; i++) {
-            int expected = TASK_DISK_BATCH_FREE;
-            if (__atomic_compare_exchange_n(&task_disk_batches[i].state,
-                                             &expected,
-                                             TASK_DISK_BATCH_BUILDING,
-                                             false, __ATOMIC_ACQ_REL,
-                                             __ATOMIC_ACQUIRE)) {
-                task_disk_record_high_water();
-                return &task_disk_batches[i];
-            }
+    int found_free = 0;
+    for (unsigned i = 0; i < LUNA_DISK_LOCAL_QUEUE_COUNT; i++) {
+        if (__atomic_load_n(&task_disk_batches[i].state,
+                            __ATOMIC_ACQUIRE) == TASK_DISK_BATCH_FREE) {
+            found_free = 1;
+            break;
         }
+    }
+    if (!found_free) {
         __atomic_fetch_add(&task_disk_backpressure, 1ULL,
                            __ATOMIC_RELAXED);
-        seL4_Yield();
+        __atomic_fetch_add(&task_disk_queue_waits, 1ULL,
+                           __ATOMIC_RELAXED);
     }
+    unsigned long long wait_start = luna_lkl_task_time();
+    lkl_host_ops.sem_down(task_disk_queue_free_sem);
+    if (!found_free)
+        task_disk_record_time(&task_disk_queue_wait_ns, wait_start);
+    for (unsigned i = 0; i < LUNA_DISK_LOCAL_QUEUE_COUNT; i++) {
+        int expected = TASK_DISK_BATCH_FREE;
+        if (__atomic_compare_exchange_n(&task_disk_batches[i].state,
+                                         &expected,
+                                         TASK_DISK_BATCH_BUILDING,
+                                         false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            task_disk_record_high_water();
+            return &task_disk_batches[i];
+        }
+    }
+    lkl_host_ops.sem_up(task_disk_queue_free_sem);
     return NULL;
 }
 
@@ -238,6 +292,7 @@ static void task_disk_publish_batch(struct task_disk_local_batch *batch,
                                           __ATOMIC_RELAXED);
     batch->result = -1;
     batch->auto_release = auto_release;
+    batch->ready_ns = luna_lkl_task_time();
     if (auto_release)
         __atomic_fetch_add(&task_disk_async_pending, 1U,
                            __ATOMIC_ACQ_REL);
@@ -249,27 +304,39 @@ static void task_disk_publish_batch(struct task_disk_local_batch *batch,
 static int task_disk_submit_batch(struct task_disk_local_batch *batch)
 {
     task_disk_publish_batch(batch, 0);
-    while (__atomic_load_n(&batch->state, __ATOMIC_ACQUIRE) !=
-           TASK_DISK_BATCH_DONE)
-        seL4_Yield();
+    unsigned long long wait_start = luna_lkl_task_time();
+    lkl_host_ops.sem_down(batch->completion_sem);
+    task_disk_record_time(&task_disk_completion_wait_ns, wait_start);
+    if (__atomic_load_n(&batch->state, __ATOMIC_ACQUIRE) !=
+        TASK_DISK_BATCH_DONE)
+        return -1;
     int result = batch->result;
     batch->count = 0;
     __atomic_store_n(&batch->state, TASK_DISK_BATCH_FREE,
                      __ATOMIC_RELEASE);
+    lkl_host_ops.sem_up(task_disk_queue_free_sem);
     return result;
 }
 
 static int task_disk_flush_writes(void)
 {
+    lkl_host_ops.sem_down(task_disk_flush_gate_sem);
     task_disk_write_lock();
     struct task_disk_local_batch *batch = task_disk_pending_write;
     task_disk_pending_write = NULL;
     if (batch && batch->count) task_disk_publish_batch(batch, 1);
+    unsigned pending = __atomic_exchange_n(&task_disk_async_pending, 0U,
+                                            __ATOMIC_ACQ_REL);
     task_disk_write_unlock();
-    while (__atomic_load_n(&task_disk_async_pending, __ATOMIC_ACQUIRE))
-        seL4_Yield();
-    return __atomic_load_n(&task_disk_async_error, __ATOMIC_ACQUIRE) ?
-           -1 : 0;
+    unsigned long long wait_start = luna_lkl_task_time();
+    for (unsigned i = 0; i < pending; i++)
+        lkl_host_ops.sem_down(task_disk_async_completion_sem);
+    if (pending)
+        task_disk_record_time(&task_disk_flush_wait_ns, wait_start);
+    int result = __atomic_load_n(&task_disk_async_error,
+                                 __ATOMIC_ACQUIRE) ? -1 : 0;
+    lkl_host_ops.sem_up(task_disk_flush_gate_sem);
+    return result;
 }
 
 static int task_disk_queue_write(struct lkl_blk_req *request,
@@ -296,9 +363,11 @@ static int task_disk_queue_write(struct lkl_blk_req *request,
             batch->offset[slot] = offset;
             batch->buffer[slot] = batch->owned_data[slot];
             batch->length[slot] = chunk;
+            unsigned long long copy_start = luna_lkl_task_time();
             memcpy(batch->owned_data[slot],
                    (unsigned char *)request->buf[i].iov_base + iov_offset,
                    chunk);
+            task_disk_record_time(&task_disk_copy_ns, copy_start);
             __atomic_fetch_add(&task_disk_copies, 1ULL, __ATOMIC_RELAXED);
             offset += chunk;
             iov_offset += chunk;
@@ -372,6 +441,27 @@ struct lkl_dev_blk_ops lkl_dev_blk_ops = {
     .request = task_disk_request,
 };
 
+void luna_lkl_task_disk_timing_snapshot(
+    struct luna_disk_timing_snapshot *snapshot)
+{
+    if (!snapshot) return;
+    *snapshot = (struct luna_disk_timing_snapshot) {
+        .queue_wait_ns = __atomic_load_n(&task_disk_queue_wait_ns,
+                                         __ATOMIC_ACQUIRE),
+        .worker_wait_ns = __atomic_load_n(&task_disk_worker_wait_ns,
+                                          __ATOMIC_ACQUIRE),
+        .ipc_ns = __atomic_load_n(&task_disk_ipc_ns, __ATOMIC_ACQUIRE),
+        .copy_ns = __atomic_load_n(&task_disk_copy_ns, __ATOMIC_ACQUIRE),
+        .flush_wait_ns = __atomic_load_n(&task_disk_flush_wait_ns,
+                                         __ATOMIC_ACQUIRE),
+        .completion_wait_ns = __atomic_load_n(
+            &task_disk_completion_wait_ns, __ATOMIC_ACQUIRE),
+        .ipc_count = __atomic_load_n(&task_disk_ipc, __ATOMIC_ACQUIRE),
+        .batch_count = __atomic_load_n(&task_disk_batches_completed,
+                                       __ATOMIC_ACQUIRE),
+    };
+}
+
 int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
                                  unsigned long disk_size)
 {
@@ -387,6 +477,9 @@ int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
     task_old_root_fd = -1;
     memset(task_disk_batches, 0, sizeof(task_disk_batches));
     task_disk_worker_sem = NULL;
+    task_disk_queue_free_sem = NULL;
+    task_disk_async_completion_sem = NULL;
+    task_disk_flush_gate_sem = NULL;
     task_disk_worker_tid = 0;
     task_disk_worker_stop = 0;
     task_disk_sequence = 1;
@@ -400,21 +493,61 @@ int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
     task_disk_write_lock_word = 0;
     task_disk_async_pending = 0;
     task_disk_async_error = 0;
+    task_disk_queue_wait_ns = 0;
+    task_disk_worker_wait_ns = 0;
+    task_disk_ipc_ns = 0;
+    task_disk_copy_ns = 0;
+    task_disk_flush_wait_ns = 0;
+    task_disk_completion_wait_ns = 0;
+    task_disk_queue_waits = 0;
+    task_disk_completion_signals = 0;
     memset(&task_disk, 0, sizeof(task_disk));
     return 0;
+}
+
+static void task_disk_free_sems(void)
+{
+    for (unsigned i = 0; i < LUNA_DISK_LOCAL_QUEUE_COUNT; i++) {
+        if (task_disk_batches[i].completion_sem) {
+            lkl_host_ops.sem_free(task_disk_batches[i].completion_sem);
+            task_disk_batches[i].completion_sem = NULL;
+        }
+    }
+    if (task_disk_worker_sem) {
+        lkl_host_ops.sem_free(task_disk_worker_sem);
+        task_disk_worker_sem = NULL;
+    }
+    if (task_disk_async_completion_sem) {
+        lkl_host_ops.sem_free(task_disk_async_completion_sem);
+        task_disk_async_completion_sem = NULL;
+    }
+    if (task_disk_queue_free_sem) {
+        lkl_host_ops.sem_free(task_disk_queue_free_sem);
+        task_disk_queue_free_sem = NULL;
+    }
+    if (task_disk_flush_gate_sem) {
+        lkl_host_ops.sem_free(task_disk_flush_gate_sem);
+        task_disk_flush_gate_sem = NULL;
+    }
 }
 
 int luna_lkl_task_disk_add(void)
 {
     if (!task_disk_io || !task_disk_size || task_disk_id >= 0) return -1;
+    task_disk_queue_free_sem = lkl_host_ops.sem_alloc(
+        LUNA_DISK_LOCAL_QUEUE_COUNT);
+    task_disk_async_completion_sem = lkl_host_ops.sem_alloc(0);
+    task_disk_flush_gate_sem = lkl_host_ops.sem_alloc(1);
     task_disk_worker_sem = lkl_host_ops.sem_alloc(0);
-    if (!task_disk_worker_sem) return -1;
-    task_disk_worker_tid = lkl_host_ops.thread_create(task_disk_worker, NULL);
-    if (!task_disk_worker_tid) {
-        lkl_host_ops.sem_free(task_disk_worker_sem);
-        task_disk_worker_sem = NULL;
-        return -1;
+    if (!task_disk_queue_free_sem || !task_disk_async_completion_sem ||
+        !task_disk_flush_gate_sem || !task_disk_worker_sem)
+        goto fail;
+    for (unsigned i = 0; i < LUNA_DISK_LOCAL_QUEUE_COUNT; i++) {
+        task_disk_batches[i].completion_sem = lkl_host_ops.sem_alloc(0);
+        if (!task_disk_batches[i].completion_sem) goto fail;
     }
+    task_disk_worker_tid = lkl_host_ops.thread_create(task_disk_worker, NULL);
+    if (!task_disk_worker_tid) goto fail;
     task_disk.ops = &lkl_dev_blk_ops;
     task_disk_id = lkl_disk_add(&task_disk);
     if (task_disk_id < 0) {
@@ -423,12 +556,14 @@ int luna_lkl_task_disk_add(void)
         __atomic_store_n(&task_disk_worker_stop, 1, __ATOMIC_RELEASE);
         lkl_host_ops.sem_up(task_disk_worker_sem);
         lkl_host_ops.thread_join(task_disk_worker_tid);
-        lkl_host_ops.sem_free(task_disk_worker_sem);
-        task_disk_worker_sem = NULL;
         task_disk_worker_tid = 0;
-        return -1;
+        goto fail;
     }
     return 0;
+
+fail:
+    task_disk_free_sems();
+    return -1;
 }
 
 static int task_mkdir(const char *path, int mode)
@@ -572,14 +707,22 @@ int luna_lkl_task_disk_cleanup_after_halt(void)
     __atomic_store_n(&task_disk_worker_stop, 1, __ATOMIC_RELEASE);
     lkl_host_ops.sem_up(task_disk_worker_sem);
     if (lkl_host_ops.thread_join(task_disk_worker_tid)) return -1;
-    lkl_host_ops.sem_free(task_disk_worker_sem);
-    task_disk_worker_sem = NULL;
     task_disk_worker_tid = 0;
+    task_disk_free_sems();
     lkl_printf("LUNA_DISK_BATCH_COUNTERS ipc=%llu batches=%llu "
                "requests=%llu copies=%llu backpressure=%llu "
                "queue_high_water=%llu\n",
                task_disk_ipc, task_disk_batches_completed,
                task_disk_requests, task_disk_copies,
                task_disk_backpressure, task_disk_queue_high_water);
+    lkl_printf("LUNA_DISK_WAIT_COUNTERS mechanism=lkl-semaphore "
+               "queue_waits=%llu queue_wait_ns=%llu worker_wait_ns=%llu "
+               "ipc_ns=%llu copy_ns=%llu flush_wait_ns=%llu "
+               "completion_wait_ns=%llu completion_signals=%llu\n",
+               task_disk_queue_waits, task_disk_queue_wait_ns,
+               task_disk_worker_wait_ns, task_disk_ipc_ns,
+               task_disk_copy_ns, task_disk_flush_wait_ns,
+               task_disk_completion_wait_ns,
+               task_disk_completion_signals);
     return 0;
 }

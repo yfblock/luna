@@ -102,11 +102,13 @@ REQUIRED = [
     b"LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci",
     b"LUNA_NETWORK_IPV4_OK address=10.0.2.15/24",
     b"LUNA_NETWORK_ASYNC_RX_OK notification=receive-only",
-    b"LUNA_ROOT_ALLOCATOR_POOL_OK bytes=8388608",
+    b"LUNA_ROOT_ALLOCATOR_POOL_OK bytes=12582912",
     b"LUNA_NETWORK_IRQ_OK line=",
+    b"LUNA_NETWORK_IRQ_BUDGET_OK budget=16",
     b"LUNA_NET_MANAGER_COUNTERS tx_ipc=",
     b"LUNA_NET_BATCH_COUNTERS tx_ipc=",
     b"LUNA_DISK_BATCH_COUNTERS ipc=",
+    b"LUNA_DISK_WAIT_COUNTERS mechanism=lkl-semaphore",
     b"LUNA_DISK_MANAGER_COUNTERS ipc=",
     b"LUNA_CHILD_RESOURCE_HIGH_WATER threads=",
     b"LUNA_NETWORK_ICMP_OK peer=10.0.2.2",
@@ -125,6 +127,7 @@ REQUIRED = [
     b"LUNA_STATIC_USER_OK path=/bin/busybox abi=1",
     b"LUNA_BUSYBOX_HEAP_OK bytes=1048576",
     b"LUNA_BLOCK_BENCHMARK_OK bytes=1048576",
+    b"LUNA_BLOCK_WARMUP_OK normalization=drop-before-sample",
     b"LUNA_PIPELINE_BENCHMARK_OK bytes=1048576",
     b"LUNA_USER_RESOURCE_PEAK_OK heap_bytes=",
     b"LUNA_SPAWN_WAIT_OK pid=",
@@ -398,6 +401,40 @@ def main() -> int:
             errors.append(f"kick-driven poll count unexpectedly high: {kick_polls}")
         if fallback_polls != 0:
             errors.append(f"unexpected continuous polling: {fallback_polls}")
+    irq_budget = re.search(
+        rb"LUNA_NETWORK_IRQ_BUDGET_OK budget=(\d+) irq_packets=(\d+) "
+        rb"coalesced_polls=(\d+) coalesced_packets=(\d+) "
+        rb"budget_exhaustions=(\d+) max_packets_per_irq=(\d+) "
+        rb"packets_per_irq_milli=(\d+)", data
+    )
+    if not irq_budget:
+        errors.append("virtio-net IRQ budget statistics were not reported")
+    else:
+        budget, irq_packets, coalesced_polls, coalesced_packets, \
+            exhaustions, maximum, packets_per_irq = map(
+                int, irq_budget.groups()
+            )
+        if budget != 16 or not 0 < maximum <= budget or irq_packets <= 0 or \
+                coalesced_polls <= 0 or coalesced_packets <= 0 or \
+                exhaustions <= 0 or packets_per_irq <= 0:
+            errors.append("virtio-net IRQ budget statistics are invalid")
+
+    allocator_profiles = re.findall(
+        rb"LUNA_CHILD_ALLOCATOR_PROFILE profile=(full|light) "
+        rb"pages=(\d+) mode=(\d+)", data
+    )
+    full_profiles = [entry for entry in allocator_profiles
+                     if entry[0] == b"full"]
+    light_profiles = [entry for entry in allocator_profiles
+                      if entry[0] == b"light"]
+    if len(full_profiles) != 2 or any(
+        int(pages) != 8192 or int(mode) not in (1, 2)
+        for _, pages, mode in full_profiles
+    ) or len(light_profiles) != 100 or any(
+        not 0 < int(pages) <= 64 or int(mode) != 3
+        for _, pages, mode in light_profiles
+    ):
+        errors.append("allocator full/light profile coverage is invalid")
 
     pipeline_bench = re.search(
         rb"LUNA_PIPELINE_BENCHMARK_OK bytes=(\d+) elapsed_ns=(\d+) "
@@ -412,7 +449,8 @@ def main() -> int:
     pipeline_detail = re.search(
         rb"LUNA_PIPELINE_BENCHMARK_OK .* samples=(\d+) p50_ns=(\d+) "
         rb"p95_ns=(\d+) p99_ns=(\d+) read_calls=(\d+) "
-        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+)", data
+        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+) "
+        rb"pipe_capacity=(\d+)", data
     )
     pipeline_samples = [int(value) for value in re.findall(
         rb"LUNA_PIPELINE_SAMPLE ns=(\d+)", data
@@ -421,11 +459,15 @@ def main() -> int:
         errors.append("pipeline benchmark detail was not reported")
     else:
         values = list(map(int, pipeline_detail.groups()))
-        samples, p50, p95, p99, read_calls, read_bytes, write_calls, write_bytes = values
+        samples, p50, p95, p99, read_calls, read_bytes, write_calls, \
+            write_bytes, pipe_capacity = values
+        average_read = read_bytes // read_calls if read_calls else 0
+        average_write = write_bytes // write_calls if write_calls else 0
         if samples != 7 or len(pipeline_samples) != samples or any(
             value <= 0 for value in (p50, p95, p99, read_calls, read_bytes,
                                      write_calls, write_bytes)
-        ) or not p50 <= p95 <= p99:
+        ) or not p50 <= p95 <= p99 or pipe_capacity < 65536 or \
+                average_read < 16384 or average_write < 16384:
             errors.append("pipeline benchmark detail is invalid")
 
     block_bench = re.search(
@@ -441,6 +483,58 @@ def main() -> int:
             value <= 0 for value in values[1:4] + values[5:]
         ):
             errors.append("block benchmark statistics are invalid")
+    block_samples = [int(value) for value in re.findall(
+        rb"LUNA_BLOCK_SAMPLE index=(\d+) ", data
+    )]
+    if block_samples != list(range(1, 8)):
+        errors.append("block benchmark samples are incomplete")
+    block_detail = re.search(
+        rb"LUNA_BLOCK_BENCHMARK_DETAIL samples=(\d+) "
+        rb"seq_write_p50_ns=(\d+) seq_write_p95_ns=(\d+) "
+        rb"seq_write_p99_ns=(\d+) cold_read_p50_ns=(\d+) "
+        rb"cold_read_p95_ns=(\d+) cold_read_p99_ns=(\d+) "
+        rb"hot_read_p50_ns=(\d+) hot_read_p95_ns=(\d+) "
+        rb"hot_read_p99_ns=(\d+) random_write_p50_ns=(\d+) "
+        rb"random_write_p95_ns=(\d+) random_write_p99_ns=(\d+) "
+        rb"random_read_p50_ns=(\d+) random_read_p95_ns=(\d+) "
+        rb"random_read_p99_ns=(\d+)", data
+    )
+    if not block_detail:
+        errors.append("block benchmark percentiles were not reported")
+    else:
+        detail = list(map(int, block_detail.groups()))
+        if detail[0] != 7 or any(value <= 0 for value in detail[1:]) or any(
+            not detail[offset] <= detail[offset + 1] <= detail[offset + 2]
+            for offset in (1, 4, 7, 10, 13)
+        ):
+            errors.append("block benchmark percentiles are invalid")
+    bimodal = re.search(
+        rb"LUNA_BLOCK_BIMODAL_DIAG warmup=1 "
+        rb"normalization=drop-before-sample "
+        rb"first_seq_ns=(\d+) "
+        rb"steady_seq_p50_ns=(\d+) first_extra_ns=(\d+) .* "
+        rb"dominant=(worker-wait|queue-wait|manager-ipc|copy)", data
+    )
+    if not bimodal or any(int(value) <= 0 for value in bimodal.groups()[:2]):
+        errors.append("block bimodal diagnosis was not reported")
+
+    disk_waits = re.findall(
+        rb"LUNA_DISK_WAIT_COUNTERS mechanism=lkl-semaphore "
+        rb"queue_waits=(\d+) queue_wait_ns=(\d+) worker_wait_ns=(\d+) "
+        rb"ipc_ns=(\d+) copy_ns=(\d+) flush_wait_ns=(\d+) "
+        rb"completion_wait_ns=(\d+) completion_signals=(\d+)", data
+    )
+    if len(disk_waits) != 102:
+        errors.append("block semaphore wait coverage is incomplete")
+    else:
+        clean_waits = list(map(int, disk_waits[-1]))
+        queue_waits, queue_wait_ns, worker_wait_ns, ipc_ns, copy_ns, \
+            flush_wait_ns, completion_wait_ns, signals = clean_waits
+        if worker_wait_ns <= 0 or ipc_ns <= 0 or copy_ns <= 0 or \
+                flush_wait_ns <= 0 or signals <= 0 or \
+                (queue_waits > 0) != (queue_wait_ns > 0) or \
+                completion_wait_ns < 0:
+            errors.append("block semaphore wait statistics are invalid")
 
     rx_throughput = re.search(
         rb"LUNA_NET_RX_THROUGHPUT_OK packets=(\d+) bytes=(\d+) "

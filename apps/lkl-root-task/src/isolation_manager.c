@@ -755,13 +755,31 @@ static int receive_event_variant(struct luna_event_context *context,
                    context->resources->heap.mapped_pages, event);
             return -1;
         }
-        if (event == LUNA_ISOLATION_EVENT_ALLOCATOR_OK &&
-            context->resources->heap.peak_pages !=
-                LUNA_CHILD_HEAP_PAGES) {
-            printf("luna: child heap peak was %zu pages, expected %lu\n",
-                   context->resources->heap.peak_pages,
-                   (unsigned long)LUNA_CHILD_HEAP_PAGES);
-            return -1;
+        if (event == LUNA_ISOLATION_EVENT_ALLOCATOR_OK) {
+            enum luna_allocator_profile profile =
+                luna_allocator_profile_for_mode(
+                    (enum luna_isolation_mode)detail);
+            size_t peak = context->resources->heap.peak_pages;
+            if ((profile == LUNA_ALLOCATOR_PROFILE_FULL &&
+                 peak != LUNA_CHILD_HEAP_PAGES) ||
+                (profile == LUNA_ALLOCATOR_PROFILE_LIGHT &&
+                 (!peak || peak > LUNA_ALLOCATOR_LIGHT_MAX_PAGES))) {
+                printf("luna: child allocator profile=%s peak=%zu invalid "
+                       "limit=%lu\n",
+                       profile == LUNA_ALLOCATOR_PROFILE_FULL ?
+                           "full" : "light",
+                       peak,
+                       (unsigned long)(
+                           profile == LUNA_ALLOCATOR_PROFILE_FULL ?
+                           LUNA_CHILD_HEAP_PAGES :
+                           LUNA_ALLOCATOR_LIGHT_MAX_PAGES));
+                return -1;
+            }
+            printf("LUNA_CHILD_ALLOCATOR_PROFILE profile=%s pages=%zu "
+                   "mode=%lu\n",
+                   profile == LUNA_ALLOCATOR_PROFILE_FULL ?
+                       "full" : "light",
+                   peak, detail);
         }
         if (received_event) *received_event = event;
         return 0;

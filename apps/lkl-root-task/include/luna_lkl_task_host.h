@@ -18,6 +18,17 @@ struct luna_task_sync_resource {
     seL4_CPtr ntfn;
 };
 
+struct luna_disk_timing_snapshot {
+    unsigned long long queue_wait_ns;
+    unsigned long long worker_wait_ns;
+    unsigned long long ipc_ns;
+    unsigned long long copy_ns;
+    unsigned long long flush_wait_ns;
+    unsigned long long completion_wait_ns;
+    unsigned long long ipc_count;
+    unsigned long long batch_count;
+};
+
 int luna_lkl_task_configure_resources(
     const struct luna_task_thread_resource threads[LUNA_RESOURCE_SLOTS],
     const struct luna_task_sync_resource sync[LUNA_SYNC_SLOTS],
@@ -42,7 +53,7 @@ int luna_lkl_task_sync_tls_runtime_ok(void);
 void luna_lkl_task_resource_stats(void);
 int luna_lkl_task_prepare_time(unsigned long long tsc_frequency);
 int luna_lkl_task_thread_timer_test(void);
-int luna_lkl_task_allocator_test(void);
+int luna_lkl_task_allocator_test(enum luna_isolation_mode mode);
 int luna_lkl_task_allocator_idle(void);
 int luna_lkl_task_init(void);
 int luna_lkl_task_disk_add(void);
@@ -55,6 +66,8 @@ int luna_lkl_task_net_finish(void);
 int luna_lkl_task_disk_prepare(enum luna_isolation_mode mode);
 int luna_lkl_task_disk_finish(void);
 int luna_lkl_task_disk_cleanup_after_halt(void);
+void luna_lkl_task_disk_timing_snapshot(
+    struct luna_disk_timing_snapshot *snapshot);
 int luna_lkl_task_user_smoke(void);
 int luna_lkl_task_user_shell(void);
 int luna_lkl_task_start_kernel(unsigned long long tsc_frequency);

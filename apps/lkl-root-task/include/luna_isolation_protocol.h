@@ -13,11 +13,12 @@
 #define LUNA_RESOURCE_STACK_PAGES    64
 #define LUNA_RESOURCE_TLS_VALUE      ((seL4_Word)0x4c4b4c544c53504fULL)
 #define LUNA_SYNC_SLOTS              96
-#define LUNA_ROOT_ALLOCATOR_POOL_SIZE (8UL * 1024UL * 1024UL)
+#define LUNA_ROOT_ALLOCATOR_POOL_SIZE (12UL * 1024UL * 1024UL)
 #define LUNA_RESTART_STRESS_ROUNDS   100
 #define LUNA_CHILD_HEAP_BASE          0x20000000UL
 #define LUNA_CHILD_HEAP_SIZE          (32UL * 1024UL * 1024UL)
 #define LUNA_CHILD_HEAP_PAGES         (LUNA_CHILD_HEAP_SIZE / 4096UL)
+#define LUNA_ALLOCATOR_LIGHT_MAX_PAGES 64UL
 #define LUNA_PERSISTENT_DISK_SIZE      (16UL * 1024UL * 1024UL)
 #define LUNA_PERSISTENT_DISK_PAGE_BITS 21UL
 #define LUNA_PERSISTENT_DISK_PAGES     \
@@ -113,6 +114,18 @@ enum luna_isolation_mode {
     LUNA_ISOLATION_MODE_CLEAN = 2,
     LUNA_ISOLATION_MODE_STRESS = 3,
 };
+
+enum luna_allocator_profile {
+    LUNA_ALLOCATOR_PROFILE_FULL = 1,
+    LUNA_ALLOCATOR_PROFILE_LIGHT = 2,
+};
+
+static inline enum luna_allocator_profile
+luna_allocator_profile_for_mode(enum luna_isolation_mode mode)
+{
+    return mode == LUNA_ISOLATION_MODE_STRESS ?
+           LUNA_ALLOCATOR_PROFILE_LIGHT : LUNA_ALLOCATOR_PROFILE_FULL;
+}
 
 enum luna_isolation_event {
     LUNA_ISOLATION_EVENT_READY = 0x100,

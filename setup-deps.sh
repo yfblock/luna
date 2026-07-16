@@ -7,6 +7,8 @@ DEPS="$ROOT/deps"
 PATCH="$ROOT/patches/lkl-tty.patch"
 BUSYBOX_PATCH="$ROOT/patches/busybox-nofork-cat.patch"
 BUSYBOX_RUNTIME_PATCH="$ROOT/patches/busybox-static-runtime.patch"
+BUSYBOX_PIPELINE_PATCH="$ROOT/patches/busybox-pipeline-batch.patch"
+ETHDRIVERS_PATCH="$ROOT/patches/sel4-ethdrivers-intx-budget.patch"
 SEL4_MANIFEST_URL="https://github.com/seL4/seL4-tutorials-manifest.git"
 SEL4_MANIFEST_REV="cf8e88fbd953fedbf65ddee6eac6ccabb4a36df3"
 LKL_URL="https://github.com/lkl/linux.git"
@@ -72,6 +74,10 @@ check_busybox() {
         echo "BusyBox static runtime patch is not applied cleanly" >&2
         return 1
     }
+    git -C "$DEPS/busybox" apply --unidiff-zero --check --reverse "$BUSYBOX_PIPELINE_PATCH" >/dev/null 2>&1 || {
+        echo "BusyBox pipeline batch patch is not applied cleanly" >&2
+        return 1
+    }
 }
 
 check_sel4() {
@@ -83,6 +89,10 @@ check_sel4() {
         return 1
     }
     (cd "$DEPS" && repo status >/dev/null)
+    git -C "$DEPS/projects/util_libs" apply --unidiff-zero --check --reverse "$ETHDRIVERS_PATCH" >/dev/null 2>&1 || {
+        echo "seL4 ethdrivers INTx budget patch is not applied cleanly" >&2
+        return 1
+    }
 }
 
 check_lkl() {
@@ -113,6 +123,16 @@ mkdir -p "$DEPS"
 
 (cd "$DEPS" && repo init -u "$SEL4_MANIFEST_URL" -b "$SEL4_MANIFEST_REV" -m default.xml)
 (cd "$DEPS" && repo sync -c --no-clone-bundle --no-tags -j"$(nproc)")
+
+if git -C "$DEPS/projects/util_libs" apply --unidiff-zero --check --reverse "$ETHDRIVERS_PATCH" >/dev/null 2>&1; then
+    echo "seL4 ethdrivers INTx budget patch already applied"
+elif git -C "$DEPS/projects/util_libs" apply --unidiff-zero --check "$ETHDRIVERS_PATCH" >/dev/null 2>&1; then
+    git -C "$DEPS/projects/util_libs" apply --unidiff-zero "$ETHDRIVERS_PATCH"
+    echo "applied seL4 ethdrivers INTx budget patch"
+else
+    echo "seL4 ethdrivers INTx budget patch cannot be applied" >&2
+    exit 1
+fi
 
 if [[ ! -d "$DEPS/lkl-linux/.git" ]]; then
     git clone "$LKL_URL" "$DEPS/lkl-linux"
@@ -169,6 +189,16 @@ elif git -C "$DEPS/busybox" apply --check "$BUSYBOX_RUNTIME_PATCH" >/dev/null 2>
     echo "applied BusyBox static runtime patch"
 else
     echo "BusyBox static runtime patch cannot be applied to $BUSYBOX_REV" >&2
+    exit 1
+fi
+
+if git -C "$DEPS/busybox" apply --unidiff-zero --check --reverse "$BUSYBOX_PIPELINE_PATCH" >/dev/null 2>&1; then
+    echo "BusyBox pipeline batch patch already applied"
+elif git -C "$DEPS/busybox" apply --unidiff-zero --check "$BUSYBOX_PIPELINE_PATCH" >/dev/null 2>&1; then
+    git -C "$DEPS/busybox" apply --unidiff-zero "$BUSYBOX_PIPELINE_PATCH"
+    echo "applied BusyBox pipeline batch patch"
+else
+    echo "BusyBox pipeline batch patch cannot be applied to $BUSYBOX_REV" >&2
     exit 1
 fi
 

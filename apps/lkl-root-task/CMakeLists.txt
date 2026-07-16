@@ -41,6 +41,7 @@ add_custom_command(
             "${LUNA_BUSYBOX_CONFIG}" "${LUNA_BUSYBOX_OBJECT}"
     DEPENDS "${LUNA_BUSYBOX_TOOL}" "${LUNA_BUSYBOX_CONFIG}"
             "${BUSYBOX_DIR}/coreutils/cat.c"
+            "${BUSYBOX_DIR}/libbb/copyfd.c"
             "${BUSYBOX_DIR}/coreutils/echo.c"
             "${BUSYBOX_DIR}/coreutils/cp.c"
             "${BUSYBOX_DIR}/coreutils/ls.c"

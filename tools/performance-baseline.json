@@ -1,32 +1,45 @@
 {
-  "description": "Phase 2.7 socket-backend regression floor; update only with a reviewed benchmark result.",
+  "description": "Phase 2.8 socket-backend multi-sample regression floor; update only with a reviewed benchmark result.",
   "network_backend": "socket",
   "reference": {
-    "pipeline.bytes_per_sec": 5151620,
-    "network_rx_throughput.p50_bytes_per_sec": 3565565,
-    "network_tx.bytes_per_sec": 8556420,
-    "block.sequential_write_bytes_per_sec": 40001181,
-    "block.random_write_iops": 13004,
-    "block.random_read_iops": 15733
+    "pipeline.bytes_per_sec": 49227133,
+    "network_rx_throughput.p50_bytes_per_sec": 3559196,
+    "network_tx.bytes_per_sec": 4009374,
+    "block.sequential_write_bytes_per_sec": 113893388,
+    "block.random_write_iops": 2474,
+    "block.random_read_iops": 2567
   },
   "minimums": {
-    "pipeline.bytes_per_sec": 3500000,
+    "pipeline.bytes_per_sec": 25000000,
+    "pipeline.average_read_size": 32768,
+    "pipeline.average_write_size": 32768,
     "network_rx_throughput.p50_bytes_per_sec": 2200000,
     "network_tx.bytes_per_sec": 2500000,
-    "block.sequential_write_bytes_per_sec": 8000000,
-    "block.cold_read_bytes_per_sec": 5000000,
-    "block.hot_read_bytes_per_sec": 12000000,
-    "block.random_write_iops": 1500,
-    "block.random_read_iops": 1500,
+    "block.sequential_write_bytes_per_sec": 80000000,
+    "block.cold_read_bytes_per_sec": 10000000,
+    "block.hot_read_bytes_per_sec": 15000000,
+    "block.random_write_iops": 1800,
+    "block.random_read_iops": 1800,
+    "network_irq.coalesced_polls": 1,
+    "network_irq.coalesced_packets": 1,
+    "network_irq.budget_exhaustions": 1,
+    "data_path_counters.block_child.completion_signals": 1,
     "lifecycle.rounds": 100
   },
   "maximums": {
-    "pipeline.p99_ns": 350000000,
+    "pipeline.p99_ns": 50000000,
     "network_rx_throughput.p99_ns": 30000000,
+    "block.sequential_write_p99_ns": 20000000,
+    "block.cold_read_p99_ns": 80000000,
+    "block.hot_read_p99_ns": 80000000,
+    "block.random_write_p99_ns": 150000000,
+    "block.random_read_p99_ns": 150000000,
     "lifecycle.create_p99_ns": 800000000,
-    "lifecycle.start_p99_ns": 1700000000,
+    "lifecycle.start_p99_ns": 800000000,
     "lifecycle.destroy_p99_ns": 600000000,
-    "resources.busybox_heap_peak_bytes": 1048576
+    "resources.busybox_heap_peak_bytes": 1048576,
+    "resources.child_sync_high_water": 60,
+    "network_irq.max_packets_per_irq": 16
   },
   "equals": {
     "resources.managed_frame_pages": 8225,
@@ -37,6 +50,13 @@
     "resources.network_window_pages": 17,
     "resources.static_worker_peak": 4,
     "resources.child_thread_slots": 47,
-    "resources.child_sync_slots": 96
+    "resources.child_sync_slots": 96,
+    "pipeline.pipe_capacity": 262144,
+    "block.samples": 7,
+    "block.bimodal.warmup_samples": 1,
+    "network_irq.budget": 16,
+    "resources.allocator_full_profiles": 2,
+    "resources.allocator_light_profiles": 100,
+    "resources.allocator_light_peak_pages": 36
   }
 }

@@ -1,0 +1,33 @@
+diff --git a/libbb/copyfd.c b/libbb/copyfd.c
+index 7f9d92ea9..5f9379bd2 100644
+--- a/libbb/copyfd.c
++++ b/libbb/copyfd.c
+@@ -35,4 +34,0 @@ static off_t bb_full_fd_action(int src_fd, int dst_fd, off_t size)
+-#if CONFIG_FEATURE_COPYBUF_KB > 4
+-	char *buffer = buffer; /* for compiler */
+-	int buffer_size = 0;
+-#else
+@@ -41 +36,0 @@ static off_t bb_full_fd_action(int src_fd, int dst_fd, off_t size)
+-#endif
+@@ -72,15 +66,0 @@ static off_t bb_full_fd_action(int src_fd, int dst_fd, off_t size)
+-#if CONFIG_FEATURE_COPYBUF_KB > 4
+-		if (buffer_size == 0) {
+-			if (size > 0 && size <= 4 * 1024)
+-				goto use_small_buf;
+-			/* We want page-aligned buffer, just in case kernel is clever
+-			 * and can do page-aligned io more efficiently */
+-			buffer = mmap_anon(CONFIG_FEATURE_COPYBUF_KB * 1024);
+-			buffer_size = CONFIG_FEATURE_COPYBUF_KB * 1024;
+-			if (buffer == MAP_FAILED) {
+- use_small_buf:
+-				buffer = alloca(4 * 1024);
+-				buffer_size = 4 * 1024;
+-			}
+-		}
+-#endif
+@@ -121,5 +100,0 @@ static off_t bb_full_fd_action(int src_fd, int dst_fd, off_t size)
+-/* some environments don't have munmap(), hide it in #if */
+-#if CONFIG_FEATURE_COPYBUF_KB > 4
+-	if (buffer_size > 4 * 1024)
+-		munmap(buffer, buffer_size);
+-#endif

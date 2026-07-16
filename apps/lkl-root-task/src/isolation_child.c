@@ -182,7 +182,8 @@ int main(int argc, char **argv)
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_RESOURCE_OK,
                child_boot.mode);
-    if (luna_lkl_task_allocator_test())
+    if (luna_lkl_task_allocator_test((enum luna_isolation_mode)
+                                     child_boot.mode))
         for (;;) seL4_Yield();
     send_event(child_boot.control_ep, LUNA_ISOLATION_EVENT_ALLOCATOR_OK,
                child_boot.mode);

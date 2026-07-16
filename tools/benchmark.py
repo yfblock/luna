@@ -105,7 +105,8 @@ def parse(data: bytes) -> dict[str, object]:
         data,
         rb"LUNA_PIPELINE_BENCHMARK_OK .* samples=(\d+) p50_ns=(\d+) "
         rb"p95_ns=(\d+) p99_ns=(\d+) read_calls=(\d+) "
-        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+)",
+        rb"read_bytes=(\d+) write_calls=(\d+) write_bytes=(\d+) "
+        rb"pipe_capacity=(\d+)",
         "pipeline-detail",
     )
     pipeline_samples = [int(value) for value in re.findall(
@@ -141,6 +142,44 @@ def parse(data: bytes) -> dict[str, object]:
         rb"random_write_ns=(\d+) random_read_ns=(\d+)",
         "block",
     )
+    block_detail = marker(
+        data,
+        rb"LUNA_BLOCK_BENCHMARK_DETAIL samples=(\d+) "
+        rb"seq_write_p50_ns=(\d+) seq_write_p95_ns=(\d+) "
+        rb"seq_write_p99_ns=(\d+) cold_read_p50_ns=(\d+) "
+        rb"cold_read_p95_ns=(\d+) cold_read_p99_ns=(\d+) "
+        rb"hot_read_p50_ns=(\d+) hot_read_p95_ns=(\d+) "
+        rb"hot_read_p99_ns=(\d+) random_write_p50_ns=(\d+) "
+        rb"random_write_p95_ns=(\d+) random_write_p99_ns=(\d+) "
+        rb"random_read_p50_ns=(\d+) random_read_p95_ns=(\d+) "
+        rb"random_read_p99_ns=(\d+)",
+        "block-detail",
+    )
+    block_sample_lines = re.findall(rb"LUNA_BLOCK_SAMPLE ([^\r\n]+)", data)
+    block_samples = [
+        {
+            key.decode("ascii"): int(value)
+            for key, value in re.findall(rb"([a-z_]+)=(\d+)", line)
+        }
+        for line in block_sample_lines
+    ]
+    if len(block_samples) != block_detail[0] or [
+        sample.get("index") for sample in block_samples
+    ] != list(range(1, block_detail[0] + 1)):
+        raise ValueError("incomplete block benchmark samples")
+    block_bimodal = re.search(
+        rb"LUNA_BLOCK_BIMODAL_DIAG warmup=1 "
+        rb"normalization=drop-before-sample "
+        rb"first_seq_ns=(\d+) "
+        rb"steady_seq_p50_ns=(\d+) first_extra_ns=(\d+) "
+        rb"first_worker_wait_ns=(\d+) steady_worker_wait_p50_ns=(\d+) "
+        rb"first_queue_wait_ns=(\d+) steady_queue_wait_p50_ns=(\d+) "
+        rb"first_ipc_ns=(\d+) steady_ipc_p50_ns=(\d+) "
+        rb"first_copy_ns=(\d+) steady_copy_p50_ns=(\d+) "
+        rb"dominant=([a-z-]+)", data
+    )
+    if not block_bimodal:
+        raise ValueError("missing benchmark marker: block-bimodal")
     net_counters = marker(
         data,
         rb"LUNA_NET_MANAGER_COUNTERS tx_ipc=(\d+) tx_batches=(\d+) "
@@ -155,6 +194,14 @@ def parse(data: bytes) -> dict[str, object]:
         rb"requests=(\d+) copies=(\d+) backpressure=(\d+) "
         rb"queue_high_water=(\d+)",
         "disk-counters",
+    )
+    disk_waits = marker_last(
+        data,
+        rb"LUNA_DISK_WAIT_COUNTERS mechanism=lkl-semaphore "
+        rb"queue_waits=(\d+) queue_wait_ns=(\d+) worker_wait_ns=(\d+) "
+        rb"ipc_ns=(\d+) copy_ns=(\d+) flush_wait_ns=(\d+) "
+        rb"completion_wait_ns=(\d+) completion_signals=(\d+)",
+        "disk-waits",
     )
     disk_manager = marker(
         data,
@@ -192,6 +239,29 @@ def parse(data: bytes) -> dict[str, object]:
         rb"LUNA_USER_RESOURCE_PEAK_OK heap_bytes=(\d+) workers=(\d+)",
         "user-resources",
     )
+    irq_budget = marker(
+        data,
+        rb"LUNA_NETWORK_IRQ_BUDGET_OK budget=(\d+) irq_packets=(\d+) "
+        rb"coalesced_polls=(\d+) coalesced_packets=(\d+) "
+        rb"budget_exhaustions=(\d+) max_packets_per_irq=(\d+) "
+        rb"packets_per_irq_milli=(\d+)",
+        "network-irq-budget",
+    )
+    allocator_profiles = re.findall(
+        rb"LUNA_CHILD_ALLOCATOR_PROFILE profile=(full|light) "
+        rb"pages=(\d+) mode=(\d+)", data
+    )
+    light_allocator_pages = [
+        int(pages) for profile, pages, mode in allocator_profiles
+        if profile == b"light" and mode == b"3"
+    ]
+    full_allocator_pages = [
+        int(pages) for profile, pages, _ in allocator_profiles
+        if profile == b"full"
+    ]
+    if len(light_allocator_pages) != lifecycle[0] or \
+            len(full_allocator_pages) != 2:
+        raise ValueError("incomplete allocator profile samples")
 
     def rate(units: int, elapsed_ns: int) -> int:
         return units * 1_000_000_000 // elapsed_ns
@@ -218,6 +288,7 @@ def parse(data: bytes) -> dict[str, object]:
                 pipeline_detail[7] // pipeline_detail[6]
                 if pipeline_detail[6] else 0
             ),
+            "pipe_capacity": pipeline_detail[8],
         },
         "network_rx": {
             "packets": rx[0],
@@ -253,6 +324,39 @@ def parse(data: bytes) -> dict[str, object]:
             "random_write_iops": rate(block[4], block[5]),
             "random_read_ns": block[6],
             "random_read_iops": rate(block[4], block[6]),
+            "samples": block_detail[0],
+            "sequential_write_p50_ns": block_detail[1],
+            "sequential_write_p95_ns": block_detail[2],
+            "sequential_write_p99_ns": block_detail[3],
+            "cold_read_p50_ns": block_detail[4],
+            "cold_read_p95_ns": block_detail[5],
+            "cold_read_p99_ns": block_detail[6],
+            "hot_read_p50_ns": block_detail[7],
+            "hot_read_p95_ns": block_detail[8],
+            "hot_read_p99_ns": block_detail[9],
+            "random_write_p50_ns": block_detail[10],
+            "random_write_p95_ns": block_detail[11],
+            "random_write_p99_ns": block_detail[12],
+            "random_read_p50_ns": block_detail[13],
+            "random_read_p95_ns": block_detail[14],
+            "random_read_p99_ns": block_detail[15],
+            "sample_detail": block_samples,
+            "bimodal": {
+                "warmup_samples": 1,
+                "normalization": "drop-before-sample",
+                "first_seq_ns": int(block_bimodal.group(1)),
+                "steady_seq_p50_ns": int(block_bimodal.group(2)),
+                "first_extra_ns": int(block_bimodal.group(3)),
+                "first_worker_wait_ns": int(block_bimodal.group(4)),
+                "steady_worker_wait_p50_ns": int(block_bimodal.group(5)),
+                "first_queue_wait_ns": int(block_bimodal.group(6)),
+                "steady_queue_wait_p50_ns": int(block_bimodal.group(7)),
+                "first_ipc_ns": int(block_bimodal.group(8)),
+                "steady_ipc_p50_ns": int(block_bimodal.group(9)),
+                "first_copy_ns": int(block_bimodal.group(10)),
+                "steady_copy_p50_ns": int(block_bimodal.group(11)),
+                "dominant": block_bimodal.group(12).decode("ascii"),
+            },
         },
         "data_path_counters": {
             "network": {
@@ -273,6 +377,15 @@ def parse(data: bytes) -> dict[str, object]:
                 "copies": disk_counters[3],
                 "backpressure": disk_counters[4],
                 "queue_high_water": disk_counters[5],
+                "wait_mechanism": "lkl-semaphore",
+                "queue_waits": disk_waits[0],
+                "queue_wait_ns": disk_waits[1],
+                "worker_wait_ns": disk_waits[2],
+                "ipc_ns": disk_waits[3],
+                "copy_ns": disk_waits[4],
+                "flush_wait_ns": disk_waits[5],
+                "completion_wait_ns": disk_waits[6],
+                "completion_signals": disk_waits[7],
             },
             "block_manager": {
                 "ipc": disk_manager[0],
@@ -300,6 +413,15 @@ def parse(data: bytes) -> dict[str, object]:
             "destroy_p95_ns": percentile(lifecycle_samples["DESTROY"], 95),
             "destroy_p99_ns": percentile(lifecycle_samples["DESTROY"], 99),
         },
+        "network_irq": {
+            "budget": irq_budget[0],
+            "irq_packets": irq_budget[1],
+            "coalesced_polls": irq_budget[2],
+            "coalesced_packets": irq_budget[3],
+            "budget_exhaustions": irq_budget[4],
+            "max_packets_per_irq": irq_budget[5],
+            "packets_per_irq_milli": irq_budget[6],
+        },
         "resources": {
             "managed_frame_pages": manager[0],
             "child_tcbs": manager[1],
@@ -314,6 +436,9 @@ def parse(data: bytes) -> dict[str, object]:
             "child_sync_high_water": child_pool[2],
             "child_sync_slots": child_pool[3],
             "child_manager_ipc": child_pool[4],
+            "allocator_full_profiles": len(full_allocator_pages),
+            "allocator_light_profiles": len(light_allocator_pages),
+            "allocator_light_peak_pages": max(light_allocator_pages),
         },
     }
 

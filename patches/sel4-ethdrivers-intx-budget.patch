@@ -1,0 +1,95 @@
+diff --git a/libethdrivers/include/ethdrivers/raw.h b/libethdrivers/include/ethdrivers/raw.h
+index 2d2a5a9..c2d3850 100644
+--- a/libethdrivers/include/ethdrivers/raw.h
++++ b/libethdrivers/include/ethdrivers/raw.h
+@@ -47,0 +48,8 @@ typedef void (*ethif_raw_handleIRQ_t)(struct eth_driver *driver, int irq);
++/* Optional split IRQ interface for drivers that can acknowledge an IRQ and
++ * drain completions with a bounded budget. The return value is the number of
++ * completed packets; more is set when another bounded poll is required. */
++typedef void (*ethif_raw_ack_irq_t)(struct eth_driver *driver, int irq);
++typedef unsigned int (*ethif_raw_poll_budget_t)(struct eth_driver *driver,
++                                                unsigned int budget,
++                                                int *more);
++
+@@ -133,0 +142,2 @@ struct raw_iface_funcs {
++    ethif_raw_ack_irq_t raw_ack_irq;
++    ethif_raw_poll_budget_t raw_poll_budget;
+@@ -170 +179,0 @@ struct arm_eth_plat_config {
+-
+diff --git a/libethdrivers/src/virtio_pci.c b/libethdrivers/src/virtio_pci.c
+index e722801..dd2fdec 100644
+--- a/libethdrivers/src/virtio_pci.c
++++ b/libethdrivers/src/virtio_pci.c
+@@ -13,0 +14 @@
++#include <limits.h>
+@@ -240 +241,2 @@ static void print_state(struct eth_driver *eth_driver)
+-static void complete_tx(struct eth_driver *driver)
++static unsigned int complete_tx_budget(struct eth_driver *driver,
++                                       unsigned int budget)
+@@ -243 +245,2 @@ static void complete_tx(struct eth_driver *driver)
+-    while (dev->tuh != dev->tx_ring.used->idx) {
++    unsigned int completed = 0;
++    while (completed < budget && dev->tuh != dev->tx_ring.used->idx) {
+@@ -255,0 +259 @@ static void complete_tx(struct eth_driver *driver)
++        completed++;
+@@ -256,0 +261,6 @@ static void complete_tx(struct eth_driver *driver)
++    return completed;
++}
++
++static void complete_tx(struct eth_driver *driver)
++{
++    (void)complete_tx_budget(driver, UINT_MAX);
+@@ -295 +305,2 @@ static void fill_rx_bufs(struct eth_driver *driver)
+-static void complete_rx(struct eth_driver *driver)
++static unsigned int complete_rx_budget(struct eth_driver *driver,
++                                       unsigned int budget)
+@@ -298 +309,2 @@ static void complete_rx(struct eth_driver *driver)
+-    while (dev->ruh != dev->rx_ring.used->idx) {
++    unsigned int completed = 0;
++    while (completed < budget && dev->ruh != dev->rx_ring.used->idx) {
+@@ -311,0 +324 @@ static void complete_rx(struct eth_driver *driver)
++        completed++;
+@@ -312,0 +326,6 @@ static void complete_rx(struct eth_driver *driver)
++    return completed;
++}
++
++static void complete_rx(struct eth_driver *driver)
++{
++    (void)complete_rx_budget(driver, UINT_MAX);
+@@ -320 +339 @@ static int raw_tx(struct eth_driver *driver, unsigned int num, uintptr_t *phys,
+-        complete_tx(driver);
++        (void)complete_tx_budget(driver, 1);
+@@ -365 +384,2 @@ static void raw_poll(struct eth_driver *driver)
+-static void handle_irq(struct eth_driver *driver, int irq)
++static unsigned int raw_poll_budget(struct eth_driver *driver,
++                                    unsigned int budget, int *more)
+@@ -368 +388,19 @@ static void handle_irq(struct eth_driver *driver, int irq)
+-    /* read and throw away the ISR state. This will perform the ack */
++    unsigned int completed = 0;
++    if (budget) {
++        completed = complete_tx_budget(driver, budget);
++        if (completed < budget)
++            completed += complete_rx_budget(driver, budget - completed);
++    }
++    fill_rx_bufs(driver);
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    if (more)
++        *more = dev->tuh != dev->tx_ring.used->idx ||
++                dev->ruh != dev->rx_ring.used->idx;
++    return completed;
++}
++
++static void ack_irq(struct eth_driver *driver, int irq)
++{
++    virtio_dev_t *dev = (virtio_dev_t *)driver->eth_data;
++    (void)irq;
++    /* Reading ISR clears the legacy level-triggered cause. */
+@@ -369,0 +408,5 @@ static void handle_irq(struct eth_driver *driver, int irq)
++}
++
++static void handle_irq(struct eth_driver *driver, int irq)
++{
++    ack_irq(driver, irq);
+@@ -373,0 +417,2 @@ static struct raw_iface_funcs iface_fns = {
++    .raw_ack_irq = ack_irq,
++    .raw_poll_budget = raw_poll_budget,

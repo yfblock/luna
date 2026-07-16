@@ -1468,7 +1468,36 @@ int luna_lkl_task_sync_tls_runtime_ok(void)
     return 1;
 }
 
-int luna_lkl_task_allocator_test(void)
+static int task_allocator_light_stress(void)
+{
+    static const unsigned pages[] = { 1, 7, 2, 5, 3, 8, 4, 6 };
+    void *blocks[sizeof(pages) / sizeof(pages[0])] = { 0 };
+    const size_t count = sizeof(blocks) / sizeof(blocks[0]);
+
+    for (size_t i = 0; i < count; i++) {
+        blocks[i] = task_page_alloc(pages[i] * TASK_PAGE_SIZE);
+        if (!blocks[i]) return -1;
+        memset(blocks[i], (int)(0x31U + i), pages[i] * TASK_PAGE_SIZE);
+    }
+    for (size_t i = 1; i < count; i += 2) {
+        task_page_free(blocks[i], pages[i] * TASK_PAGE_SIZE);
+        blocks[i] = NULL;
+    }
+
+    void *reuse = task_page_alloc(5 * TASK_PAGE_SIZE);
+    if (!reuse || ((unsigned char *)reuse)[0] != 0 ||
+        ((unsigned char *)reuse)[5 * TASK_PAGE_SIZE - 1] != 0)
+        return -1;
+    task_page_free(reuse, 5 * TASK_PAGE_SIZE);
+
+    for (size_t i = 0; i < count; i++) {
+        if (blocks[i])
+            task_page_free(blocks[i], pages[i] * TASK_PAGE_SIZE);
+    }
+    return task_heap_is_idle() ? 0 : -1;
+}
+
+int luna_lkl_task_allocator_test(enum luna_isolation_mode mode)
 {
     task_heap_init();
 
@@ -1499,14 +1528,22 @@ int luna_lkl_task_allocator_test(void)
                                    LKL_PROT_READ | LKL_PROT_WRITE);
     if (!shared || task_munmap(shared, 2 * TASK_PAGE_SIZE)) return -1;
 
-    /* Touch the whole reserved arena once. Besides testing maximum-capacity
-     * allocation, this materializes per-page vspace metadata so reservation
-     * teardown can verify every page after it has been unmapped. */
-    void *large = task_page_alloc(LUNA_CHILD_HEAP_SIZE);
-    if (!large) return -1;
-    task_page_free(large, LUNA_CHILD_HEAP_SIZE);
-    if (!task_heap_is_idle() || task_heap_peak_bytes < LUNA_CHILD_HEAP_SIZE)
+    if (luna_allocator_profile_for_mode(mode) ==
+        LUNA_ALLOCATOR_PROFILE_FULL) {
+        /* Audit children touch the whole reserved arena. This tests maximum
+         * capacity and materializes every manager-side mapping record so the
+         * teardown audit still covers all 8192 pages. */
+        void *large = task_page_alloc(LUNA_CHILD_HEAP_SIZE);
+        if (!large) return -1;
+        task_page_free(large, LUNA_CHILD_HEAP_SIZE);
+        if (!task_heap_is_idle() ||
+            task_heap_peak_bytes < LUNA_CHILD_HEAP_SIZE)
+            return -1;
+    } else if (task_allocator_light_stress() ||
+               task_heap_peak_bytes >
+                   LUNA_ALLOCATOR_LIGHT_MAX_PAGES * TASK_PAGE_SIZE) {
         return -1;
+    }
 
     task_heap_init();
     return 0;

@@ -10,6 +10,7 @@
 #include <lkl.h>
 #include <lkl_host.h>
 #include <lkl/asm/syscalls.h>
+#include <lkl/linux/fcntl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,12 +43,17 @@
 #define LUNA_STATIC_ARG_BYTES 1024
 #define LUNA_PIPELINE_BENCH_BYTES (1024UL * 1024UL)
 #define LUNA_PIPELINE_BENCH_SAMPLES 7U
+#define LUNA_PIPELINE_PIPE_SIZE (256UL * 1024UL)
 #define LUNA_BLOCK_BENCH_BYTES (1024UL * 1024UL)
 #define LUNA_BLOCK_BENCH_BLOCK 4096UL
+#define LUNA_BLOCK_SEQ_CHUNK (64UL * 1024UL)
+#define LUNA_BLOCK_BENCH_SAMPLES 7U
 #define LUNA_STDIO_IO_CHUNK (64UL * 1024UL)
 #define LUNA_STDIO_GETC_BUFFER (16UL * 1024UL)
 #define LUNA_BLOCK_BENCH_OPS \
     (LUNA_BLOCK_BENCH_BYTES / LUNA_BLOCK_BENCH_BLOCK)
+#define LUNA_BLOCK_SEQ_OPS \
+    (LUNA_BLOCK_BENCH_BYTES / LUNA_BLOCK_SEQ_CHUNK)
 
 extern int lbb_main(char **argv);
 void *luna_bb_malloc(size_t size);
@@ -101,6 +108,7 @@ static volatile unsigned long long task_stdio_read_calls;
 static volatile unsigned long long task_stdio_read_bytes;
 static volatile unsigned long long task_stdio_write_calls;
 static volatile unsigned long long task_stdio_write_bytes;
+static volatile unsigned long long task_pipeline_pipe_capacity;
 
 static void task_stdio_record(volatile unsigned long long *calls,
                               volatile unsigned long long *bytes,
@@ -1787,6 +1795,20 @@ int luna_bb_run_pipeline(int count, char ***commands)
             task_user_errno = (int)-result;
             goto fail_pipes;
         }
+        long capacity = lkl_sys_fcntl((unsigned int)pipes[i][1],
+                                      LKL_F_SETPIPE_SZ,
+                                      LUNA_PIPELINE_PIPE_SIZE);
+        if (capacity < (long)LUNA_STDIO_IO_CHUNK) {
+            task_user_errno = capacity < 0 ? (int)-capacity : ENOSPC;
+            goto fail_pipes;
+        }
+        unsigned long long current = __atomic_load_n(
+            &task_pipeline_pipe_capacity, __ATOMIC_RELAXED);
+        while ((!current || (unsigned long long)capacity < current) &&
+               !__atomic_compare_exchange_n(
+                   &task_pipeline_pipe_capacity, &current,
+                   (unsigned long long)capacity, false,
+                   __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
     }
     struct task_static_worker *workers[LUNA_STATIC_WORKERS] = { 0 };
     for (int i = 0; i < count; i++) {
@@ -1937,81 +1959,298 @@ static int task_block_drop_cache(int fd)
     return result < 0 ? -1 : 0;
 }
 
+static void task_sample_percentiles(const unsigned long long *samples,
+                                    unsigned count,
+                                    unsigned long long *p50,
+                                    unsigned long long *p95,
+                                    unsigned long long *p99)
+{
+    unsigned long long ordered[LUNA_BLOCK_BENCH_SAMPLES];
+    if (count > LUNA_BLOCK_BENCH_SAMPLES) count = LUNA_BLOCK_BENCH_SAMPLES;
+    memcpy(ordered, samples, count * sizeof(*samples));
+    for (unsigned i = 1; i < count; i++) {
+        unsigned long long value = ordered[i];
+        unsigned j = i;
+        while (j && ordered[j - 1] > value) {
+            ordered[j] = ordered[j - 1];
+            j--;
+        }
+        ordered[j] = value;
+    }
+    *p50 = ordered[(count - 1U) / 2U];
+    *p95 = ordered[count - 1U];
+    *p99 = ordered[count - 1U];
+}
+
+struct task_block_sample {
+    unsigned long long sequential_write;
+    unsigned long long cold_read;
+    unsigned long long hot_read;
+    unsigned long long random_write;
+    unsigned long long random_read;
+    unsigned long long queue_wait;
+    unsigned long long worker_wait;
+    unsigned long long ipc;
+    unsigned long long copy;
+};
+
 static int task_block_benchmark(void)
 {
     static const char path[] = "/luna-block-benchmark";
-    char buffer[LUNA_BLOCK_BENCH_BLOCK];
+    /* The BusyBox arena is reset immediately after this benchmark. Reuse its
+     * first 64 KiB instead of growing the child ELF/BSS and manager mapping
+     * metadata with a second permanent buffer. */
+    char *buffer = (char *)task_user_heap;
+    struct task_block_sample samples[LUNA_BLOCK_BENCH_SAMPLES];
+    memset(samples, 0, sizeof(samples));
     long fd = lkl_sys_open(path, LKL_O_RDWR | LKL_O_CREAT | LKL_O_TRUNC,
                            0644);
     if (fd < 0) return -1;
 
-    unsigned long long start = luna_lkl_task_time();
-    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
-        memset(buffer, (unsigned char)block, sizeof(buffer));
-        if (lkl_sys_write((unsigned int)fd, buffer, sizeof(buffer)) !=
-            (long)sizeof(buffer)) goto fail;
+    /* Materialize the complete extent before sampling. Every sample then
+     * starts after the same cache drop, instead of allowing the first sample
+     * to inherit a warm file while later samples inherit the previous cold
+     * read's global drop_caches state. */
+    for (unsigned block = 0; block < LUNA_BLOCK_SEQ_OPS; block++) {
+        memset(buffer, (unsigned char)block, LUNA_BLOCK_SEQ_CHUNK);
+        if (lkl_sys_write((unsigned int)fd, buffer,
+                          LUNA_BLOCK_SEQ_CHUNK) !=
+            (long)LUNA_BLOCK_SEQ_CHUNK) goto fail;
     }
     if (lkl_sys_fsync((unsigned int)fd)) goto fail;
-    unsigned long long sequential_write = luna_lkl_task_time() - start;
 
-    if (lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
-    start = luna_lkl_task_time();
-    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
-        if (lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
-            (long)sizeof(buffer)) goto fail;
-        for (size_t i = 0; i < sizeof(buffer); i++)
-            if ((unsigned char)buffer[i] != (unsigned char)block) goto fail;
-    }
-    unsigned long long hot_read = luna_lkl_task_time() - start;
+    for (unsigned iteration = 0;
+         iteration <= LUNA_BLOCK_BENCH_SAMPLES; iteration++) {
+        unsigned sample = iteration ? iteration - 1U : 0U;
+        int measured = iteration != 0;
+        unsigned long long setup_start = luna_lkl_task_time();
+        if (task_block_drop_cache((int)fd)) goto fail;
+        unsigned long long setup_drop = luna_lkl_task_time() - setup_start;
+        struct luna_disk_timing_snapshot before, after;
+        luna_lkl_task_disk_timing_snapshot(&before);
+        if (lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
+        unsigned long long start = luna_lkl_task_time();
+        for (unsigned block = 0; block < LUNA_BLOCK_SEQ_OPS; block++) {
+            unsigned char pattern =
+                (unsigned char)(block ^ (iteration * 29U));
+            memset(buffer, pattern, LUNA_BLOCK_SEQ_CHUNK);
+            if (lkl_sys_write((unsigned int)fd, buffer,
+                              LUNA_BLOCK_SEQ_CHUNK) !=
+                (long)LUNA_BLOCK_SEQ_CHUNK) goto fail;
+        }
+        unsigned long long seq_data = luna_lkl_task_time() - start;
+        start = luna_lkl_task_time();
+        if (lkl_sys_fsync((unsigned int)fd)) goto fail;
+        unsigned long long seq_fsync = luna_lkl_task_time() - start;
+        samples[sample].sequential_write = seq_data + seq_fsync;
 
-    start = luna_lkl_task_time();
-    for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
-         operation++) {
-        unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
-        memset(buffer, (unsigned char)(block ^ 0xa5U), sizeof(buffer));
-        if (lkl_sys_lseek((unsigned int)fd,
-                          (long long)block * LUNA_BLOCK_BENCH_BLOCK,
-                          LKL_SEEK_SET) < 0 ||
-            lkl_sys_write((unsigned int)fd, buffer, sizeof(buffer)) !=
-                (long)sizeof(buffer)) goto fail;
-    }
-    if (lkl_sys_fsync((unsigned int)fd)) goto fail;
-    unsigned long long random_write = luna_lkl_task_time() - start;
+        if (lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
+        start = luna_lkl_task_time();
+        for (unsigned block = 0; block < LUNA_BLOCK_SEQ_OPS; block++) {
+            unsigned char pattern =
+                (unsigned char)(block ^ (iteration * 29U));
+            if (lkl_sys_read((unsigned int)fd, buffer,
+                             LUNA_BLOCK_SEQ_CHUNK) !=
+                (long)LUNA_BLOCK_SEQ_CHUNK) goto fail;
+            for (size_t i = 0; i < LUNA_BLOCK_SEQ_CHUNK; i++)
+                if ((unsigned char)buffer[i] != pattern) goto fail;
+        }
+        samples[sample].hot_read = luna_lkl_task_time() - start;
 
-    start = luna_lkl_task_time();
-    for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
-         operation++) {
-        unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
-        if (lkl_sys_lseek((unsigned int)fd,
-                          (long long)block * LUNA_BLOCK_BENCH_BLOCK,
-                          LKL_SEEK_SET) < 0 ||
-            lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
-                (long)sizeof(buffer)) goto fail;
-        for (size_t i = 0; i < sizeof(buffer); i++)
-            if ((unsigned char)buffer[i] !=
-                (unsigned char)(block ^ 0xa5U)) goto fail;
-    }
-    unsigned long long random_read = luna_lkl_task_time() - start;
+        start = luna_lkl_task_time();
+        for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
+             operation++) {
+            unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
+            unsigned char pattern =
+                (unsigned char)(block ^ 0xa5U ^ (iteration * 17U));
+            memset(buffer, pattern, LUNA_BLOCK_BENCH_BLOCK);
+            if (lkl_sys_lseek((unsigned int)fd,
+                              (long long)block * LUNA_BLOCK_BENCH_BLOCK,
+                              LKL_SEEK_SET) < 0 ||
+                lkl_sys_write((unsigned int)fd, buffer,
+                              LUNA_BLOCK_BENCH_BLOCK) !=
+                    (long)LUNA_BLOCK_BENCH_BLOCK) goto fail;
+        }
+        unsigned long long random_data = luna_lkl_task_time() - start;
+        start = luna_lkl_task_time();
+        if (lkl_sys_fsync((unsigned int)fd)) goto fail;
+        unsigned long long random_fsync = luna_lkl_task_time() - start;
+        samples[sample].random_write = random_data + random_fsync;
 
-    if (task_block_drop_cache((int)fd) ||
-        lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
-    start = luna_lkl_task_time();
-    for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
-        if (lkl_sys_read((unsigned int)fd, buffer, sizeof(buffer)) !=
-            (long)sizeof(buffer)) goto fail;
-        for (size_t i = 0; i < sizeof(buffer); i++)
-            if ((unsigned char)buffer[i] !=
-                (unsigned char)(block ^ 0xa5U)) goto fail;
+        start = luna_lkl_task_time();
+        for (unsigned operation = 0; operation < LUNA_BLOCK_BENCH_OPS;
+             operation++) {
+            unsigned block = (operation * 73U) % LUNA_BLOCK_BENCH_OPS;
+            unsigned char pattern =
+                (unsigned char)(block ^ 0xa5U ^ (iteration * 17U));
+            if (lkl_sys_lseek((unsigned int)fd,
+                              (long long)block * LUNA_BLOCK_BENCH_BLOCK,
+                              LKL_SEEK_SET) < 0 ||
+                lkl_sys_read((unsigned int)fd, buffer,
+                             LUNA_BLOCK_BENCH_BLOCK) !=
+                    (long)LUNA_BLOCK_BENCH_BLOCK) goto fail;
+            for (size_t i = 0; i < LUNA_BLOCK_BENCH_BLOCK; i++)
+                if ((unsigned char)buffer[i] != pattern) goto fail;
+        }
+        samples[sample].random_read = luna_lkl_task_time() - start;
+
+        start = luna_lkl_task_time();
+        if (task_block_drop_cache((int)fd) ||
+            lkl_sys_lseek((unsigned int)fd, 0, LKL_SEEK_SET) < 0) goto fail;
+        unsigned long long cache_drop = luna_lkl_task_time() - start;
+        start = luna_lkl_task_time();
+        for (unsigned block = 0; block < LUNA_BLOCK_BENCH_OPS; block++) {
+            unsigned char pattern =
+                (unsigned char)(block ^ 0xa5U ^ (iteration * 17U));
+            if (lkl_sys_read((unsigned int)fd, buffer,
+                             LUNA_BLOCK_BENCH_BLOCK) !=
+                (long)LUNA_BLOCK_BENCH_BLOCK) goto fail;
+            for (size_t i = 0; i < LUNA_BLOCK_BENCH_BLOCK; i++)
+                if ((unsigned char)buffer[i] != pattern) goto fail;
+        }
+        samples[sample].cold_read = luna_lkl_task_time() - start;
+        luna_lkl_task_disk_timing_snapshot(&after);
+        samples[sample].queue_wait =
+            after.queue_wait_ns - before.queue_wait_ns;
+        samples[sample].worker_wait =
+            after.worker_wait_ns - before.worker_wait_ns;
+        samples[sample].ipc = after.ipc_ns - before.ipc_ns;
+        samples[sample].copy = after.copy_ns - before.copy_ns;
+        if (!measured) {
+            lkl_printf("LUNA_BLOCK_WARMUP_OK normalization=drop-before-sample "
+                       "seq_write_ns=%llu random_write_ns=%llu "
+                       "worker_wait_ns=%llu\n",
+                       samples[sample].sequential_write,
+                       samples[sample].random_write,
+                       samples[sample].worker_wait);
+            continue;
+        }
+        lkl_printf("LUNA_BLOCK_SAMPLE index=%u setup_drop_ns=%llu "
+                   "seq_data_ns=%llu "
+                   "seq_fsync_ns=%llu seq_write_ns=%llu hot_read_ns=%llu "
+                   "random_data_ns=%llu random_fsync_ns=%llu "
+                   "random_write_ns=%llu random_read_ns=%llu "
+                   "cache_drop_ns=%llu cold_read_ns=%llu "
+                   "queue_wait_ns=%llu worker_wait_ns=%llu ipc_ns=%llu "
+                   "copy_ns=%llu flush_wait_ns=%llu "
+                   "completion_wait_ns=%llu ipc=%llu batches=%llu\n",
+                   sample + 1U, setup_drop, seq_data, seq_fsync,
+                   samples[sample].sequential_write,
+                   samples[sample].hot_read, random_data, random_fsync,
+                   samples[sample].random_write,
+                   samples[sample].random_read, cache_drop,
+                   samples[sample].cold_read,
+                   samples[sample].queue_wait,
+                   samples[sample].worker_wait,
+                   samples[sample].ipc, samples[sample].copy,
+                   after.flush_wait_ns - before.flush_wait_ns,
+                   after.completion_wait_ns - before.completion_wait_ns,
+                   after.ipc_count - before.ipc_count,
+                   after.batch_count - before.batch_count);
     }
-    unsigned long long cold_read = luna_lkl_task_time() - start;
-    if (lkl_sys_close((unsigned int)fd) || !sequential_write ||
-        !cold_read || !hot_read || !random_write || !random_read) return -1;
+    if (lkl_sys_close((unsigned int)fd)) return -1;
+
+    unsigned long long values[LUNA_BLOCK_BENCH_SAMPLES];
+    unsigned long long seq_p50, seq_p95, seq_p99;
+    unsigned long long cold_p50, cold_p95, cold_p99;
+    unsigned long long hot_p50, hot_p95, hot_p99;
+    unsigned long long random_write_p50, random_write_p95, random_write_p99;
+    unsigned long long random_read_p50, random_read_p95, random_read_p99;
+#define BLOCK_PERCENTILES(field, p50, p95, p99) do { \
+        for (unsigned i = 0; i < LUNA_BLOCK_BENCH_SAMPLES; i++) \
+            values[i] = samples[i].field; \
+        task_sample_percentiles(values, LUNA_BLOCK_BENCH_SAMPLES, \
+                                &(p50), &(p95), &(p99)); \
+    } while (0)
+    BLOCK_PERCENTILES(sequential_write, seq_p50, seq_p95, seq_p99);
+    BLOCK_PERCENTILES(cold_read, cold_p50, cold_p95, cold_p99);
+    BLOCK_PERCENTILES(hot_read, hot_p50, hot_p95, hot_p99);
+    BLOCK_PERCENTILES(random_write, random_write_p50, random_write_p95,
+                      random_write_p99);
+    BLOCK_PERCENTILES(random_read, random_read_p50, random_read_p95,
+                      random_read_p99);
+#undef BLOCK_PERCENTILES
     lkl_printf("LUNA_BLOCK_BENCHMARK_OK bytes=%lu seq_write_ns=%llu "
                "cold_read_ns=%llu hot_read_ns=%llu random_ops=%lu "
-               "random_write_ns=%llu random_read_ns=%llu\n",
-               (unsigned long)LUNA_BLOCK_BENCH_BYTES, sequential_write,
-               cold_read, hot_read, (unsigned long)LUNA_BLOCK_BENCH_OPS,
-               random_write, random_read);
+               "random_write_ns=%llu random_read_ns=%llu samples=%u\n",
+               (unsigned long)LUNA_BLOCK_BENCH_BYTES, seq_p50,
+               cold_p50, hot_p50, (unsigned long)LUNA_BLOCK_BENCH_OPS,
+               random_write_p50, random_read_p50,
+               LUNA_BLOCK_BENCH_SAMPLES);
+    lkl_printf("LUNA_BLOCK_BENCHMARK_DETAIL samples=%u "
+               "seq_write_p50_ns=%llu seq_write_p95_ns=%llu "
+               "seq_write_p99_ns=%llu cold_read_p50_ns=%llu "
+               "cold_read_p95_ns=%llu cold_read_p99_ns=%llu "
+               "hot_read_p50_ns=%llu hot_read_p95_ns=%llu "
+               "hot_read_p99_ns=%llu random_write_p50_ns=%llu "
+               "random_write_p95_ns=%llu random_write_p99_ns=%llu "
+               "random_read_p50_ns=%llu random_read_p95_ns=%llu "
+               "random_read_p99_ns=%llu\n",
+               LUNA_BLOCK_BENCH_SAMPLES, seq_p50, seq_p95, seq_p99,
+               cold_p50, cold_p95, cold_p99, hot_p50, hot_p95, hot_p99,
+               random_write_p50, random_write_p95, random_write_p99,
+               random_read_p50, random_read_p95, random_read_p99);
+    unsigned long long steady_seq[LUNA_BLOCK_BENCH_SAMPLES - 1U];
+    unsigned long long steady_worker[LUNA_BLOCK_BENCH_SAMPLES - 1U];
+    unsigned long long steady_queue[LUNA_BLOCK_BENCH_SAMPLES - 1U];
+    unsigned long long steady_ipc[LUNA_BLOCK_BENCH_SAMPLES - 1U];
+    unsigned long long steady_copy[LUNA_BLOCK_BENCH_SAMPLES - 1U];
+    for (unsigned i = 1; i < LUNA_BLOCK_BENCH_SAMPLES; i++) {
+        steady_seq[i - 1U] = samples[i].sequential_write;
+        steady_worker[i - 1U] = samples[i].worker_wait;
+        steady_queue[i - 1U] = samples[i].queue_wait;
+        steady_ipc[i - 1U] = samples[i].ipc;
+        steady_copy[i - 1U] = samples[i].copy;
+    }
+    unsigned long long steady_seq_p50, ignored95, ignored99;
+    unsigned long long steady_worker_p50, steady_queue_p50;
+    unsigned long long steady_ipc_p50, steady_copy_p50;
+    task_sample_percentiles(steady_seq, LUNA_BLOCK_BENCH_SAMPLES - 1U,
+                            &steady_seq_p50, &ignored95, &ignored99);
+    task_sample_percentiles(steady_worker, LUNA_BLOCK_BENCH_SAMPLES - 1U,
+                            &steady_worker_p50, &ignored95, &ignored99);
+    task_sample_percentiles(steady_queue, LUNA_BLOCK_BENCH_SAMPLES - 1U,
+                            &steady_queue_p50, &ignored95, &ignored99);
+    task_sample_percentiles(steady_ipc, LUNA_BLOCK_BENCH_SAMPLES - 1U,
+                            &steady_ipc_p50, &ignored95, &ignored99);
+    task_sample_percentiles(steady_copy, LUNA_BLOCK_BENCH_SAMPLES - 1U,
+                            &steady_copy_p50, &ignored95, &ignored99);
+#define POSITIVE_DELTA(first, steady) ((first) > (steady) ? \
+                                       (first) - (steady) : 0ULL)
+    unsigned long long worker_extra = POSITIVE_DELTA(
+        samples[0].worker_wait, steady_worker_p50);
+    unsigned long long queue_extra = POSITIVE_DELTA(
+        samples[0].queue_wait, steady_queue_p50);
+    unsigned long long ipc_extra = POSITIVE_DELTA(
+        samples[0].ipc, steady_ipc_p50);
+    unsigned long long copy_extra = POSITIVE_DELTA(
+        samples[0].copy, steady_copy_p50);
+    const char *dominant = "worker-wait";
+    unsigned long long dominant_extra = worker_extra;
+    if (queue_extra > dominant_extra) {
+        dominant = "queue-wait";
+        dominant_extra = queue_extra;
+    }
+    if (ipc_extra > dominant_extra) {
+        dominant = "manager-ipc";
+        dominant_extra = ipc_extra;
+    }
+    if (copy_extra > dominant_extra) dominant = "copy";
+    lkl_printf("LUNA_BLOCK_BIMODAL_DIAG warmup=1 "
+               "normalization=drop-before-sample "
+               "first_seq_ns=%llu "
+               "steady_seq_p50_ns=%llu first_extra_ns=%llu "
+               "first_worker_wait_ns=%llu steady_worker_wait_p50_ns=%llu "
+               "first_queue_wait_ns=%llu steady_queue_wait_p50_ns=%llu "
+               "first_ipc_ns=%llu steady_ipc_p50_ns=%llu "
+               "first_copy_ns=%llu steady_copy_p50_ns=%llu dominant=%s\n",
+               samples[0].sequential_write, steady_seq_p50,
+               POSITIVE_DELTA(samples[0].sequential_write, steady_seq_p50),
+               samples[0].worker_wait, steady_worker_p50,
+               samples[0].queue_wait, steady_queue_p50,
+               samples[0].ipc, steady_ipc_p50,
+               samples[0].copy, steady_copy_p50, dominant);
+#undef POSITIVE_DELTA
     return 0;
 
 fail:
@@ -2043,6 +2282,7 @@ static int task_pipeline_benchmark(void)
     task_stdio_read_bytes = 0;
     task_stdio_write_calls = 0;
     task_stdio_write_bytes = 0;
+    task_pipeline_pipe_capacity = 0;
     task_stdio_benchmarking = 1;
     int result = 0;
     for (unsigned sample = 0; sample < LUNA_PIPELINE_BENCH_SAMPLES;
@@ -2099,11 +2339,12 @@ static int task_pipeline_benchmark(void)
     lkl_printf("LUNA_PIPELINE_BENCHMARK_OK bytes=%lu elapsed_ns=%llu "
                "bytes_per_sec=%llu samples=%u p50_ns=%llu p95_ns=%llu "
                "p99_ns=%llu read_calls=%llu read_bytes=%llu "
-               "write_calls=%llu write_bytes=%llu\n",
+               "write_calls=%llu write_bytes=%llu pipe_capacity=%llu\n",
                (unsigned long)LUNA_PIPELINE_BENCH_BYTES, p50,
                bytes_per_second, LUNA_PIPELINE_BENCH_SAMPLES, p50, p95,
                p99, task_stdio_read_calls, task_stdio_read_bytes,
-               task_stdio_write_calls, task_stdio_write_bytes);
+               task_stdio_write_calls, task_stdio_write_bytes,
+               task_pipeline_pipe_capacity);
     return 0;
 }
 

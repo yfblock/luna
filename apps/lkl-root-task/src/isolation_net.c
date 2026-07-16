@@ -39,6 +39,7 @@
 #define LUNA_NET_POLL_STACK_PAGES 8U
 #define LUNA_NET_IRQ_PRIORITY 100U
 #define LUNA_NET_IRQ_STACK_PAGES 8U
+#define LUNA_NET_INTX_BUDGET 16U
 #define PCI_CONFIG_ADDRESS 0x0cf8U
 #define PCI_CONFIG_DATA 0x0cfcU
 #define PCI_COMMAND 0x04U
@@ -103,6 +104,11 @@ struct luna_network_state {
     volatile uint64_t rx_endpoint_packets;
     volatile uint64_t rx_shared_copies;
     volatile uint64_t irq_count;
+    volatile uint64_t irq_packets;
+    volatile uint64_t irq_coalesced_polls;
+    volatile uint64_t irq_coalesced_packets;
+    volatile uint64_t irq_budget_exhaustions;
+    volatile uint64_t irq_max_packets;
     volatile uint64_t irq_kick_polls;
     volatile uint64_t fallback_polls;
     volatile uint64_t irq_errors;
@@ -201,7 +207,9 @@ static uintptr_t allocate_rx_buffer(void *cookie, size_t size,
                                     void **buffer_cookie)
 {
     struct luna_network_state *state = cookie;
-    if (!buffer_cookie || size > LUNA_NET_PACKET_SIZE) return 0;
+    if (!buffer_cookie || size > LUNA_NET_PACKET_SIZE ||
+        !__atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE))
+        return 0;
     for (unsigned i = 0; i < LUNA_NET_RX_DMA_COUNT; i++) {
         struct luna_dma_buffer *buffer = &state->rx_dma[i];
         if (buffer->in_use) continue;
@@ -334,6 +342,26 @@ static void process_tx_queue(struct luna_network_state *state)
     }
 }
 
+static void record_irq_packets(struct luna_network_state *state,
+                               unsigned processed)
+{
+    __atomic_fetch_add(&state->irq_packets, processed, __ATOMIC_RELAXED);
+    uint64_t maximum = __atomic_load_n(&state->irq_max_packets,
+                                        __ATOMIC_RELAXED);
+    while (processed > maximum &&
+           !__atomic_compare_exchange_n(&state->irq_max_packets, &maximum,
+                                        processed, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) { }
+}
+
+static unsigned network_poll_budget(struct luna_network_state *state,
+                                    int *more)
+{
+    return state->driver.i_fn.raw_poll_budget(
+        &state->driver, LUNA_NET_INTX_BUDGET, more);
+}
+
 static void network_irq_callback(void *data,
                                  ps_irq_acknowledge_fn_t acknowledge_fn,
                                  void *ack_data)
@@ -344,12 +372,19 @@ static void network_irq_callback(void *data,
     if (__atomic_load_n(&state->child_active, __ATOMIC_ACQUIRE) &&
         rx_queue_full(state))
         record_rx_backpressure(state);
-    state->driver.i_fn.raw_handleIRQ(&state->driver,
-                                     (int)state->irq_line);
+    state->driver.i_fn.raw_ack_irq(&state->driver, (int)state->irq_line);
+    int more = 0;
+    unsigned processed = network_poll_budget(state, &more);
+    record_irq_packets(state, processed);
     __atomic_fetch_add(&state->irq_count, 1, __ATOMIC_RELAXED);
     process_tx_queue(state);
     __atomic_store_n(&state->irq_in_driver, 0, __ATOMIC_RELEASE);
     unlock_driver(state);
+    if (more) {
+        __atomic_fetch_add(&state->irq_budget_exhaustions, 1,
+                           __ATOMIC_RELAXED);
+        seL4_Signal(state->poll_kick_ntfn.cptr);
+    }
     if (!acknowledge_fn || acknowledge_fn(ack_data)) {
         __atomic_fetch_add(&state->irq_errors, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&state->irq_mode, 0, __ATOMIC_RELEASE);
@@ -392,18 +427,24 @@ static void network_poll_thread(void *arg0, void *arg1, void *ipc_buffer)
                                     __ATOMIC_ACQUIRE) &&
                     rx_queue_full(state))
                     record_rx_backpressure(state);
-                state->driver.i_fn.raw_poll(&state->driver);
+                int more = 0;
+                unsigned processed = network_poll_budget(state, &more);
                 __atomic_fetch_add(&state->irq_kick_polls, 1,
                                    __ATOMIC_RELAXED);
+                if (processed) {
+                    __atomic_fetch_add(&state->irq_coalesced_polls, 1,
+                                       __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&state->irq_coalesced_packets,
+                                       processed, __ATOMIC_RELAXED);
+                }
+                if (more)
+                    __atomic_fetch_add(&state->irq_budget_exhaustions, 1,
+                                       __ATOMIC_RELAXED);
                 process_tx_queue(state);
                 __atomic_store_n(&state->poll_in_driver, 0,
                                  __ATOMIC_RELEASE);
                 unlock_driver(state);
-                if (__atomic_load_n(&state->child_active,
-                                    __ATOMIC_ACQUIRE) ||
-                    (!__atomic_load_n(&state->tx_pending,
-                                      __ATOMIC_ACQUIRE) &&
-                     tx_queue_empty(state)))
+                if (!more)
                     break;
                 seL4_Yield();
             } while (1);
@@ -503,6 +544,8 @@ static int init_network_irq(simple_t *simple, vka_t *vka,
 {
     uint32_t line = 0, pin = 0;
     if (!network.driver.i_fn.raw_handleIRQ ||
+        !network.driver.i_fn.raw_ack_irq ||
+        !network.driver.i_fn.raw_poll_budget ||
         pci_read(PCI_INTERRUPT_LINE, 1, &line) ||
         pci_read(PCI_INTERRUPT_PIN, 1, &pin) ||
         !line || line >= 24U || pin != 1U) {
@@ -746,6 +789,11 @@ int luna_network_map_child(vka_t *vka, vspace_t *manager_vspace,
     __atomic_store_n(&network.rx_shared_copies, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.tx_stress_gate, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_count, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_packets, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_coalesced_polls, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_coalesced_packets, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_budget_exhaustions, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&network.irq_max_packets, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_kick_polls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.fallback_polls, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&network.irq_errors, 0, __ATOMIC_RELEASE);
@@ -798,6 +846,28 @@ int luna_network_verify_irq(void)
                network.irq_line, (unsigned long long)interrupts,
                (unsigned long long)kick_polls,
                (unsigned long long)fallback_polls);
+        uint64_t irq_packets = __atomic_load_n(&network.irq_packets,
+                                               __ATOMIC_ACQUIRE);
+        uint64_t coalesced_polls = __atomic_load_n(
+            &network.irq_coalesced_polls, __ATOMIC_ACQUIRE);
+        uint64_t coalesced_packets = __atomic_load_n(
+            &network.irq_coalesced_packets, __ATOMIC_ACQUIRE);
+        uint64_t exhaustions = __atomic_load_n(
+            &network.irq_budget_exhaustions, __ATOMIC_ACQUIRE);
+        uint64_t maximum = __atomic_load_n(&network.irq_max_packets,
+                                           __ATOMIC_ACQUIRE);
+        if (maximum > LUNA_NET_INTX_BUDGET) return -1;
+        printf("LUNA_NETWORK_IRQ_BUDGET_OK budget=%u irq_packets=%llu "
+               "coalesced_polls=%llu coalesced_packets=%llu "
+               "budget_exhaustions=%llu max_packets_per_irq=%llu "
+               "packets_per_irq_milli=%llu\n",
+               LUNA_NET_INTX_BUDGET,
+               (unsigned long long)irq_packets,
+               (unsigned long long)coalesced_polls,
+               (unsigned long long)coalesced_packets,
+               (unsigned long long)exhaustions,
+               (unsigned long long)maximum,
+               (unsigned long long)(irq_packets * 1000ULL / interrupts));
         printf("LUNA_NET_MANAGER_COUNTERS tx_ipc=%llu tx_batches=%llu "
                "tx_packets=%llu tx_copies=%llu tx_kicks=%llu "
                "rx_ipc=%llu rx_batches=%llu rx_packets=%llu "
