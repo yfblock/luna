@@ -7,6 +7,7 @@
 #include "luna_isolation.h"
 #include "luna_isolation_protocol.h"
 #include "luna_network_manager.h"
+#include "luna_timer_manager.h"
 
 #include <sel4/sel4.h>
 #include <sel4utils/process.h>
@@ -344,6 +345,7 @@ static int destroy_child(sel4utils_process_t *process,
     int result = 0;
     size_t disk_mapped_pages = resources->disk.mapped_pages;
     size_t net_mapped_pages = resources->net.mapped_pages;
+    luna_timer_manager_deactivate();
     luna_network_deactivate_child();
     if (process->thread.tcb.cptr)
         seL4_TCB_Suspend(process->thread.tcb.cptr);
@@ -370,6 +372,10 @@ static int destroy_child(sel4utils_process_t *process,
             vka_free_object(vka, &slot->ntfn);
     }
     if (delete_child_cap(process, resources->console.child_io_port)) result = -1;
+    if (delete_child_cap(process, resources->net.child_rx_ntfn)) result = -1;
+    if (delete_child_cap(process, resources->net.child_tx_ntfn)) result = -1;
+    if (delete_child_cap(process, resources->net.child_tx_submit_ntfn))
+        result = -1;
     if (resources->console.cap_created &&
         vka_cnode_delete(&resources->console.io_port_path))
         result = -1;
@@ -732,10 +738,23 @@ static int receive_event_variant(struct luna_event_context *context,
              event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
              event == LUNA_ISOLATION_EVENT_NET_STATS ||
              event == LUNA_ISOLATION_EVENT_NET_TX_STATS ||
-             event == LUNA_ISOLATION_EVENT_NET_TX_STRESS)) {
+             event == LUNA_ISOLATION_EVENT_NET_TX_STRESS ||
+             event == LUNA_ISOLATION_EVENT_NET_DEBUG)) {
             if (seL4_GetMR(2) ||
                 luna_network_service(context->command_ep, event,
                                      seL4_GetMR(1)))
+                return -1;
+            continue;
+        }
+
+        if (label == 0 && length == 3 && badge == context->badge &&
+            (event == LUNA_ISOLATION_EVENT_TIMER_ARM ||
+             event == LUNA_ISOLATION_EVENT_TIMER_CANCEL)) {
+            seL4_CPtr timer_ntfn = context->resources->slots[
+                LUNA_TIMER_SLOT].join_ntfn.cptr;
+            if (luna_timer_manager_service(
+                    context->command_ep, timer_ntfn, event,
+                    seL4_GetMR(1), seL4_GetMR(2)))
                 return -1;
             continue;
         }
@@ -853,7 +872,9 @@ static void send_net_resource(seL4_CPtr command_ep,
     seL4_SetMR(3, LUNA_NET_MAC_WORD0);
     seL4_SetMR(4, LUNA_NET_MAC_WORD1);
     seL4_SetMR(5, mapping->child_rx_ntfn);
-    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 6));
+    seL4_SetMR(6, mapping->child_tx_ntfn);
+    seL4_SetMR(7, mapping->child_tx_submit_ntfn);
+    seL4_Send(command_ep, seL4_MessageInfo_new(0, 0, 0, 8));
 }
 
 static int start_child(simple_t *simple, vka_t *vka, vspace_t *manager_vspace,
@@ -1112,11 +1133,16 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
     struct luna_event_context event_context = {0};
     int control_allocated = 0;
     int command_allocated = 0;
+    int timer_initialized = 0;
     int child_live = 0;
     int result = -1;
 
     manager_private_page[0] = LUNA_ISOLATION_SECRET;
 
+    if (luna_timer_manager_init(simple, vka, manager_vspace,
+                                tsc_frequency))
+        goto out;
+    timer_initialized = 1;
     if (luna_network_manager_init(simple, vka, manager_vspace)) goto out;
     if (init_persistent_disk(&disk, simple, vka, manager_vspace)) goto out;
 
@@ -1163,7 +1189,7 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
            resources.heap.peak_pages + resources.disk.mapped_pages +
                resources.net.mapped_pages,
            (unsigned long)(LUNA_RESOURCE_SLOTS + 1),
-           (unsigned long)(LUNA_RESOURCE_SLOTS + LUNA_SYNC_SLOTS + 1),
+           (unsigned long)(LUNA_RESOURCE_SLOTS + LUNA_SYNC_SLOTS + 2),
            resources.heap.peak_pages, resources.disk.mapped_pages,
            resources.net.mapped_pages);
     if (wait_child_halt(&event_context, LUNA_ISOLATION_MODE_FAULT))
@@ -1274,12 +1300,15 @@ int luna_isolation_smoke(simple_t *simple, vka_t *vka,
            "requests=%llu copies=%llu queue_high_water=%llu\n",
            disk.ipc_count, disk.batch_count, disk.request_count,
            disk.copy_count, disk.queue_high_water);
+    luna_timer_manager_report();
     result = 0;
 
 out:
     if (child_live) (void)destroy_child(&child, &resources, vka);
     if (command_allocated) vka_free_object(vka, &command_ep);
     if (control_allocated) vka_free_object(vka, &control_ep);
+    if (timer_initialized)
+        luna_timer_manager_destroy(vka, manager_vspace);
     /* The persistent disk is manager-owned state and intentionally remains
      * allocated until this root task's terminal quiescent state. */
     vspace_unmap_pages(manager_vspace, MANAGER_PRIVATE_ADDR, 1,

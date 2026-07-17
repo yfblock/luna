@@ -157,7 +157,7 @@ class Peer:
         if len(payload) != 1200 or payload[:8] != TX_MAGIC:
             return None
         sequence, count = struct.unpack("!II", payload[8:16])
-        if not 1 <= count <= 4096 or sequence >= count:
+        if not 1 <= count <= 65536 or sequence >= count:
             return None
         if payload[16:] != bytes([sequence & 0xFF]) * (len(payload) - 16):
             return None
@@ -193,17 +193,30 @@ class Peer:
             return self.handle_tx_stream(src_port, payload)
         if dst_port != UDP_PORT:
             return None
-        if len(payload) != 12 or payload[:8] != BURST_MAGIC:
+        if len(payload) != 24 or payload[:8] != BURST_MAGIC:
             return None
-        count, payload_size = struct.unpack("!HH", payload[8:12])
-        if not 1 <= count <= 64 or not 4 <= payload_size <= 1400:
+        count, payload_size, generation, missing = struct.unpack(
+            "!HHIQ", payload[8:24]
+        )
+        if not 1 <= count <= 64 or not 8 <= payload_size <= 1400:
             return None
+        valid = (1 << count) - 1
+        if not missing or missing & ~valid:
+            return None
+        if missing != valid:
+            print(
+                f"LUNA_NET_PEER_RX_RETRY generation={generation} "
+                f"missing=0x{missing:x}",
+                flush=True,
+            )
         replies = []
         for sequence in range(count):
-            body = struct.pack("!HH", sequence, count)
+            if not missing & (1 << sequence):
+                continue
+            body = struct.pack("!HHI", sequence, count, generation)
             body += bytes([sequence & 0xFF]) * (payload_size - len(body))
             replies.append(udp_segment(UDP_PORT, src_port, body,
-                                       0x3000 + sequence))
+                                       (generation + sequence) & 0xFFFF))
         return replies
 
     def handle_ipv4(self, packet: bytes) -> bytes | list[bytes] | None:

@@ -123,6 +123,7 @@ add_executable(luna-lkl
     src/main.c
     src/isolation_manager.c
     src/isolation_net.c
+    src/isolation_timer.c
 )
 
 target_include_directories(luna-lkl PRIVATE

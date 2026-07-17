@@ -77,3 +77,19 @@ git diff --check
 socket 稳定性 reference 为：pipeline 约 49.2 MB/s，Block 64KiB 顺序写约 113.9 MB/s，随机写/读约
 2.47k/2.57k IOPS，child start p50 约 0.54 s。随机 IOPS reference 的下降是统计口径修正，不是把
 首次快样本继续当成稳态吞吐。
+
+## Phase 2.9 网络热路径与 one-shot timer
+
+Phase 2.9 的 reviewed socket benchmark（2026-07-17）把网络正式口径扩展到 37.5 MiB TX 和
+3 秒持续 RX。相对 Phase 2.8 reference：2048-packet TX 从约 4.01 MB/s 提升到 6.98 MB/s，pure RX
+p50 从约 3.56 MB/s 提升到 6.92 MB/s；37.5 MiB TX 为 6.79 MB/s，持续 RX 为 5.39 MB/s。
+
+TX 使用 63-token counting semaphore、自适应 50/100/200 μs coalescing 和 16-packet immediate
+submit；正式平均 batch 为 11.188，`hot_yields=0`。timer 从持续 TSC polling 改为 PIT one-shot
+Notification，并把 34,294 次较晚 deadline arm 延后合并，manager/child `polling_loops=0`。pending
+TX response 另有 5 ms bounded recheck 与单次 timeout retry，正常正式运行 `timeout_retries=0`。
+
+这一 timer 架构把 pipeline 稳定在约 27.9 MB/s、Block random write/read 稳定在约
+1.77k/1.83k IOPS。`tools/performance-baseline.json` 已用这次 100-child 正式结果更新 reference，
+继续保留 pipeline 25 MB/s、网络 +30% floor、顺序/冷热 Block、资源等值与尾延迟门槛。完整原因、
+后端与跨 QEMU 证据见 `PHASE2.9-RESULTS.md`。

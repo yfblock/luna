@@ -122,7 +122,9 @@ def parse(data: bytes) -> dict[str, object]:
     rx_throughput = marker(
         data,
         rb"LUNA_NET_RX_THROUGHPUT_OK packets=(\d+) bytes=(\d+) "
-        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+)",
+        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+) "
+        rb"retries=(\d+) recovered_bursts=(\d+) duplicates=(\d+) "
+        rb"stale=(\d+)",
         "network-rx-throughput",
     )
     rx_throughput_samples = [int(value) for value in re.findall(
@@ -134,6 +136,69 @@ def parse(data: bytes) -> dict[str, object]:
         data,
         rb"LUNA_NET_TX_QUEUE_STATS sent=(\d+).*elapsed_ns=(\d+)",
         "network-tx",
+    )
+    rx_sustained = marker(
+        data,
+        rb"LUNA_NET_RX_SUSTAINED_OK duration_target_ns=(\d+) "
+        rb"elapsed_ns=(\d+) packets=(\d+) bytes=(\d+) "
+        rb"bytes_per_sec=(\d+) retries=(\d+) recovered_bursts=(\d+) "
+        rb"duplicates=(\d+) stale=(\d+)",
+        "network-rx-sustained",
+    )
+    tx_sustained = marker(
+        data,
+        rb"LUNA_NET_TX_THROUGHPUT_OK rounds=(\d+) packets=(\d+) "
+        rb"bytes=(\d+) elapsed_ns=(\d+) bytes_per_sec=(\d+) "
+        rb"minimum_bytes=(\d+)",
+        "network-tx-sustained",
+    )
+    tx_waits = marker_last(
+        data,
+        rb"LUNA_NET_TX_NOTIFICATION_STATS mechanism=counting-semaphore "
+        rb"queue_waits=(\d+) queue_wait_ns=(\d+) manager_waits=(\d+) "
+        rb"manager_wait_ns=(\d+) hot_yields=(\d+)",
+        "network-tx-notification",
+    )
+    tx_coalesce = marker_last(
+        data,
+        rb"LUNA_NET_TX_COALESCE_STATS min_ns=(\d+) max_ns=(\d+) "
+        rb"timers=(\d+) average_ns=(\d+) full_batch_bypass=(\d+) "
+        rb"batches=(\d+) packets=(\d+) average_batch_milli=(\d+) "
+        rb"max_batch=(\d+) spurious_wakes=(\d+)",
+        "network-tx-coalescing",
+    )
+    tx_recovery = marker(
+        data,
+        rb"LUNA_NET_TX_RECOVERY_STATS timeout_retries=(\d+)",
+        "network-tx-recovery",
+    )
+    net_cycles = marker_last(
+        data,
+        rb"LUNA_NET_CYCLE_STATS tx_packets=(\d+) tx_cycles=(\d+) "
+        rb"tx_cycles_per_packet=(\d+) worker_cycles=(\d+) "
+        rb"worker_cycles_per_packet=(\d+) rx_packets=(\d+) "
+        rb"rx_cycles=(\d+) rx_cycles_per_packet=(\d+)",
+        "network-cycle-stats",
+    )
+    timer_manager = marker(
+        data,
+        rb"LUNA_TIMER_NOTIFICATION_OK mechanism=pit-one-shot "
+        rb"arms=(\d+) cancels=(\d+) interrupts=(\d+) wakes=(\d+) "
+        rb"hardware_rearms=(\d+) polling_loops=(\d+) "
+        rb"network_arms=(\d+) network_cancels=(\d+) "
+        rb"network_wakes=(\d+)",
+        "timer-manager",
+    )
+    timer_child = marker_last(
+        data,
+        rb"LUNA_TIMER_CHILD_COUNTERS arms=(\d+) cancels=(\d+) "
+        rb"wakes=(\d+) early_wakes=(\d+) polling_loops=(\d+)",
+        "timer-child",
+    )
+    timer_coalesce = marker_last(
+        data,
+        rb"LUNA_TIMER_COALESCE_COUNTERS deferred_arms=(\d+)",
+        "timer-coalesce",
     )
     block = marker(
         data,
@@ -304,12 +369,68 @@ def parse(data: bytes) -> dict[str, object]:
             "p95_ns": rx_throughput[4],
             "p99_ns": rx_throughput[5],
             "p50_bytes_per_sec": rate(rx_throughput[1], rx_throughput[3]),
+            "retries": rx_throughput[6],
+            "recovered_bursts": rx_throughput[7],
+            "duplicates": rx_throughput[8],
+            "stale": rx_throughput[9],
         },
         "network_tx": {
             "packets": tx[0],
             "bytes": tx[0] * 1200,
             "elapsed_ns": tx[1],
             "bytes_per_sec": rate(tx[0] * 1200, tx[1]),
+        },
+        "network_rx_sustained": {
+            "duration_target_ns": rx_sustained[0],
+            "elapsed_ns": rx_sustained[1],
+            "packets": rx_sustained[2],
+            "bytes": rx_sustained[3],
+            "bytes_per_sec": rx_sustained[4],
+            "retries": rx_sustained[5],
+            "recovered_bursts": rx_sustained[6],
+            "duplicates": rx_sustained[7],
+            "stale": rx_sustained[8],
+        },
+        "network_tx_throughput": {
+            "rounds": tx_sustained[0],
+            "packets": tx_sustained[1],
+            "bytes": tx_sustained[2],
+            "elapsed_ns": tx_sustained[3],
+            "bytes_per_sec": tx_sustained[4],
+            "minimum_bytes": tx_sustained[5],
+        },
+        "network_tx_notification": {
+            "mechanism": "counting-semaphore",
+            "queue_waits": tx_waits[0],
+            "queue_wait_ns": tx_waits[1],
+            "manager_waits": tx_waits[2],
+            "manager_wait_ns": tx_waits[3],
+            "hot_yields": tx_waits[4],
+        },
+        "network_tx_coalescing": {
+            "min_ns": tx_coalesce[0],
+            "max_ns": tx_coalesce[1],
+            "timers": tx_coalesce[2],
+            "average_ns": tx_coalesce[3],
+            "full_batch_bypass": tx_coalesce[4],
+            "batches": tx_coalesce[5],
+            "packets": tx_coalesce[6],
+            "average_batch_milli": tx_coalesce[7],
+            "max_batch": tx_coalesce[8],
+            "spurious_wakes": tx_coalesce[9],
+        },
+        "network_tx_recovery": {
+            "timeout_retries": tx_recovery[0],
+        },
+        "network_cycles": {
+            "tx_packets": net_cycles[0],
+            "tx_cycles": net_cycles[1],
+            "tx_cycles_per_packet": net_cycles[2],
+            "worker_cycles": net_cycles[3],
+            "worker_cycles_per_packet": net_cycles[4],
+            "rx_packets": net_cycles[5],
+            "rx_cycles": net_cycles[6],
+            "rx_cycles_per_packet": net_cycles[7],
         },
         "block": {
             "bytes": block[0],
@@ -421,6 +542,23 @@ def parse(data: bytes) -> dict[str, object]:
             "budget_exhaustions": irq_budget[4],
             "max_packets_per_irq": irq_budget[5],
             "packets_per_irq_milli": irq_budget[6],
+        },
+        "timer": {
+            "manager_arms": timer_manager[0],
+            "manager_cancels": timer_manager[1],
+            "interrupts": timer_manager[2],
+            "manager_wakes": timer_manager[3],
+            "hardware_rearms": timer_manager[4],
+            "manager_polling_loops": timer_manager[5],
+            "network_arms": timer_manager[6],
+            "network_cancels": timer_manager[7],
+            "network_wakes": timer_manager[8],
+            "child_arms": timer_child[0],
+            "child_cancels": timer_child[1],
+            "child_wakes": timer_child[2],
+            "child_early_wakes": timer_child[3],
+            "child_polling_loops": timer_child[4],
+            "deferred_arms": timer_coalesce[0],
         },
         "resources": {
             "managed_frame_pages": manager[0],

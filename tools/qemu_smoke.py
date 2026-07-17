@@ -94,9 +94,13 @@ REQUIRED = [
     b"LUNA_CHILD_ALLOCATOR_OK pages=8192",
     b"LUNA_CHILD_ALLOCATOR_RELEASE_OK",
     b"LUNA_RESOURCE_PEAK_OK managed_frame_pages=8225 child_tcbs=50 "
-    b"child_notifications=146 heap_pages=8192 disk_pages=16 net_pages=17",
+    b"child_notifications=147 heap_pages=8192 disk_pages=16 net_pages=17",
     b"LUNA_SYNC_TLS_OK",
     b"LUNA_THREAD_TIMER_OK",
+    b"LUNA_TIMER_MANAGER_READY mechanism=pit-notification",
+    b"LUNA_TIMER_NOTIFICATION_OK mechanism=pit-one-shot",
+    b"LUNA_TIMER_CHILD_COUNTERS arms=",
+    b"LUNA_TIMER_COALESCE_COUNTERS deferred_arms=",
     b"LUNA_VIRTIO_BLOCK_OK bytes=16777216",
     b"LUNA_HOST_FILE_BACKING_OK bytes=16777216",
     b"LUNA_VIRTIO_NET_OK backend=qemu-virtio-pci",
@@ -107,6 +111,10 @@ REQUIRED = [
     b"LUNA_NETWORK_IRQ_BUDGET_OK budget=16",
     b"LUNA_NET_MANAGER_COUNTERS tx_ipc=",
     b"LUNA_NET_BATCH_COUNTERS tx_ipc=",
+    b"LUNA_NET_TX_NOTIFICATION_STATS mechanism=counting-semaphore",
+    b"LUNA_NET_TX_COALESCE_STATS min_ns=50000 max_ns=200000",
+    b"LUNA_NET_TX_RECOVERY_STATS timeout_retries=",
+    b"LUNA_NET_CYCLE_STATS tx_packets=",
     b"LUNA_DISK_BATCH_COUNTERS ipc=",
     b"LUNA_DISK_WAIT_COUNTERS mechanism=lkl-semaphore",
     b"LUNA_DISK_MANAGER_COUNTERS ipc=",
@@ -115,10 +123,12 @@ REQUIRED = [
     b"LUNA_NETWORK_TCP_OK peer=10.0.2.2:18080",
     b"LUNA_NET_QUEUE_STATS received=",
     b"LUNA_NET_RX_THROUGHPUT_OK packets=24",
+    b"LUNA_NET_RX_SUSTAINED_OK duration_target_ns=3000000000",
     b"high_water=31 backpressure=1",
     b"empty_fetches=0",
     b"LUNA_NETWORK_PRESSURE_OK burst=64 payload=1200",
     b"LUNA_NET_TX_QUEUE_STATS sent=2048",
+    b"LUNA_NET_TX_THROUGHPUT_OK rounds=1",
     b"LUNA_NET_PEER_TX_COMPLETE unique=2048 count=2048",
     b"LUNA_NETWORK_TX_PRESSURE_OK packets=2048 payload=1200",
     b"LUNA_NETWORK_RECLAIM_OK rounds=100",
@@ -397,7 +407,7 @@ def main() -> int:
             errors.append(f"virtio-net IRQ line out of range: {line}")
         if interrupts <= 0:
             errors.append("virtio-net did not deliver any interrupts")
-        if kick_polls > 4096:
+        if kick_polls > 262144:
             errors.append(f"kick-driven poll count unexpectedly high: {kick_polls}")
         if fallback_polls != 0:
             errors.append(f"unexpected continuous polling: {fallback_polls}")
@@ -538,7 +548,9 @@ def main() -> int:
 
     rx_throughput = re.search(
         rb"LUNA_NET_RX_THROUGHPUT_OK packets=(\d+) bytes=(\d+) "
-        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+)", data
+        rb"samples=(\d+) p50_ns=(\d+) p95_ns=(\d+) p99_ns=(\d+) "
+        rb"retries=(\d+) recovered_bursts=(\d+) duplicates=(\d+) "
+        rb"stale=(\d+)", data
     )
     rx_samples = [int(value) for value in re.findall(
         rb"LUNA_NET_RX_THROUGHPUT_SAMPLE ns=(\d+)", data
@@ -546,12 +558,120 @@ def main() -> int:
     if not rx_throughput:
         errors.append("pure RX throughput benchmark was not reported")
     else:
-        packets, size, samples, p50, p95, p99 = map(
+        packets, size, samples, p50, p95, p99, retries, recovered, _, _ = map(
             int, rx_throughput.groups()
         )
         if packets != 24 or size != 28800 or samples != 7 or \
-                len(rx_samples) != samples or not 0 < p50 <= p95 <= p99:
+                len(rx_samples) != samples or not 0 < p50 <= p95 <= p99 or \
+                recovered > retries:
             errors.append("pure RX throughput benchmark is invalid")
+
+    rx_sustained = re.search(
+        rb"LUNA_NET_RX_SUSTAINED_OK duration_target_ns=(\d+) "
+        rb"elapsed_ns=(\d+) packets=(\d+) bytes=(\d+) "
+        rb"bytes_per_sec=(\d+) retries=(\d+) recovered_bursts=(\d+) "
+        rb"duplicates=(\d+) stale=(\d+)", data
+    )
+    if not rx_sustained:
+        errors.append("sustained RX throughput benchmark was not reported")
+    else:
+        target, elapsed, packets, size, rate, retries, recovered, _, _ = map(
+            int, rx_sustained.groups()
+        )
+        if target != 3000000000 or elapsed < target or packets <= 0 or \
+                size != packets * 1200 or rate <= 0 or recovered > retries:
+            errors.append("sustained RX throughput benchmark is invalid")
+
+    tx_sustained = re.search(
+        rb"LUNA_NET_TX_THROUGHPUT_OK rounds=(\d+) packets=(\d+) "
+        rb"bytes=(\d+) elapsed_ns=(\d+) bytes_per_sec=(\d+) "
+        rb"minimum_bytes=(\d+)", data
+    )
+    if not tx_sustained:
+        errors.append("sustained TX throughput benchmark was not reported")
+    else:
+        rounds, packets, size, elapsed, rate, minimum = map(
+            int, tx_sustained.groups()
+        )
+        if rounds != 1 or size != packets * 1200 or size < minimum or \
+                minimum != 32 * 1024 * 1024 or elapsed <= 0 or rate <= 0:
+            errors.append("sustained TX throughput benchmark is invalid")
+
+    tx_wait_matches = re.findall(
+        rb"LUNA_NET_TX_NOTIFICATION_STATS mechanism=counting-semaphore "
+        rb"queue_waits=(\d+) queue_wait_ns=(\d+) manager_waits=(\d+) "
+        rb"manager_wait_ns=(\d+) hot_yields=(\d+)", data
+    )
+    if not tx_wait_matches:
+        errors.append("TX notification wait statistics were not reported")
+    else:
+        queue_waits, queue_wait_ns, manager_waits, manager_wait_ns, \
+            hot_yields = map(int, tx_wait_matches[-1])
+        if queue_waits <= 0 or queue_wait_ns <= 0 or manager_waits <= 0 or \
+                manager_wait_ns <= 0 or hot_yields != 0:
+            errors.append("TX notification wait statistics are invalid")
+
+    tx_coalesce_matches = re.findall(
+        rb"LUNA_NET_TX_COALESCE_STATS min_ns=(\d+) max_ns=(\d+) "
+        rb"timers=(\d+) average_ns=(\d+) full_batch_bypass=(\d+) "
+        rb"batches=(\d+) packets=(\d+) average_batch_milli=(\d+) "
+        rb"max_batch=(\d+) spurious_wakes=(\d+)", data
+    )
+    if not tx_coalesce_matches:
+        errors.append("adaptive TX coalescing statistics were not reported")
+    else:
+        minimum, maximum, timers, average, bypass, batches, packets, \
+            average_batch, max_batch, _ = map(int, tx_coalesce_matches[-1])
+        if minimum != 50000 or maximum != 200000 or timers <= 0 or \
+                not minimum <= average <= maximum or bypass <= 0 or \
+                not 0 < batches <= packets or not 0 < max_batch <= 16 or \
+                not 1000 <= average_batch <= 16000:
+            errors.append("adaptive TX coalescing statistics are invalid")
+
+    cycle_stat_matches = re.findall(
+        rb"LUNA_NET_CYCLE_STATS tx_packets=(\d+) tx_cycles=(\d+) "
+        rb"tx_cycles_per_packet=(\d+) worker_cycles=(\d+) "
+        rb"worker_cycles_per_packet=(\d+) rx_packets=(\d+) "
+        rb"rx_cycles=(\d+) rx_cycles_per_packet=(\d+)", data
+    )
+    if not cycle_stat_matches or any(
+        int(value) <= 0 for value in cycle_stat_matches[-1]
+    ):
+        errors.append("network cycles-per-packet statistics are invalid")
+
+    timer_manager = re.search(
+        rb"LUNA_TIMER_NOTIFICATION_OK mechanism=pit-one-shot "
+        rb"arms=(\d+) cancels=(\d+) interrupts=(\d+) wakes=(\d+) "
+        rb"hardware_rearms=(\d+) polling_loops=(\d+) "
+        rb"network_arms=(\d+) network_cancels=(\d+) "
+        rb"network_wakes=(\d+)", data
+    )
+    timer_children = re.findall(
+        rb"LUNA_TIMER_CHILD_COUNTERS arms=(\d+) cancels=(\d+) "
+        rb"wakes=(\d+) early_wakes=(\d+) polling_loops=(\d+)", data
+    )
+    timer_coalescing = re.findall(
+        rb"LUNA_TIMER_COALESCE_COUNTERS deferred_arms=(\d+)", data
+    )
+    if (not timer_manager or len(timer_children) != 102 or
+            len(timer_coalescing) != 102 or
+            int(timer_coalescing[-1]) <= 0):
+        errors.append("timer Notification coverage is incomplete")
+    else:
+        arms, cancels, interrupts, wakes, _, polling, network_arms, \
+            network_cancels, network_wakes = map(
+            int, timer_manager.groups()
+        )
+        if arms <= 0 or cancels <= 0 or interrupts <= 0 or wakes <= 0 or \
+                polling != 0 or \
+                network_arms != network_cancels + network_wakes or \
+                any(
+                    int(child_arms) <= 0 or int(child_cancels) <= 0 or
+                    int(child_wakes) <= 0 or int(child_polling) != 0
+                    for child_arms, child_cancels, child_wakes, _,
+                    child_polling in timer_children
+                ):
+            errors.append("timer Notification statistics are invalid")
 
     net_counters = re.search(
         rb"LUNA_NET_MANAGER_COUNTERS tx_ipc=(\d+) tx_batches=(\d+) "

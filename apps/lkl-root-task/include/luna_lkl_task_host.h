@@ -18,6 +18,8 @@ struct luna_task_sync_resource {
     seL4_CPtr ntfn;
 };
 
+struct lkl_sem;
+
 struct luna_disk_timing_snapshot {
     unsigned long long queue_wait_ns;
     unsigned long long worker_wait_ns;
@@ -38,9 +40,11 @@ int luna_lkl_task_configure_disk(void *io_base, unsigned long io_size,
                                  unsigned long disk_size);
 int luna_lkl_task_configure_net(void *io_base, unsigned long io_size,
                                 seL4_Word mac_word0, seL4_Word mac_word1,
-                                seL4_CPtr rx_ntfn);
+                                seL4_CPtr rx_ntfn, seL4_CPtr tx_ntfn,
+                                seL4_CPtr tx_submit_ntfn);
 void luna_lkl_task_manager_lock(void);
 void luna_lkl_task_manager_unlock(void);
+void luna_lkl_task_sem_signal_once(struct lkl_sem *sem);
 int luna_lkl_task_manager_request(enum luna_isolation_event event,
                                   seL4_Word value1, seL4_Word value2);
 int luna_lkl_task_manager_request_value(enum luna_isolation_event event,

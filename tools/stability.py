@@ -17,6 +17,8 @@ SUMMARY_METRICS = (
     "pipeline.bytes_per_sec",
     "network_rx_throughput.p50_bytes_per_sec",
     "network_tx.bytes_per_sec",
+    "network_rx_sustained.bytes_per_sec",
+    "network_tx_throughput.bytes_per_sec",
     "block.sequential_write_bytes_per_sec",
     "block.cold_read_bytes_per_sec",
     "block.hot_read_bytes_per_sec",

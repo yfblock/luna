@@ -73,13 +73,26 @@ class Service:
 
     def rx_burst(self, sock: socket.socket) -> None:
         payload, address = sock.recvfrom(65535)
-        if len(payload) != 12 or payload[:8] != BURST_MAGIC:
+        if len(payload) != 24 or payload[:8] != BURST_MAGIC:
             return
-        count, payload_size = struct.unpack("!HH", payload[8:12])
-        if not 1 <= count <= 64 or not 4 <= payload_size <= 1400:
+        count, payload_size, generation, missing = struct.unpack(
+            "!HHIQ", payload[8:24]
+        )
+        if not 1 <= count <= 64 or not 8 <= payload_size <= 1400:
             return
+        valid = (1 << count) - 1
+        if not missing or missing & ~valid:
+            return
+        if missing != valid:
+            print(
+                f"LUNA_NET_PEER_RX_RETRY generation={generation} "
+                f"missing=0x{missing:x}",
+                flush=True,
+            )
         for sequence in range(count):
-            body = struct.pack("!HH", sequence, count)
+            if not missing & (1 << sequence):
+                continue
+            body = struct.pack("!HHI", sequence, count, generation)
             body += bytes([sequence & 0xFF]) * (payload_size - len(body))
             sock.sendto(body, address)
 
@@ -88,7 +101,7 @@ class Service:
         if len(payload) != 1200 or payload[:8] != TX_MAGIC:
             return
         sequence, count = struct.unpack("!II", payload[8:16])
-        if not 1 <= count <= 4096 or sequence >= count:
+        if not 1 <= count <= 65536 or sequence >= count:
             return
         if payload[16:] != bytes([sequence & 0xFF]) * (len(payload) - 16):
             return

@@ -16,6 +16,8 @@ struct luna_net_mapping {
     size_t mapped_pages;
     int reserved;
     seL4_CPtr child_rx_ntfn;
+    seL4_CPtr child_tx_ntfn;
+    seL4_CPtr child_tx_submit_ntfn;
 };
 
 int luna_network_manager_init(simple_t *simple, vka_t *vka,

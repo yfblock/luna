@@ -344,6 +344,18 @@ static void task_sem_up(struct lkl_sem *sem)
         seL4_Signal(sem->slot->ntfn);
 }
 
+void luna_lkl_task_sem_signal_once(struct lkl_sem *sem)
+{
+    if (!sem) return;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&sem->count, &expected, 1, false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return;
+    if (__atomic_load_n(&sem->waiters, __ATOMIC_ACQUIRE) > 0)
+        seL4_Signal(sem->slot->ntfn);
+}
+
 static void task_sem_down(struct lkl_sem *sem)
 {
     if (task_sem_try_down(sem)) return;
@@ -558,9 +570,13 @@ int luna_lkl_task_manager_request_value(enum luna_isolation_event event,
                event == LUNA_ISOLATION_EVENT_NET_CONTROL ||
                event == LUNA_ISOLATION_EVENT_NET_STATS ||
                event == LUNA_ISOLATION_EVENT_NET_TX_STATS ||
-               event == LUNA_ISOLATION_EVENT_NET_TX_STRESS) {
+               event == LUNA_ISOLATION_EVENT_NET_TX_STRESS ||
+               event == LUNA_ISOLATION_EVENT_NET_DEBUG) {
         expected = LUNA_COMMAND_NET_RESULT;
         expected_length = 3;
+    } else if (event == LUNA_ISOLATION_EVENT_TIMER_ARM ||
+               event == LUNA_ISOLATION_EVENT_TIMER_CANCEL) {
+        expected = LUNA_COMMAND_TIMER_RESULT;
     } else {
         expected = LUNA_COMMAND_DISK_RESULT;
     }
@@ -772,6 +788,7 @@ static unsigned long long task_time(void)
 }
 
 #define TASK_TIMER_TID 0x7ffffffdUL
+#define TASK_TIMER_DEFER_MIN_NS 5000000UL
 static void (*task_timer_fn)(void);
 static volatile int task_timer_started;
 static char task_timer_handle;
@@ -780,7 +797,13 @@ static volatile int task_timer_callback_running;
 static volatile int task_timer_lock_word;
 static volatile unsigned long long task_timer_generation;
 static volatile unsigned long long task_timer_armed_generation;
+static volatile unsigned long long task_timer_clear_epoch;
 static unsigned long long task_timer_deadline_ns;
+static volatile unsigned long long task_timer_arm_count;
+static volatile unsigned long long task_timer_cancel_count;
+static volatile unsigned long long task_timer_wake_count;
+static volatile unsigned long long task_timer_early_wake_count;
+static volatile unsigned long long task_timer_coalesced_arm_count;
 
 static void task_timer_lock(void)
 {
@@ -797,16 +820,42 @@ static void task_timer_service(void *arg)
 {
     (void)arg;
     for (;;) {
-        unsigned long long generation = __atomic_load_n(
-            &task_timer_armed_generation, __ATOMIC_ACQUIRE);
-        if (generation) {
-            unsigned long long deadline =
-                __atomic_load_n(&task_timer_deadline_ns, __ATOMIC_RELAXED);
-            if (task_time() >= deadline) {
+        seL4_Word badge = 0;
+        seL4_Wait(task_threads[LUNA_TIMER_SLOT].join_ntfn, &badge);
+        __atomic_fetch_add(&task_timer_wake_count, 1ULL,
+                           __ATOMIC_RELAXED);
+        for (;;) {
+            unsigned long long generation = __atomic_load_n(
+                &task_timer_armed_generation, __ATOMIC_ACQUIRE);
+            if (!generation) break;
+            unsigned long long deadline = __atomic_load_n(
+                &task_timer_deadline_ns, __ATOMIC_RELAXED);
+            unsigned long long now = task_time();
+            if (now < deadline) {
+                unsigned long long remaining = deadline - now;
+                luna_lkl_task_manager_lock();
+                int result = luna_lkl_task_manager_request(
+                    LUNA_ISOLATION_EVENT_TIMER_ARM,
+                    (seL4_Word)generation,
+                    (seL4_Word)(remaining ? remaining : 1));
+                luna_lkl_task_manager_unlock();
+                if (result) {
+                    unsigned long long expected = generation;
+                    (void)__atomic_compare_exchange_n(
+                        &task_timer_armed_generation, &expected, 0, false,
+                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                } else {
+                    __atomic_fetch_add(&task_timer_early_wake_count, 1ULL,
+                                       __ATOMIC_RELAXED);
+                }
+                break;
+            } else {
                 unsigned long long expected = generation;
                 if (__atomic_compare_exchange_n(
                         &task_timer_armed_generation, &expected, 0, false,
                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    __atomic_fetch_add(&task_timer_clear_epoch, 1ULL,
+                                       __ATOMIC_RELEASE);
                     __atomic_store_n(&task_timer_callback_running, 1,
                                      __ATOMIC_RELEASE);
                     if (__atomic_load_n(&task_timer_generation,
@@ -818,10 +867,12 @@ static void task_timer_service(void *arg)
                     }
                     __atomic_store_n(&task_timer_callback_running, 0,
                                      __ATOMIC_RELEASE);
+                    break;
+                } else {
+                    continue;
                 }
             }
         }
-        seL4_Yield();
     }
 }
 
@@ -878,11 +929,41 @@ static int task_timer_set_oneshot(void *timer, unsigned long ns)
     }
     unsigned long long generation = __atomic_add_fetch(
         &task_timer_generation, 1, __ATOMIC_ACQ_REL);
+    unsigned long long clear_epoch = __atomic_load_n(
+        &task_timer_clear_epoch, __ATOMIC_ACQUIRE);
+    unsigned long long old_generation = __atomic_load_n(
+        &task_timer_armed_generation, __ATOMIC_ACQUIRE);
+    unsigned long long old_deadline = __atomic_load_n(
+        &task_timer_deadline_ns, __ATOMIC_RELAXED);
+    unsigned long long deadline = task_time() + (ns ? ns : 1);
     __atomic_store_n(&task_timer_deadline_ns,
-                     task_time() + (ns ? ns : 1), __ATOMIC_RELAXED);
+                     deadline, __ATOMIC_RELAXED);
     __atomic_store_n(&task_timer_armed_generation, generation,
                      __ATOMIC_RELEASE);
+    int defer = ns >= TASK_TIMER_DEFER_MIN_NS && old_generation &&
+                old_deadline <= deadline &&
+                __atomic_load_n(&task_timer_clear_epoch,
+                                __ATOMIC_ACQUIRE) == clear_epoch;
     task_timer_unlock();
+    if (defer) {
+        __atomic_fetch_add(&task_timer_coalesced_arm_count, 1ULL,
+                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&task_timer_arm_count, 1ULL, __ATOMIC_RELAXED);
+        return 0;
+    }
+    luna_lkl_task_manager_lock();
+    int result = luna_lkl_task_manager_request(
+        LUNA_ISOLATION_EVENT_TIMER_ARM, (seL4_Word)generation,
+        (seL4_Word)(ns ? ns : 1));
+    luna_lkl_task_manager_unlock();
+    if (result) {
+        unsigned long long expected = generation;
+        (void)__atomic_compare_exchange_n(
+            &task_timer_armed_generation, &expected, 0, false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        return -1;
+    }
+    __atomic_fetch_add(&task_timer_arm_count, 1ULL, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -894,10 +975,18 @@ static void task_timer_free(void *timer)
         return;
     }
     __atomic_store_n(&task_timer_allocated, 0, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&task_timer_generation, 1, __ATOMIC_ACQ_REL);
+    unsigned long long generation = __atomic_add_fetch(
+        &task_timer_generation, 1, __ATOMIC_ACQ_REL);
     __atomic_store_n(&task_timer_armed_generation, 0, __ATOMIC_RELEASE);
     task_timer_fn = NULL;
     task_timer_unlock();
+    luna_lkl_task_manager_lock();
+    int cancel_result = luna_lkl_task_manager_request(
+        LUNA_ISOLATION_EVENT_TIMER_CANCEL, (seL4_Word)generation, 0);
+    luna_lkl_task_manager_unlock();
+    if (!cancel_result)
+        __atomic_fetch_add(&task_timer_cancel_count, 1ULL,
+                           __ATOMIC_RELAXED);
     while (__atomic_load_n(&task_timer_callback_running,
                            __ATOMIC_ACQUIRE))
         seL4_Yield();
@@ -1119,7 +1208,13 @@ int luna_lkl_task_configure_resources(
     task_timer_lock_word = 0;
     task_timer_generation = 0;
     task_timer_armed_generation = 0;
+    task_timer_clear_epoch = 0;
     task_timer_deadline_ns = 0;
+    task_timer_arm_count = 0;
+    task_timer_cancel_count = 0;
+    task_timer_wake_count = 0;
+    task_timer_early_wake_count = 0;
+    task_timer_coalesced_arm_count = 0;
     return 0;
 }
 
@@ -1568,6 +1663,12 @@ void luna_lkl_task_resource_stats(void)
                LUNA_SYNC_SLOTS,
                __atomic_load_n(&task_manager_ipc_count,
                                __ATOMIC_ACQUIRE));
+    lkl_printf("LUNA_TIMER_CHILD_COUNTERS arms=%llu cancels=%llu "
+               "wakes=%llu early_wakes=%llu polling_loops=0\n",
+               task_timer_arm_count, task_timer_cancel_count,
+               task_timer_wake_count, task_timer_early_wake_count);
+    lkl_printf("LUNA_TIMER_COALESCE_COUNTERS deferred_arms=%llu\n",
+               task_timer_coalesced_arm_count);
 }
 
 int luna_lkl_task_init(void)

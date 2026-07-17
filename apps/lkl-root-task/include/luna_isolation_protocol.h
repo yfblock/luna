@@ -92,6 +92,12 @@ static inline unsigned luna_net_stats_unpack(seL4_Word stats,
 struct luna_net_batch_header {
     volatile seL4_Word tx_count;
     volatile seL4_Word rx_count;
+    volatile seL4_Word tx_request_sequence;
+    volatile seL4_Word tx_response_sequence;
+    volatile seL4_Word tx_accepted;
+    volatile seL4_Word rx_produced;
+    volatile seL4_Word rx_consumed;
+    volatile seL4_Word rx_waiting;
     volatile seL4_Word tx_lengths[LUNA_NET_BATCH_SLOTS];
     volatile seL4_Word rx_lengths[LUNA_NET_BATCH_SLOTS];
 };
@@ -166,6 +172,9 @@ enum luna_isolation_event {
     LUNA_ISOLATION_EVENT_NET_TX_BATCH = 0x20c,
     LUNA_ISOLATION_EVENT_NET_RX_BATCH = 0x20d,
     LUNA_ISOLATION_EVENT_DISK_SUBMIT_BATCH = 0x20e,
+    LUNA_ISOLATION_EVENT_TIMER_ARM = 0x20f,
+    LUNA_ISOLATION_EVENT_TIMER_CANCEL = 0x210,
+    LUNA_ISOLATION_EVENT_NET_DEBUG = 0x211,
     LUNA_ISOLATION_EVENT_PRIVATE_PAGE_VISIBLE = 0x1ff,
 };
 
@@ -179,6 +188,7 @@ enum luna_manager_command {
     LUNA_COMMAND_DISK_RESULT = 7,
     LUNA_COMMAND_CONFIGURE_NET = 8,
     LUNA_COMMAND_NET_RESULT = 9,
+    LUNA_COMMAND_TIMER_RESULT = 10,
 };
 
 #endif /* LUNA_ISOLATION_PROTOCOL_H */
